@@ -903,168 +903,320 @@ def make_handler(store):
 PAGE = r"""<!doctype html>
 <meta charset="utf-8"><title>Gate Review</title>
 <style>
- :root{--bg:#16181d;--card:#22252c;--line:#33373f;--fg:#e6e8ec;--dim:#8b919c}
+ /* ================================================================ 暗房
+    这一屏的工作是: 扫一排抠图, 划掉坏的, 放行。所以图是唯一亮源, 其余全部压暗。
+    抠图的灰底(#b4b4b4 上下)是后端烤进去的、改不了 —— 那就让整页比它暗得多,
+    灰底自然成为焦点, 而不是和卡片背景打架。                          */
+ :root{
+   --ink:#0a0b0d;        /* 页面底 —— 真暗, 不是带蓝的深灰 */
+   --stock:#131519;      /* 片基: 卡片/面板 */
+   --raise:#191c21;      /* 抬起一层: 顶栏、弹层头 */
+   --rule:#23262c;       /* 细线 */
+   --paper:#e9e7e2;      /* 正文: 略暖白 = 灯箱旁的相纸, 不是纯白 */
+   --pencil:#82878f;     /* 次要文字。#7d828b 在顶栏底上是 4.42:1, 差一点不达标 */
+   --frame:#c9c9c9;      /* 图位占位色, 和后端烤的灰底同族 */
+   /* 语义色。这五个是**数据**不是装饰 —— 所以不另设品牌 accent。 */
+   --keep:#6fbf73; --drop:#e0703c; --kill:#d94a3d;
+   --solo:#58a8d8; --share:#b87fd0; --flag:#e8b84a;
+   --bg:var(--ink); --card:var(--stock); --line:var(--rule);
+   --fg:var(--paper); --dim:var(--pencil);
+ }
  *{box-sizing:border-box}
- body{margin:0;background:var(--bg);color:var(--fg);
-      font:13px/1.5 ui-sans-serif,system-ui,"PingFang SC","Microsoft YaHei",sans-serif}
- header{position:sticky;top:0;z-index:9;background:#1b1e24;border-bottom:1px solid var(--line);
-        padding:10px 16px;display:flex;gap:16px;align-items:center;flex-wrap:wrap}
- header b{font-size:15px}
- .path{color:var(--dim);font:11px ui-monospace,monospace}
+ body{margin:0;background:var(--ink);color:var(--paper);
+      font:13px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,
+           "PingFang SC","Microsoft YaHei",sans-serif;
+      -webkit-font-smoothing:antialiased}
+ /* 等宽只给**需要竖着对齐的数字**。小标签用正文字体 —— 满页等宽是通用暗色面板的味道。 */
+ .num,.path,.im em,.dim,.glyph,.rt td,.rt input,.sum .big,.rcrow .num{
+      font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}
+
+ /* ---------------------------------------------------------------- 顶栏 */
+ header{position:sticky;top:0;z-index:9;background:var(--raise);
+        border-bottom:1px solid var(--rule);
+        padding:9px 18px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+ header b{font-size:16px;font-weight:650;letter-spacing:-.012em}
+ /* 决策文件路径: 只让文件名可读, 目录退到背景。hover 看全路径(title 里有)。 */
+ /* 决策文件。★ 要紧的是**文件名**(05_review.json 和 05_review_afterrecall.json
+    是两道闸), 目录是常量。所以只渲染末三段, 全路径进 title —— 用 CSS 截断做不到
+    这件事: overflow 永远从头开始留, 留下的恰好是没信息的那一半。 */
+ .path{color:var(--pencil);font-size:11px;white-space:nowrap}
+ .path b{color:#aeb4bd;font-weight:500}
+ /* 闸位/进度是**给人读的句子**, 不是路径 —— 不该继承 .path 的等宽和 RTL 截断 */
+ .ghd{font-size:12.5px;letter-spacing:-.002em}
+ .ghd.dimly{color:var(--pencil);font-size:11.5px}
+ #gate{font-weight:560}
  .sp{flex:1}
- button{background:#2c3038;color:var(--fg);border:1px solid var(--line);border-radius:6px;
-        padding:5px 10px;cursor:pointer;font-size:12px}
- button:hover{background:#363b45}
- button.on{background:#3d4450;border-color:#5b6474}
- #save{background:#2f6f3f;border-color:#3f8a52;padding:7px 16px;font-weight:600}
- #save:disabled{background:#2c3038;border-color:var(--line);color:var(--dim);cursor:default}
- #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(212px,1fr));gap:12px;padding:16px}
- .hd{padding:6px 8px;display:flex;gap:6px;align-items:baseline}
- .hd b{font-size:13px}
- .hd span{color:var(--dim);font:11px ui-monospace,monospace;margin-left:auto}
- .bg{font-style:normal;font-size:10px;padding:1px 6px;border-radius:9px;white-space:nowrap}
- .bg.cls{background:#3a3020;color:#e0b060;border:1px solid #574424}
- .bg.cls.big{background:#4a2820;color:#ff9060;border-color:#7a4030}
- /* 召回来源: 身份徽章, 黄。和 .bg.cls(类代表) 分开 —— 位置即类别, 颜色即来源。 */
- .bg.rec{background:#4a3d10;color:#ffd24a;border:1px solid #7a651c}
- /* 召回信息表 */
- .rcrow{display:flex;gap:12px;align-items:flex-start;padding:10px 0;
-        border-bottom:1px solid var(--line)}
- .rcrow:last-child{border-bottom:0}
- .rcrow img{border-radius:6px;background:#111;flex:none}
- .rcrow .t{flex:1;min-width:0}
- .rcrow .t b{font-size:13px}
- .rcrow .why{font-size:12px;margin-top:4px}
- .rcrow .num{color:var(--dim);font-size:11px;margin-top:3px;font-family:ui-monospace,monospace}
- .rcv{font-style:normal;font-size:10px;padding:1px 7px;border-radius:9px;
-      white-space:nowrap;margin-left:6px}
- .rcedge{border:1px dashed #ffd24a;color:#ffd24a;font-size:10px;
-         padding:1px 7px;border-radius:9px;margin-left:6px}
- .rcsum{color:var(--dim);font-size:12px;margin-bottom:10px;line-height:1.6}
- .rcb{border-color:#7a651c;color:#ffd24a}
- .sec{grid-column:1/-1;margin:6px 0 -4px;padding:8px 2px 0;border-top:1px solid var(--line);
-      font-size:13px;font-weight:600}
- .sec:first-child{border-top:0;margin-top:0}
- .sec span{font-weight:400;color:var(--dim);font-size:11px;margin-left:10px}
- /* ---- 词卡(收起态) ---- */
- .wcard{background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:hidden;
-        border-left-width:4px}
- .wcard.dead{opacity:.5}
- .wcard img{width:100%;aspect-ratio:1;display:block;background:#d2d2d2;object-fit:cover}
- .wcard .row{display:flex;align-items:center;gap:3px;padding:0 6px 5px;flex-wrap:wrap}
- .wcard .row label{color:var(--dim);font-size:10px;width:48px;flex:none}
- .wcard .row button{flex:1 1 auto;padding:3px 4px;font-size:11px}
- .wcard .row button.dgr.on{background:#5a2424;border-color:#8a3a3a}
- .warn{margin:0 6px 6px;padding:5px 7px;border-radius:5px;background:#4a2820;
-       border:1px solid #7a4030;color:#ffb090;font-size:10px;line-height:1.4}
- /* ---- 展开面板 ---- */
- .panel{grid-column:1/-1;background:#191c22;border:1px solid var(--line);border-radius:8px;padding:12px}
- .panel h3{margin:0 0 10px;font-size:13px;font-weight:600}
- .panel h3 span{color:var(--dim);font-weight:400;margin-left:8px;font-size:11px}
- .insts{display:grid;grid-template-columns:repeat(auto-fill,minmax(158px,1fr));gap:10px}
- .inst{position:relative;background:var(--card);border:1px solid var(--line);border-radius:6px;
-       overflow:hidden}
- /* 质量可疑 = 材质通道(降饱和), 和形状差异的几何通道分开 */
- .inst.bad{filter:saturate(.35)}
- .inst.dropped{filter:grayscale(1) brightness(.6);border-color:#c0392b;box-shadow:0 0 0 1px #c0392b inset}
- .inst.dropped:hover{filter:grayscale(.3) brightness(.85)}
- .inst.dropped .im b::after{content:' · dropped';color:#e07060;font-weight:400;font-size:10px}
- .inst.bad:hover{filter:none}
- .inst.rep{border-color:#5ab45a;box-shadow:0 0 0 1px #5ab45a inset}
- .repbadge.guess{background:#25352a;border-color:#3f6a4a;color:#8fbf9c;border-style:dashed}
- .inst img{width:100%;aspect-ratio:1;display:block;background:#d2d2d2;object-fit:cover}
- .alarm{position:absolute;top:4px;left:4px;background:#4a3410;border:1px solid #7a5a20;
-        color:#f0c060;font-style:normal;font-size:9px;padding:1px 5px;border-radius:8px}
- .repbadge{position:absolute;top:4px;right:4px;background:#1f4a28;border:1px solid #3f8a52;
-           color:#8fe0a0;font-style:normal;font-size:9px;padding:1px 5px;border-radius:8px}
- .im{padding:5px 7px 2px;font-size:11px}
- .im b{font-size:12px} .im em{float:right;font-style:normal;color:var(--dim);font:11px ui-monospace,monospace}
- .bar{height:3px;background:#2c3038;border-radius:2px;margin:4px 0}
- .bar s{display:block;height:100%;background:#5b7ea0;border-radius:2px}
- /* AR 画成小矩形 —— 横扫一眼就能分堆, 比读数字快 */
- .glyph{display:flex;align-items:center;gap:6px;color:var(--dim);font:10px ui-monospace,monospace;
-        margin:3px 0}
- .glyph u{display:inline-block;border:1.5px solid #7f9fc4;background:#7f9fc422;
+
+ /* ---------------------------------------------------------------- 控件 */
+ button{background:#1e2127;color:var(--paper);border:1px solid var(--rule);border-radius:4px;
+        padding:5px 11px;cursor:pointer;font-size:12px;font-family:inherit;
+        letter-spacing:.004em;transition:background .09s ease,border-color .09s ease}
+ button:hover:not(:disabled){background:#282c34;border-color:#363b44}
+ /* 选中态。两个坑一起解:
+    1) **权重**: 必须写 button.on:not(:disabled), 否则上面那条 hover 的 (0,2,1)
+       压过裸 .on 的 (0,1,1) —— 光标一压到 shared 上它就退回未选中的样子,
+       而那正是人要下手点的时刻。
+    2) **对比**: 暗底上靠灰阶区分选中/未选中最多做到 1.39:1(实测), 远低于
+       WCAG 1.4.11 对状态指示要求的 3:1。灰阶拉不动就别拉 —— 改成**下缘一条
+       亮色标记**, 用的就是那五个语义色: keep 绿 / solo 蓝 / shared 紫 / drop 橙。
+       实测 3.15~8.67:1, 而且 shared 和 solo 一眼是两个颜色, 不用读字。 */
+ button.on,button.on:not(:disabled),button.on:hover:not(:disabled){
+        background:#2b303a;border-color:#454d5a;color:#fff;
+        box-shadow:inset 0 -2px 0 var(--mark,#c9d2de)}
+ button.on[data-yn="keep"],button.on[data-io="keep"],button.on[data-rio="keep"]{--mark:var(--keep)}
+ button.on[data-mode="solo"]{--mark:var(--solo)}
+ button.on[data-mode="shared"]{--mark:var(--share)}
+ button.on[data-yn="drop-word"]{--mark:var(--kill)}
+ button.on[data-io="drop"],button.on[data-rio="drop"]{--mark:var(--drop)}
+ /* ★ 别用 opacity 表达禁用: 它和父级的 opacity 相乘, Save 最后落到 1.53:1,
+    读起来像"这里什么都没有"。给真实底色, 3.5:1 —— 看得出是控件, 看得出按不了。 */
+ button:disabled{background:#16181c;border-color:#22252b;color:#6a6f77;cursor:not-allowed}
+ button:focus-visible{outline:2px solid #6f9fd0;outline-offset:1px}
+ #save{background:#26602f;border-color:#37853f;padding:6px 18px;font-weight:600;
+       border-radius:4px}
+ #save:hover:not(:disabled){background:#2d7038}
+ #save:disabled{background:#16181c;border-color:#22252b;color:#6a6f77}
+ .gsw{display:flex;border:1px solid var(--rule);border-radius:4px;overflow:hidden}
+ .gsw button{border:0;border-radius:0;font-size:11.5px;padding:4px 13px;background:transparent}
+ .gsw button.on{background:#333944;color:#fff}
+ .rcb{border-color:#6d5a18;color:var(--flag);background:#1d1a10}
+ .rcb:hover:not(:disabled){background:#262112;border-color:#8a731f}
+
+ /* ---------------------------------------------------------------- 接触印相栅格
+    卡与卡之间只有 3px 缝, 无圆角无阴影 —— 一卷底片摊开的样子, 不是一叠卡片。 */
+ #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(196px,1fr));
+       gap:3px;padding:14px}
+ .sec{grid-column:1/-1;margin:12px 0 1px;padding:0 1px 7px;
+      border-bottom:1px solid var(--rule);font-size:12.5px;font-weight:600;
+      letter-spacing:-.005em;display:flex;align-items:baseline;gap:10px}
+ .sec:first-child{margin-top:0}
+ .sec span{font-weight:400;color:var(--pencil);font-size:11px;letter-spacing:0}
+
+ /* ---- 词卡 ---- */
+ .wcard{background:var(--stock);border:0;border-left:3px solid var(--rule);
+        border-radius:0;overflow:hidden;display:flex;flex-direction:column}
+ /* 整词作废用透明度通道, 但只压**图**不压字 —— 压字等于把复核所需的数字关掉,
+    而复核一个 drop 正是判掉之后唯一还要做的事。 */
+ .wcard.dead img{opacity:.3}
+ .wcard.dead .hd b{color:var(--pencil)}
+ .wcard img{width:100%;aspect-ratio:1;display:block;background:var(--frame);object-fit:cover}
+ /* ★ 一排卡片的按钮必须横向对齐 —— 这一屏的动作是"横扫一排连着敲 drop",
+    某张卡的按钮跳 12px 就会点错实例。min-height 治不了: street lamp 的标题
+    加徽章占满一行后, margin-left:auto 的 "#0 f268" 被挤到第二行, 那张卡就高一截。
+    所以**让它永远自己一行**: flex-basis:100% 强制换行, 每张卡都是两行, 一律齐。 */
+ .hd{padding:7px 9px 4px;display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}
+ .hd b{font-size:13px;font-weight:620;letter-spacing:-.008em}
+ .hd span{color:var(--pencil);font:11px ui-monospace,monospace;
+          flex:0 0 100%;text-align:right;margin-top:1px;
+          font-variant-numeric:tabular-nums}
+ .wcard .row{display:flex;align-items:center;gap:2px;padding:0 7px 5px}
+ .wcard .row button{flex:1 1 0;padding:4px 3px;font-size:11px;min-width:0}
+ .wcard .row button.dgr.on{background:#4d1f1c;border-color:#7d332c;color:#ffb8ad}
+ .more{padding:0 7px 8px;margin-top:auto}
+ .more button{width:100%;font-size:11px;background:transparent;color:var(--pencil)}
+ .more button:hover:not(:disabled){color:var(--paper);background:#1e2127}
+ .warn{margin:0 7px 6px;padding:6px 8px;border-radius:3px;background:#2e1a15;
+       border-left:2px solid var(--drop);color:#ffbda6;font-size:10.5px;line-height:1.45}
+
+ /* ---- 徽章。位置即类别: 左上=警告, 右上=身份。实线=人定的, 虚线=系统猜的。 ---- */
+ .bg{font-style:normal;font-size:10px;padding:1px 6px;border-radius:2px;white-space:nowrap;
+     font-variant-numeric:tabular-nums}
+ .bg.cls{background:#2b2416;color:#d9ad63;border:1px solid #443722}
+ .bg.cls.big{background:#33221a;color:#e59468;border-color:#553629}
+ .bg.rec{background:#332a0c;color:var(--flag);border:1px solid #5f4f16}
+
+ /* ---------------------------------------------------------------- 展开面板 */
+ .panel{grid-column:1/-1;background:var(--stock);border:1px solid var(--rule);padding:13px}
+ .panel h3{margin:0 0 11px;font-size:13px;font-weight:620;letter-spacing:-.008em}
+ .panel h3 span{color:var(--pencil);font-weight:400;margin-left:9px;font-size:11px;
+                letter-spacing:0}
+ .insts{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:3px}
+ .inst{position:relative;background:var(--stock);border:1px solid transparent;overflow:hidden;
+       display:flex;flex-direction:column}
+ .inst img{width:100%;aspect-ratio:1;display:block;background:var(--frame);object-fit:cover}
+ /* 质量可疑 = 材质通道(降饱和)。和形状差异的几何通道分开。hover 必须能撤销 ——
+    否则它妨碍人真的去看那张图, 而看图正是这一屏的全部意义。 */
+ .inst.bad img{filter:saturate(.32)}
+ .inst.bad:hover img{filter:none}
+ /* 判掉 = 蜡笔划掉。灰白+红框是定下来的语义, 这里只是把它做成"人划的"那种样子:
+    斜线压在图上, 而且灰白程度收轻 —— 人得看得见自己划掉的是什么。 */
+ .inst.dropped{border-color:var(--kill);box-shadow:0 0 0 1px var(--kill) inset}
+ .inst.dropped img{filter:grayscale(1) brightness(.66)}
+ .inst.dropped:hover img{filter:grayscale(.22) brightness(.92)}
+ /* ★ 滤镜必须挂在 img 上, 不能挂在 .inst 上:
+      1) 挂 .inst 会把这道红线一起变灰 —— filter 作用于整棵子树, ::after 也算;
+      2) 这道线更不能画成 img 的 background-image, 图片本身不透明, 会把它整个盖住。
+    所以: 图变灰白(人一眼看出判掉了), 线保持红(那是人自己划的那一笔)。 */
+ .inst.dropped::after{content:'';position:absolute;left:0;top:0;right:0;aspect-ratio:1;
+     pointer-events:none;background:linear-gradient(to top right,
+       transparent 47.7%,rgba(217,74,61,.82) 47.7%,
+       rgba(217,74,61,.82) 52.3%,transparent 52.3%)}
+ .inst.dropped .im b::after{content:' · dropped';color:#e58a7c;font-weight:400;font-size:10px}
+ .inst.rep{border-color:var(--keep);box-shadow:0 0 0 1px var(--keep) inset}
+ .alarm{position:absolute;top:4px;left:4px;background:#2c2410;border:1px solid #55461a;
+        color:var(--flag);font-style:normal;font-size:9px;padding:1px 5px;border-radius:2px}
+ .repbadge{position:absolute;top:4px;right:4px;background:#14301b;border:1px solid #2f6c3c;
+           color:#93dda4;font-style:normal;font-size:9px;padding:1px 5px;border-radius:2px}
+ .repbadge.guess{background:#1a2620;border-color:#38614a;color:#89b79a;border-style:dashed}
+ .im{padding:6px 8px 2px;font-size:11px}
+ .im b{font-size:12px;font-weight:620}
+ .im em{float:right;font-style:normal;color:var(--pencil);font-size:11px}
+ /* 减一件: 面积条从 3px 圆角蓝条降成 1px 细线 —— 留信号, 去响度。
+    这一行已经排过序、右边就写着百分比, 条子只需要提示"和上一个差多少"。 */
+ .bar{height:1px;background:#22262c;margin:5px 0 4px}
+ .bar s{display:block;height:100%;background:#5f7d9c;text-decoration:none}
+ /* AR 画成矩形字形 —— 横扫一眼分堆, 比逐个读数字快 */
+ .glyph{display:flex;align-items:center;gap:6px;color:var(--pencil);font-size:10px;margin:3px 0}
+ .glyph u{display:inline-block;border:1px solid #7a97b8;background:#7a97b81c;
           text-decoration:none;flex:none}
- .dim{color:var(--dim);font:10px ui-monospace,monospace;line-height:1.35}
- .iops{display:flex;flex-wrap:wrap;gap:3px;padding:5px 6px 6px}
- .iops button{flex:1 1 auto;padding:2px 4px;font-size:10px}
- button:disabled{opacity:.35;cursor:not-allowed}
- .more{padding:0 6px 8px}
- .more button{width:100%;font-size:11px}
- .tray{grid-column:1/-1;background:#1b1e24;border:1px solid var(--line);border-radius:8px;padding:12px}
- .tray h3{margin:0 0 10px;font-size:13px;font-weight:600}
- .tray h3 span{color:var(--dim);font-weight:400;margin-left:8px}
- .cands{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:10px}
- .cand{background:var(--card);border:2px solid var(--line);border-radius:6px;cursor:pointer;overflow:hidden}
- .cand:hover{border-color:#6b7484}
- .cand{position:relative}
- .cand.cur{border-color:#5ab45a}
- .cand.orig .ohome{position:absolute;top:4px;left:4px;background:#1f3348;border:1px solid #3a5f88;color:#8fc0e8;font-style:normal;font-size:9px;padding:1px 5px;border-radius:8px}
- .cand img{width:100%;aspect-ratio:1;display:block;background:#d2d2d2}
- .cand div{padding:4px 6px;font:10px ui-monospace,monospace;color:var(--dim)}
- .empty{padding:40px;text-align:center;color:var(--dim)}
- /* ---- 闸 3 尺子表 ---- */
- .sum{display:flex;gap:18px;flex-wrap:wrap;align-items:baseline;padding:12px 14px;margin:0 0 12px;
-      background:var(--card);border:1px solid var(--line);border-radius:8px;border-left-width:4px}
- .sum .big{font-size:22px;font-weight:600;font-family:ui-monospace,monospace}
- .sum .lb{color:var(--dim);font-size:11px;display:block}
- .note{padding:10px 12px;border-radius:6px;font-size:11px;line-height:1.5;margin-bottom:12px}
- .note.warn{background:#4a2820;border:1px solid #7a4030;color:#ffb090}
- .note.info{background:#1b2430;border:1px solid #33455a;color:#9ec0e0}
- .note code{background:#0e1116;border:1px solid #33373f;border-radius:4px;padding:2px 6px;
-            font-family:ui-monospace,monospace;color:#cfe0f0;display:inline-block;margin-top:4px}
+ .dim{color:var(--pencil);font-size:10px;line-height:1.4}
+ .dim.verdict{color:#b09070}   /* 结论, 不是第四个字段 */
+ /* ★ 同上: 第三个按钮是短的 frame▾ 还是长的 use as source▾, 决定它换不换行,
+    于是同一排里总有一张的 keep/drop 偏 21px。定成两列, 第三个整行占满, 一律齐。 */
+ .iops{display:grid;grid-template-columns:1fr 1fr;gap:2px;padding:5px 7px 7px;margin-top:auto}
+ .iops button{padding:3px 5px;font-size:10px;min-width:0}
+ .iops button:nth-child(3){grid-column:1/-1}
+
+ /* ---------------------------------------------------------------- 帧抽屉 */
+ .tray{grid-column:1/-1;background:var(--stock);border:1px solid var(--rule);padding:13px}
+ .tray h3{margin:0 0 11px;font-size:13px;font-weight:620;letter-spacing:-.008em}
+ .tray h3 span{color:var(--pencil);font-weight:400;margin-left:9px;font-size:11px}
+ .cands{display:grid;grid-template-columns:repeat(auto-fill,minmax(126px,1fr));gap:3px}
+ /* .cand 已改成 <button>(为了键盘可达), 所以要把按钮的默认外观全收掉 ——
+    padding、字体、文字对齐都得显式写回, 否则它会带着 button 的默认样式出场。 */
+ .cand{position:relative;background:var(--stock);border:2px solid transparent;
+       cursor:pointer;overflow:hidden;padding:0;margin:0;display:block;width:100%;
+       font:inherit;color:inherit;text-align:left;border-radius:0}
+ .cand:hover:not(:disabled){background:var(--stock)}
+ .cand:focus-visible{outline:2px solid #6f9fd0;outline-offset:2px}
+ .cand:hover{border-color:#8b95a3}
+ .cand.cur,.cand.cur:hover{border-color:var(--keep)}
+ .cand.orig .ohome{position:absolute;top:4px;left:4px;background:#14243a;
+        border:1px solid #2f4f78;color:#93c1e8;font-style:normal;font-size:9px;
+        padding:1px 5px;border-radius:2px}
+ .cand img{width:100%;aspect-ratio:1;display:block;background:var(--frame)}
+ .cand div{padding:4px 6px;font:10px ui-monospace,monospace;color:var(--pencil);
+           font-variant-numeric:tabular-nums}
+ .empty{padding:56px 24px;text-align:center;color:var(--pencil);line-height:1.7}
+
+ /* ---------------------------------------------------------------- 召回信息表 */
+ .rcsum{color:var(--pencil);font-size:12px;margin-bottom:12px;line-height:1.65;max-width:78ch}
+ .rcsum b{color:var(--paper);font-weight:600}
+ .rcsum code{background:#0f1114;border:1px solid var(--rule);border-radius:3px;
+             padding:1px 5px;font-family:ui-monospace,monospace;font-size:11px;color:#cbd6e2}
+ .rcrow{display:flex;gap:14px;align-items:flex-start;padding:12px 0;
+        border-bottom:1px solid var(--rule)}
+ .rcrow:last-child{border-bottom:0}
+ .rcrow img{background:var(--frame);flex:none}
+ .rcrow .t{flex:1;min-width:0}
+ .rcrow .t b{font-size:13.5px;font-weight:620;letter-spacing:-.008em}
+ .rcrow .why{font-size:12px;margin-top:5px;max-width:72ch}
+ .rcrow .num{color:var(--pencil);font-size:11px;margin-top:4px}
+ .rcv{font-style:normal;font-size:10px;padding:1px 7px;border-radius:2px;
+      white-space:nowrap;margin-left:7px}
+ .rcedge{border:1px dashed var(--flag);color:var(--flag);font-size:10px;
+         padding:1px 7px;border-radius:2px;margin-left:6px;font-style:normal}
+
+ /* ---------------------------------------------------------------- 闸 3 尺子表 */
+ .sum{display:flex;gap:26px;flex-wrap:wrap;align-items:baseline;padding:13px 16px;
+      margin:0 0 12px;background:var(--stock);border:0;border-left:3px solid var(--keep)}
+ .sum .big{font-size:24px;font-weight:600;letter-spacing:-.02em;line-height:1.15}
+ .sum .lb{color:var(--pencil);font-size:10.5px;display:block;margin-bottom:2px}
+ /* 提示条: 从"框套框"降成左侧一道色边 —— 它是注解, 不该比它注解的表还重。 */
+ .note{padding:9px 0 9px 12px;font-size:11.5px;line-height:1.6;margin-bottom:11px;
+       border-left:2px solid var(--rule);background:none;max-width:96ch}
+ .note.warn{border-left-color:var(--drop);color:#f0b9a3}
+ .note.info{border-left-color:#3d5a7a;color:#a8c2dc}
+ /* ★ inline-block 而不是 block: 句子中间提到一个文件名时(「writes 01_vlm_sizes.json —
+    that is ...」)块级会把这句话劈成三段。inline-block 既能跟在文字里, 又能给长命令
+    自己的滚动区。命令折在路径中间会让人复制出半行, 所以 pre + 横向滚, 配 user-select:all
+    保证点一下选中整条。 */
+ .note code{background:#0f1114;border:1px solid var(--rule);border-radius:3px;padding:2px 7px;
+            font-family:ui-monospace,monospace;color:#cbd6e2;display:inline-block;
+            font-size:11px;white-space:pre;max-width:100%;overflow-x:auto;
+            vertical-align:bottom;user-select:all}
+ /* ★ 命令块的样式必须两个容器都挂到 —— .note(闸 3) 和 .rcsum(召回表) 是两个不同的
+    父类, 只写 .note code.cmd 的话召回表那条命令会退化成一段贴着上下文的行内文字,
+    连"点一下选中整条"都没了。 */
+ .rcsum code,.note code{background:#0f1114;border:1px solid var(--rule);border-radius:3px;
+            padding:2px 7px;font-family:ui-monospace,monospace;color:#cbd6e2;
+            display:inline-block;font-size:11px;white-space:pre;max-width:100%;
+            overflow-x:auto;vertical-align:bottom;user-select:all}
+ /* ★ 命令**按空格软换行**, 不用 pre + 横向滚: .note 的 96ch 量度会把它裁掉 23%
+    而且不给滚动条, 人连 --run r2 都读不到 —— 这是这道闸唯一的逃生出口。
+    user-select:all 仍在, 点一下照样整条选中。 */
+ .rcsum code.cmd,.note code.cmd{display:block;margin:7px 0;padding:7px 9px;
+            white-space:pre-wrap;overflow-wrap:break-word;overflow-x:visible;
+            max-width:none;line-height:1.7}
+ .rcsum .src{color:var(--pencil);font-size:10.5px;margin-top:7px;
+             word-break:break-all;user-select:all}
  .rt{width:100%;border-collapse:collapse;font-size:12px}
- .rt th{text-align:right;color:var(--dim);font-weight:400;font-size:10px;padding:0 8px 6px;
-        border-bottom:1px solid var(--line)}
+ .rt th{text-align:right;color:var(--pencil);font-weight:400;font-size:10.5px;
+        padding:0 9px 7px;border-bottom:1px solid var(--rule)}
  .rt th:first-child,.rt th:nth-child(2){text-align:left}
- .rt td{padding:5px 8px;border-bottom:1px solid #262a31;text-align:right;
-        font-family:ui-monospace,monospace}
- .rt td:nth-child(2){text-align:left;font-family:inherit}
- .rt tr.off{filter:saturate(.3);color:var(--dim)}      /* 当不了尺子: 材质通道 */
- .rt tr.out td:nth-child(2){color:#f0c060}             /* 离群不用 */
- .rt tr.kline td{border:0;padding:2px 8px;color:#5ab45a;font-size:10px;
-                 border-top:1px dashed #3f6a4a}
- .rt img{width:34px;height:34px;border-radius:4px;background:#d2d2d2;object-fit:cover;display:block}
- .rt input{width:62px;background:#0e1116;border:1px solid var(--line);border-radius:4px;
-           color:var(--fg);padding:3px 5px;font:12px ui-monospace,monospace;text-align:right}
- .rt input:focus{outline:0;border-color:#5b7ea0}
- .rt tr.edited input{border-color:#c878c8;color:#e8b8e8}
- .bar2{display:inline-block;height:7px;background:#5b7ea0;border-radius:2px;vertical-align:middle}
- .why{color:var(--dim);font-size:10px;font-family:inherit}
- .gsw{display:flex;gap:0;border:1px solid var(--line);border-radius:6px;overflow:hidden}
- .gsw button{border:0;border-radius:0;font-size:11px;padding:4px 12px}
- .gsw button.on{background:#3d4450}
- /* ---- 沉浸式弹层 ---- */
- .scrim{position:fixed;inset:0;z-index:50;background:rgba(8,10,14,.66);
-        backdrop-filter:blur(7px);-webkit-backdrop-filter:blur(7px);
+ .rt td{padding:6px 9px;border-bottom:1px solid #1a1d22;text-align:right}
+ .rt td:nth-child(2){text-align:left;font-family:inherit;font-weight:560}
+ .rt tbody tr:hover td{background:#15181d}
+ .rt tr.off{filter:saturate(.28);color:var(--pencil)}   /* 当不了尺子: 材质通道 */
+ .rt tr.out td:nth-child(2){color:var(--flag)}          /* 离群不采用 */
+ .rt tr.kline td{border:0;padding:3px 9px;color:var(--keep);font-size:10px;
+                 border-top:1px dashed #356240}
+ .rt img{width:34px;height:34px;background:var(--frame);object-fit:cover;display:block}
+ .rt input{width:64px;background:#0f1114;border:1px solid var(--rule);border-radius:3px;
+           color:var(--paper);padding:4px 6px;font-size:12px;text-align:right}
+ .rt input:focus{outline:0;border-color:#6f9fd0;background:#12161b}
+ .rt tr.edited input{border-color:var(--share);color:#e9c2e9}
+ .bar2{display:inline-block;height:6px;background:#5f7d9c;vertical-align:middle}
+ .why{color:var(--pencil);font-size:10px;font-family:inherit}
+
+ /* ---------------------------------------------------------------- 沉浸式弹层 */
+ .scrim{position:fixed;inset:0;z-index:50;background:rgba(6,7,9,.72);
+        backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
         display:flex;align-items:flex-start;justify-content:center;padding:26px 20px;
         overflow:auto;animation:fade .12s ease-out}
  @keyframes fade{from{opacity:0}to{opacity:1}}
- .modal{background:var(--bg);border:1px solid #3d434e;border-radius:12px;width:100%;
-        max-width:1180px;box-shadow:0 28px 90px rgba(0,0,0,.65);animation:rise .14s ease-out}
- @keyframes rise{from{transform:translateY(8px);opacity:.6}to{transform:none;opacity:1}}
- .mhd{position:sticky;top:0;z-index:2;background:#1b1e24;border-bottom:1px solid var(--line);
-      border-radius:12px 12px 0 0;padding:10px 14px;display:flex;gap:10px;align-items:center}
- .mhd b{font-size:14px} .mhd .sp{flex:1}
- .mhd .sub{color:var(--dim);font-size:11px}
- .mbody{padding:14px}
+ .modal{background:var(--ink);border:1px solid #2d3138;border-radius:6px;width:100%;
+        max-width:1240px;box-shadow:0 30px 90px rgba(0,0,0,.7);animation:rise .14s ease-out}
+ @keyframes rise{from{transform:translateY(6px);opacity:.7}to{transform:none;opacity:1}}
+ .mhd{position:sticky;top:0;z-index:2;background:var(--raise);
+      border-bottom:1px solid var(--rule);border-radius:6px 6px 0 0;
+      padding:11px 15px;display:flex;gap:11px;align-items:baseline}
+ .mhd b{font-size:15px;font-weight:650;letter-spacing:-.012em}
+ .mhd .sp{flex:1} .mhd .sub{color:var(--pencil);font-size:11.5px}
+ .mbody{padding:15px}
  .mbody .panel,.mbody .tray{background:none;border:0;padding:0}
- .mclose{font-size:15px;line-height:1;padding:3px 9px}
+ .mclose{font-size:14px;line-height:1;padding:4px 10px;align-self:center}
+ /* 动效只回应人的动作(开/关/展开), 不做自动入场 —— 满页 fade-slide 是生成味。 */
+ @media (prefers-reduced-motion:reduce){
+   *,*::before,*::after{animation-duration:.001ms!important;transition-duration:.001ms!important}
+ }
+ /* 窄屏: 这工具偶尔在笔记本上开, 栅格自己会塌, 顶栏别把路径挤没 */
+ @media (max-width:720px){
+   header{padding:8px 12px;gap:9px}
+   /* ★ .path 的 order 把它排到 #save 之后, 于是 #save 变成第二行的头一个,
+      文件路径反而排它右边。Save 是这台质检台的终点, 必须在最后。 */
+   .path{order:9;flex:1 1 100%} #save{order:10}
+   #grid{padding:10px;gap:2px}
+   /* 表格比屏幕宽时让**它自己**滚, 别让整页横向滚 */
+   .rtwrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+ }
 </style>
 <header>
   <b id="scene">…</b>
   <span class="gsw" id="gsw"></span>
-  <span id="gate" class="path"></span>
+  <span id="gate" class="ghd"></span>
   <span class="gsw" id="rcw"></span>
-  <span id="stat" class="path"></span>
+  <span id="stat" class="ghd dimly"></span>
   <span class="sp"></span>
   <span id="dec" class="path"></span>
   <button id="save" disabled>Save</button>
 </header>
 <div id="grid"><div class="empty">Loading…</div></div>
 <script>
-const COL = {keep:"#5ab45a",drop:"#f0963c","drop-word":"#dc3c3c",solo:"#3cb4dc",shared:"#c878c8"};
+const COL = {keep:"#2f4a35",drop:"#e0703c","drop-word":"#d94a3d",solo:"#58a8d8",shared:"#b87fd0"};
+// ★ keep 压暗: 一屏全是 keep 时亮绿左栏会把页面围成绿栅栏, 而"保留"是**默认状态**,
+//   默认不该喊, 判掉才该喊。同一个语义, 出现频率不同, 响度就该不同 ——
+//   汇总条那种一页只有一个的绿仍然用亮的(见 scRender)。
 const MODES = ["shared","solo"];   // 只有两种结果: 共用一个 / 各造各的
 
 // S.行 是唯一真相(决策文件的「候选」原样)。S.词 是每次改动后重建的派生索引;
@@ -1238,8 +1390,21 @@ function 设代表(词, oid, 帧){
   dirty = true; 重建索引(); render();
 }
 
+// ★ 弹层的焦点。原来开了弹层 activeElement 还是 body, 接着按 Tab 会一路走到
+//   **虚化背景后面**的按钮上 —— 焦点环画在 blur 底下, 人看不见自己在哪。
+//   开的时候移进弹层(见 挂弹层 末尾), 关的时候还回它是从哪儿开的。
 function 开弹层(v){ M = v; render(); }
-function 关弹层(){ M = null; openTray = null; render(); }
+function 关弹层(){
+  // ★ 存节点没用: render() 会把整棵 DOM 重建, 原来那颗按钮已经不在文档里,
+  //   document.contains() 一律 false, 焦点就掉回 body。所以存的是**怎么找回它**。
+  const 从 = M ? (M.view === 'recall' ? {钮:'#rcw button'} : {词:M.词}) : null;
+  M = null; openTray = null; render();
+  let el = null;
+  if (从 && 从.钮) el = document.querySelector(从.钮);
+  else if (从 && 从.词)
+    el = [...document.querySelectorAll('[data-exp]')].find(b => b.dataset.exp === 从.词);
+  if (el) { try { el.focus(); } catch(e){} }
+}
 document.addEventListener("keydown", e => { if (e.key === "Escape" && M) 关弹层(); });
 
 async function 取实例(词){
@@ -1299,7 +1464,7 @@ function scRender(){
   const g = document.getElementById("grid");
   g.innerHTML = "";
   const d = SC.state;
-  document.getElementById("gate").textContent = "gate 3/6 · scale";
+  document.getElementById("gate").textContent = "Gate 3 of 6 — world scale";
   if (d && d.报告文件) document.getElementById("scene").textContent = d.场景 || "";
   if (!d){ g.innerHTML = '<div class="empty">Loading…</div>'; scLoad(); return; }
   if (d.error){ g.innerHTML = '<div class="empty">'+esc(d.error)+'</div>'; return; }
@@ -1316,7 +1481,7 @@ function scRender(){
   const 变 = scDirty() && c.k != null && 原.k != null && Math.abs(c.k-原.k) > 1e-9;
   const ok = c.一致率达标;
   wrap.innerHTML =
-    '<div class="sum" style="border-left-color:'+(ok?COL.keep:COL['drop-word'])+'">'+
+    '<div class="sum" style="border-left-color:'+(ok?'#6fbf73':COL['drop-word'])+'">'+
       '<div><span class="lb">scale factor k</span><span class="big">'+
         (c.k==null?'—':c.k)+'</span>'+
         (变?' <span style="color:#c878c8;font-size:11px">was '+原.k+'</span>':'')+'</div>'+
@@ -1349,7 +1514,7 @@ function scRender(){
     'Editing a reference height below writes <code>01_vlm_sizes.json</code> — that is the one '+
     'file channel this gate has. <b>Whether to apply, and where the gate sits, cannot be set '+
     'from here</b>: world_scale.py reads those from os.environ only. To override, run:'+
-    '<br><code>'+esc(scCmd(d))+'</code>']);
+    '<code class="cmd">'+esc(scCmd(d))+'</code>']);
   wrap.innerHTML += notes.map(([k,t]) => '<div class="note '+k+'">'+t+'</div>').join('');
 
   // ---- 尺子表 ----
@@ -1384,19 +1549,19 @@ function scRender(){
     if (!kline && c.k != null && r.倍数 <= c.k){
       kline = true;
       pre = '<tr class="kline"><td></td><td colspan="7">k = '+c.k+
-            '  ·  everything above measures larger than k, everything below smaller</td></tr>';
+            ' — everything above measures larger than k, everything below smaller</td></tr>';
     }
     return pre + tr(r, false);
   }).join('');
 
   wrap.innerHTML +=
-    '<table class="rt"><thead><tr><th></th><th>word</th><th>measured</th>'+
+    '<div class="rtwrap"><table class="rt"><thead><tr><th></th><th>word</th><th>measured</th>'+
     '<th>real (m)</th><th>ratio</th><th></th><th>inst</th><th></th></tr></thead>'+
     '<tbody>'+body+
     (不可用.length? '<tr class="kline"><td></td><td colspan="7" style="color:var(--dim);'+
       'border-top:1px dashed #33373f">not usable as rulers — fix a height to bring one in</td></tr>'
       + 不可用.map(r=>tr(r,true)).join('') : '')+
-    '</tbody></table>';
+    '</tbody></table></div>';
   g.appendChild(wrap);
 
   g.querySelectorAll("[data-sc]").forEach(i => {
@@ -1417,9 +1582,10 @@ function scCmd(d){
 function scStat(){
   const n = Object.keys(SC.改动).length;
   document.getElementById("stat").textContent =
-    SC.state && SC.state.逐类 ? SC.state.逐类.length+" words · "+
-      (SC.state.汇总.候选类数||0)+" usable as rulers"+(n?" · "+n+" edited":"") : "";
-  document.getElementById("dec").textContent = SC.state ? SC.state.尺子文件 : "";
+    SC.state && SC.state.逐类
+      ? SC.state.逐类.length+" words, "+(SC.state.汇总.候选类数||0)+
+        " usable as rulers"+(n?" — "+n+" edited":"") : "";
+  写文件名(SC.state ? SC.state.尺子文件 : "");
   const b = document.getElementById("save");
   b.disabled = !n; b.textContent = n ? "Save "+n+" ✎" : "Save";
 }
@@ -1455,22 +1621,47 @@ async function boot(){
             SOLO:d.SOLO, SOLO_KEEP:d.SOLO_KEEP};   // 配置默认要靠它俩推
   S.行 = d.候选; S.待删 = new Set();
   document.getElementById("scene").textContent = d.场景;
-  document.getElementById("gate").textContent  = "gate "+d.闸+"/6 · "+d.阶段;
-  document.getElementById("dec").textContent   = d.决策文件;
+  // 阶段名(pre/post)对人没意义, 它说的是"召回之前还是之后" —— 直接说那句话。
+  document.getElementById("gate").textContent =
+    "Gate " + d.闸 + " of 6 — " + (d.阶段 === "post" ? "after recall" : "before generating");
+  写文件名(d.决策文件);
   重建索引();
   if (GATE === 'scale') scLoad(); else render();
+}
+
+// 顶栏那行文件路径。目录暗、文件名亮 —— 一眼看出在编辑哪一份。
+function 写文件名(全路径){
+  const el = document.getElementById("dec");
+  if (!el) return;
+  const 段 = String(全路径).split("/");
+  const 尾 = 段.slice(-3);
+  el.innerHTML = (段.length > 3 ? '…/' : '') +
+    esc(尾.slice(0, -1).join('/')) + (尾.length > 1 ? '/' : '') +
+    '<b>' + esc(尾[尾.length - 1]) + '</b>';
+  el.title = "Editing this file: " + 全路径;
 }
 
 function stat(){
   const c = {};
   S.行.forEach(r => c[r.决定] = (c[r.决定]||0)+1);
-  const parts = Object.keys(COL).filter(d => c[d]).map(d => d+" "+c[d]);
   const ov = S.行.filter(r => r.改用).length;
-  if(ov) parts.push(ov+" overridden");
   const 冲 = [...S.词.values()].filter(w => w.冲突).length;
-  if(冲) parts.push("⚠ "+冲+" mode conflict"+(冲>1?"s":""));
-  document.getElementById("stat").textContent =
-    S.词.size+" word"+(S.词.size>1?"s":"")+" / "+S.行.length+" row"+(S.行.length>1?"s":"")+" · "+parts.join(" · ");
+  // 顶栏这行是**进度**, 不是清单: 先说规模, 再说人动过什么。
+  // ★ drop 和 drop-word 不能加成一个数 —— 它们写进 JSON 的是**两个不同的字段**
+  //   (单个不生成 / 整个词作废)。加起来看着简洁, 代价是人再也看不出自己废了几个词。
+  //   solo / shared 同理: 那两个就是"逐实例词"和"共用词"两种决策的计数。
+  const 有 = k => c[k] || 0;
+  const 头 = S.词.size + (S.词.size>1?" words":" word") + ", " +
+             S.行.length + (S.行.length>1?" candidates":" candidate");
+  const 尾 = [];
+  if (有('drop'))       尾.push(有('drop') + " dropped");
+  if (有('drop-word'))  尾.push(有('drop-word') + " word" +
+                               (有('drop-word')>1?"s":"") + " cut");
+  if (有('solo'))       尾.push(有('solo') + " per-instance");
+  if (有('shared'))     尾.push(有('shared') + " shared");
+  if (ov)               尾.push(ov + " re-sourced");
+  if (冲)               尾.push("⚠ " + 冲 + " mode conflict" + (冲>1?"s":""));
+  document.getElementById("stat").textContent = 头 + (尾.length ? " — " + 尾.join(", ") : "");
   const b = document.getElementById("save");
   b.disabled = !dirty; b.textContent = dirty ? "Save *" : "Save";
 }
@@ -1514,11 +1705,11 @@ function 词卡(w){
     (w.冲突 ? '<div class="warn">This word has both a solo row and a shared row — '+
               'it would land in SOLO and SOLO_KEEP at once, which is undefined downstream. '+
               'Click a mode button to clear it.</div>' : '')+
-    '<div class="row"><label>Use it?</label>'+
+    '<div class="row">'+
       '<button data-yn="keep" data-w="'+esc(w.词)+'" class="'+(!作废?'on':'')+'">keep</button>'+
       '<button data-yn="drop-word" data-w="'+esc(w.词)+'" class="'+(作废?'on dgr':'')+'">drop word</button>'+
     '</div>'+
-    '<div class="row"><label>Mesh</label>'+模式钮+'</div>'+
+    '<div class="row">'+模式钮+'</div>'+
     '<div class="more">'+
       '<button data-exp="'+esc(w.词)+'"'+(作废?' disabled':'')+'>'+
         'show '+n+' instance'+(n===1?'':'s')+' ▾</button>'+
@@ -1548,7 +1739,7 @@ function 召回卡(r, i){
     '<div class="hd"><b>'+esc(r.词)+'</b>'+
       '<i class="bg rec" title="'+RECALL_WHY+'">recalled</i>'+
       '<span>#'+r.实例+' f'+r.帧+'</span></div>'+
-    '<div class="row"><label>Use it?</label>'+
+    '<div class="row">'+
       '<button data-rio="keep" data-i="'+i+'" class="'+(r.决定!=='drop'?'on':'')+'">keep</button>'+
       '<button data-rio="drop" data-i="'+i+'" class="'+(r.决定==='drop'?'on dgr':'')+'">drop</button>'+
     '</div>'+
@@ -1616,9 +1807,11 @@ function 展开面板(w){
     ? ' · '+ins.length+' here, '+w.实例数+' will be placed ('+
       [淘?淘+' taken by another word':'', 丢?丢+' you dropped':''].filter(Boolean).join(', ')+')'
     : '';
-  t.innerHTML = '<h3>'+esc(w.词)+' · '+ins.length+' instances'+
-    '<span>sorted by median area'+账+' · '+建议+
-    (坏数?' · '+坏数+' mask'+(坏数>1?'s':'')+' look wrong (desaturated)':'')+
+  // ★ 弹层头已经写了词名和数量(见 挂弹层 的 sub), h3 再说一遍就是 40px 内说两次。
+  //   这里只留"怎么读这一屏"的说明。顺带修复 "1 instances" 的复数。
+  t.innerHTML = '<h3>'+(ins.length===1?'One instance':'Largest first')+账+
+    '<span>'+建议+
+    (坏数?'. '+坏数+' mask'+(坏数>1?'s':'')+' look wrong — those are desaturated':'')+
     '</span></h3>'+
     (代警.length ? '<div class="warn">The current representative #'+代.oid+
       ' is itself flagged ('+esc(代警.join('; '))+') — and the mesh for this whole class '+
@@ -1665,10 +1858,15 @@ function 展开面板(w){
            Math.round(100*r.中位面积pct/Math.max(ins[0].中位面积pct,1e-6))+'%"></s></div>'+
         '<div class="glyph"><u style="width:'+bw+'px;height:'+bh+'px"></u>'+
           'AR '+r.ar.toFixed(2)+' · fill '+Math.round(r.fill*100)+'%</div>'+
-        '<div class="dim">alive '+r.活帧数+' frames · f'+r.代表帧+
-          (r.去重淘汰?' · dropped by dedup':'')+
-          (r.VLM否决?' · VLM rejected — not generated':'')+
-          (r.低于门槛?' · below solo threshold':'')+'</div>'+
+        // 上一行是量(帧数/帧号), 下一行是**结论**。原来四样挂在同一根中点轨道上,
+        // 人读不出 "below solo threshold" 是个判定而不是第四个字段。
+        '<div class="dim">alive '+r.活帧数+' frames · f'+r.代表帧+'</div>'+
+        ((r.去重淘汰||r.VLM否决||r.低于门槛)
+          ? '<div class="dim verdict">'+[
+              r.去重淘汰?'dropped by dedup':'',
+              r.VLM否决?'VLM rejected — not generated':'',
+              r.低于门槛?'below solo threshold':''].filter(Boolean).join('; ')+'</div>'
+          : '')+
       '</div>'+
       '<div class="iops">'+
         '<button data-io="keep" data-w="'+esc(w.词)+'" data-oid="'+r.oid+'"'+
@@ -1776,13 +1974,13 @@ function render(){
 
   if (类.length){
     const tot = 类.reduce((s,w)=>s+w.实例数, 0);
-    sec("Class representatives · "+类.length+" word"+(类.length>1?"s":""),
-        "one word = one mesh, shared by every object of that class · "+tot+
-        " objects behind them · open one to see what they look like");
+    sec("Class representatives, "+类.length+" word"+(类.length>1?"s":""),
+        "One word makes one mesh, shared by every object of that class. "+tot+
+        " objects sit behind them — open one to see what they look like.");
     emit(类);
   }
   if (纯实例.length){
-    sec("Per-instance · "+纯实例.length+" word"+(纯实例.length>1?"s":""),
+    sec("Per-instance, "+纯实例.length+" word"+(纯实例.length>1?"s":""),
         "every instance gets its own mesh");
     emit(纯实例);
   }
@@ -1793,7 +1991,7 @@ function render(){
   const 召 = [];
   S.词.forEach(w => w.召回行.forEach(i => 召.push(i)));
   if (召.length){
-    sec("Recalled · "+召.length,
+    sec("Recalled, "+召.length,
         "picked up by WildDet3D where SAM3 missed them — the least trustworthy batch, "+
         "worth a look. Keep or drop only: their cutout has no other frame to switch to");
     召.sort((a,b) => (S.行[b].面积占比||0) - (S.行[a].面积占比||0));
@@ -1834,7 +2032,7 @@ function 绑事件(root){
 function 画闸切换(){
   const el = document.getElementById("gsw");
   if (!el) return;
-  el.innerHTML = [['review','Gate 2/4 · candidates'], ['scale','Gate 3 · scale']]
+  el.innerHTML = [['review','Candidates'], ['scale','Scale']]
     .map(([k,t]) => '<button data-gate="'+k+'" class="'+(GATE===k?'on':'')+'">'+t+'</button>').join('');
   el.querySelectorAll("[data-gate]").forEach(b => b.onclick = () => {
     if (GATE === b.dataset.gate) return;
@@ -1863,8 +2061,12 @@ function rcLoad(){
 }
 
 // 结局 -> 颜色。绿=活下来, 橙=被阈值挡的(阈值是拍的, 可以松), 红=模型没给东西(松也没用)
-const RC色 = {'进表':'#5ab45a', '抠出来太小':'#f0963c', '框对不上':'#f0963c',
-              '框太窄':'#dc3c3c', 'SAM3没给mask':'#dc3c3c', '未知':'#888'};
+// ★ 直接读 CSS 里那五个变量, 别在这儿抄一份 —— 抄一份就会漂: 上一版这里的
+//   #5ab45a / #f0963c / #dc3c3c 和 --keep / --drop / --kill 是三对不同的色号,
+//   同一个含义在两个面板里显示成两种颜色。
+const _c = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const RC色 = () => ({'进表':_c('--keep'), '抠出来太小':_c('--drop'), '框对不上':_c('--drop'),
+              '框太窄':_c('--kill'), 'SAM3没给mask':_c('--kill'), '未知':_c('--pencil')});
 // 结局 -> 一句人话。★ 说的是**下一步该怎么办**, 不是复述字段名。
 // 结局 -> 界面上的英文短标。★ 界面文案一律英文(JSON 字段名照旧中文, 那是数据不是文案)。
 const RC标 = {
@@ -1919,11 +2121,14 @@ function 召回表(){
     h += '<br>Thresholds this run: <code>REC_MIN_PCT='+门槛.REC_MIN_PCT+
          '</code> (mask must cover this % of frame) · <code>REC_MIN_IOU='+
          门槛.REC_MIN_IOU+'</code> (cut mask vs the box recall gave)';
-  h += '<br><span style="color:var(--dim)">source: '+esc(RC.文件||'')+'</span></div>';
+  // 显式 > 猜: 读的是哪一份必须看得见。文件名亮、全路径进 title, 和顶栏同一套做法 ——
+  // 只留 basename 会让人分不清是这一轮的还是上一轮遗留的。
+  h += '<div class="src" title="'+esc(RC.文件||'')+'">read from '+
+       esc(RC.文件||'(nothing)')+'</div></div>';
   t.innerHTML = h;
 
   判.forEach(r => {
-    const 结 = r.结局 || '未知', c = RC色[结] || '#888';
+    const 色表 = RC色(); const 结 = r.结局 || '未知', c = 色表[结] || _c('--pencil');
     const 边 = 擦边(r, 门槛);
     const 数 = [];
     if (r.抠出pct != null) 数.push('cut '+r.抠出pct+'% (floor '+(r.门槛!=null?r.门槛:门槛.REC_MIN_PCT)+'%)');
@@ -1934,7 +2139,7 @@ function 召回表(){
     const d = document.createElement("div");
     d.className = "rcrow";
     d.innerHTML =
-      '<img loading="lazy" width="180" src="/img/recall?'+qs({oid:r.obj_id, size:180})+'">'+
+      '<img loading="lazy" width="230" src="/img/recall?'+qs({oid:r.obj_id, size:230})+'">'+
       '<div class="t">'+
         '<b>'+esc(r.词||'?')+'</b>'+
         '<span style="color:var(--dim);font-size:11px"> #'+r.obj_id+' · frame '+r.最佳帧+'</span>'+
@@ -1955,9 +2160,8 @@ function 召回表(){
     const sc = esc(S.meta.场景名||''), rn = esc(S.meta.轮次||'');
     f.innerHTML = 'Want the rejected ones back? The thresholds are judgement calls, not '+
       'truth — loosen them and re-cut. This step does not touch the GPU (~1 min):'+
-      '<br><code style="user-select:all">REC_MIN_PCT=0.03 REC_MIN_IOU=0.15 \\<br>'+
-      '&nbsp;&nbsp;python pipeline/outdoor_pipeline.py --scene '+sc+' --run '+rn+
-      ' --only recall_mask</code><br>'+
+      '<code class="cmd">REC_MIN_PCT=0.03 REC_MIN_IOU=0.15 python pipeline/outdoor_pipeline.py'+
+      ' --scene '+sc+' --run '+rn+' --only recall_mask</code>'+
       'Then re-run the gate-4 check so the survivors land in the candidate table, '+
       'and reload this page.<br>'+
       '<span style="color:var(--dim)">This console cannot run any of it — it never spawns '+
@@ -1977,7 +2181,7 @@ function 画召回钮(){
   const n = (RC && RC.判词) ? RC.判词.length : null;
   const 活 = (RC && RC.统计) ? (RC.统计['进表'] || 0) : 0;
   el.innerHTML = '<button data-rcopen="1" class="rcb">Recall'+
-    (n == null ? '…' : ' · '+活+'/'+n+' kept')+'</button>';
+    (n == null ? '…' : ' '+活+'/'+n+' kept')+'</button>';
   el.querySelector('[data-rcopen]').onclick = () => 开弹层({view:'recall'});
 }
 
@@ -1997,7 +2201,7 @@ function 挂弹层(){
     : 是源
     ? (M.oid!=null ? '#'+M.oid+' — the cutout you pick here is what SAM3D builds from'
                    : 'any frame of any instance — the cutout you pick is what SAM3D builds from')
-    : w.实例数+' will be placed · keep / drop each, or pick which one builds the mesh';
+    : w.实例数+' will be placed. Keep or drop each one, or pick which builds the mesh.';
   box.innerHTML =
     '<div class="mhd">'+
       (是源 && M.从 ? '<button id="mback">‹ back</button>' : '')+
@@ -2009,6 +2213,8 @@ function 挂弹层(){
   scrim.appendChild(box);
   document.body.appendChild(scrim);
   box.querySelector("#mx").onclick = 关弹层;
+  // 焦点落进弹层。放在挂完之后 —— 元素得先在文档里才 focus 得上。
+  requestAnimationFrame(() => { const x = box.querySelector("#mx"); if (x) x.focus(); });
   const bk = box.querySelector("#mback");
   if (bk) bk.onclick = () => { openTray = null; 开弹层({view:'insts', 词:M.词, oid:null}); };
   绑事件(box);
@@ -2054,15 +2260,19 @@ function tray(w, oid){
     const scope = oid != null
       ? (solo ? 'only #'+oid+'\'s own frames (solo: the override is keyed by instance)'
               : 'frames of #'+oid+' — picking one makes it this class\'s image')
-      : new Set(cs.map(c=>c.oid)).size+' instances · pick the one that best represents this class';
-    t.innerHTML = '<h3>'+esc(w.词)+' frames<span>'+scope+' · '+cs.length+
-      ' sampled · green = in use · click another to switch, click the green one to revert'+
+      : new Set(cs.map(c=>c.oid)).size+' instances — pick the one that best represents this class';
+    t.innerHTML = '<h3>'+esc(w.词)+' frames<span>'+scope+'. '+cs.length+
+      ' sampled, green is in use. Click another to switch, click the green one to revert'+
       '</span></h3><div class="cands"></div>';
     const box = t.querySelector(".cands");
     cs.forEach(c => {
       const isCur  = (c.oid===cur[0]    && c.frame===cur[1]);   // 现在用的
       const isOrig = (c.oid===row.实例  && c.frame===row.帧);    // pick 原本选的
-      const el = document.createElement("div");
+      // ★ 这是决定"哪一帧拿去建 mesh"的控件, 原来是个挂了 onclick 的 <div> ——
+      //   没有 tabindex、没有 role、没有 keydown, 键盘完全够不着。
+      //   用 <button> 而不是补 tabindex: 回车/空格、焦点环、AT 语义全都白送。
+      const el = document.createElement("button");
+      el.type = "button";
       el.className = "cand" + (isCur ? " cur" : "") + (isOrig ? " orig" : "");
       el.innerHTML = '<img loading="lazy" src="/img/cand?'+
         qs({word:w.词,oid:c.oid,frame:c.frame,size:160})+'">'+
