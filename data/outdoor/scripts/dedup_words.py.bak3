@@ -1,0 +1,277 @@
+#!/usr/bin/env python
+"""跨词去重(二维版): 同一批物体被几个同义词各抠一遍, 在生成之前就把多余的词判掉。
+
+起因: VLM 列词表时会把同一个东西说成好几种说法, SAM3 又对每个说法各跟踪一遍。
+beach 上 shop / storefront / restaurant 抠的是同一批 5 栋楼, hot dog cart / hot dog
+stand / kiosk 是同一辆热狗车; timesquare 上 plant pot / planter 是同一批花盆,
+chair / folding chair 是同一批椅子。三份 mask 一路往下走, 就是三次 SAM3D 生成
+(每次 1-2 分钟 GPU)、三个 mesh、三套盒子。
+
+为什么这一步要排在生成之前
+--------------------------
+原来的跨词去重在 boxes_from_masks.py 里, 用三维体素占用判重叠 —— 但 boxes 排在 gen
+之后(它要拿 mesh 的长宽高比例来选词), 于是同义词已经各烧过一次 GPU 才发现是重复的,
+去掉的只是"盒子"的重, mesh 白生成了。
+
+为什么改用二维
+--------------
+判"是不是同一个东西"在同一张照片的像素里比就够了, 不必经过深度和尺度 —— 而深度和尺度
+恰恰是这条链上最不可靠的两环(beach 的深度尺度实测差过 6.4 倍, WildDet3D 抬出来的盒子
+高度在 carpark 上整体差 2.37 倍)。同一条思路 2026-09-08 刚在 merge_recall.py 上用过
+一次: 那里把召回的去重从三维距离改成二维框 IoU, 假漏检从 46 降到 4。
+这里比 merge_recall 还稳一档: 那边是"框 vs 框", 这里两个词的 mask 都是 SAM3 在同一帧
+同一批像素上画的, 可以直接比 mask 本身。
+
+不做什么
+--------
+* 只判"整个词是另一个词的同义词", 不判"这个实例和那个实例是同一个"。
+  car 有 20 个实例, taxi 有 3 个, 三辆出租车确实同时是车 —— 但把 taxi 整个判掉是对的,
+  把 car 整个判掉会丢掉 17 辆车。所以配对率的分母取 max(实例数) 而不是 min: 只有两个词
+  覆盖的物体集合基本重合时才合并, 细词是粗词子集这种情况留给下游三维那步逐实例处理。
+* 部件关系(树冠 vs 整盆植物: 单向包含高、小的明显比大的小)只记录不合并。
+  部件该并进父体还是该单独摆, 得看三维盒子, 这一步看不出来。
+* 两个词从来没在同一帧同时出现过的, 这一步看不见 —— 没有可比的像素。beach 上 planter
+  只活在第 312 帧、potted plant 只活在第 48~98 帧, 一帧都不重叠。这种死角留给
+  boxes_from_masks.py 里那段三维体素去重去捞, 那段因此没有删。
+* 不动 03_masks 里的任何 npz。输的词的 mask 原样留着 —— 判错了只要删掉这个 json
+  就全恢复了, 而删掉的 mask 要重跑一次 SAM3 跟踪才能拿回来。
+
+输出 $R1/03_dedup_words.json, 下游(pick_from_masks / boxes_from_masks)读它的 "淘汰词"。
+只读 mask, 不碰 GPU, 也不碰深度 —— 所以调门槛可以秒级重跑。
+"""
+import os, json
+import numpy as np
+from pycocotools import mask as mask_util
+
+R1  = os.environ.get("R1", "/home/jincheng/sam3d/data/outdoor/result/timesquare/r1")
+MK  = f"{R1}/03_masks"
+OUT = os.environ.get("DW_OUT", f"{R1}/03_dedup_words.json")
+
+# 排除词不参与。它们本来就不往下游走, 让它们参与只有坏处: 万一某个排除词当选了组里的
+# 代表, 整组物体就跟着它一起被排除掉了(beach 的 building 就在 EXCLUDE 里)。
+EXCLUDE = {w.strip() for w in os.environ.get("EXCLUDE", "").split(",") if w.strip()}
+
+# ---- 门槛。名字统一带 DW_ 前缀: 三维那版用的 DUP_TH/PART_TH 是体素占用的门槛, 含义不同,
+#      共用一个名字迟早会被 pipeline 的 CFG 串在一起。
+#
+# DUP_TH 和 PART_RATIO 默认取同一个值, 这不是偷懒: 一个 mask 完全包在另一个里面时,
+# 交集就等于小的那个面积, 于是"较小的那个包含率"恰好等于"小面积/大面积"。两个门槛在这种
+# 情形下是同一条线的两侧 —— 取同一个值中间就不留死区(既判不成重复也判不成部件的灰带)。
+# 而同义词的典型形态正是"完全包含": 粗词多圈了一点。所以这条线上真正要回答的问题只有一个:
+# 多圈了多少还算同一个东西, 多到什么程度才算"父体 vs 部件"。
+#
+# 0.55 是照三个场景的实测挑的, 两侧都有余量:
+#   同一个东西但粗词多圈了一点 —— hot dog cart 完全包在 hot dog stand 里(包含率 1.00),
+#     面积比 0.64, 多出来的是头顶那把伞; scaffolding 完全包在 roller coaster 里,
+#     面积比 0.65, 多出来的是过山车更外围的钢架。这两个都必须判成重复。
+#   真正的同一个东西 —— shop/storefront/restaurant 的 IoU 中位数 0.99, carpark 的
+#     trailer/truck 0.99, dumpster/trash can 0.98, 怎么调都过。
+# 门槛在 0.50~0.65 之间扫过一遍, beach/carpark/timesquare 三个场景的分组一个字都没变,
+# 说明真实的重叠分布在 0.65 以上和 0.4 以下, 中间是空的 —— 这条线放哪儿都行, 取中间。
+DUP_TH     = float(os.environ.get("DW_DUP_TH",   "0.55"))  # 双向包含都超过它 = 这一帧算重复
+PART_TH    = float(os.environ.get("DW_PART_TH",  "0.70"))  # 单向包含超过它 = 可能是部件
+PART_RATIO = float(os.environ.get("DW_PART_RATIO","0.55")) # 且小的面积 < 大的这个比例才算部件
+FRAME_FRAC = float(os.environ.get("DW_FRAME_FRAC","0.50")) # 共同帧里有这么多比例投"重复"票
+MIN_COMMON = int(  os.environ.get("DW_MIN_COMMON","1"))    # 共同帧少于它就不下结论
+WORD_FRAC  = float(os.environ.get("DW_WORD_FRAC", "0.60")) # 配对率(分母取 max 实例数)
+STRIDE     = int(  os.environ.get("DW_STRIDE",    "1"))    # 抽帧比较, 只是速度旋钮
+FRAME_SAT  = float(os.environ.get("FRAME_SAT",    "10"))   # 和 pick_from_masks 保持一致
+
+# ------------------------------------------------------------------ 读盘
+# 每个词一个 npz: meta 是结构化数组(oid/frame/area/edge), counts 是逐行的 RLE, hw 是画幅。
+words = {}          # 词 -> [ (oid, frame, area, edge, rle) ... ]
+skipped = {}        # 词 -> 跳过的原因
+HW = None
+for fn in sorted(os.listdir(MK)):
+    if not fn.endswith(".npz"): continue
+    z = np.load(f"{MK}/{fn}", allow_pickle=True)
+    meta, counts = z["meta"], z["counts"]
+    H, W = (int(x) for x in z["hw"]); HW = (H, W)
+    word = str(z["word"])
+    if word in EXCLUDE:
+        skipped[word] = "在 EXCLUDE 里"; continue
+    rows = [(int(o), int(f), int(a), float(e), counts[i])
+            for i, (o, f, a, e) in enumerate(meta) if a > 0 and int(f) % STRIDE == 0]
+    if not rows:
+        skipped[word] = "没有有效 mask"; continue
+    words[word] = rows
+print(f"[输入] {MK}  {len(words)} 个词参与比较"
+      + (f", 跳过 {len(skipped)} 个 ({', '.join(sorted(skipped))})" if skipped else ""))
+
+# 每个实例(词#oid)出现在哪些帧。共同帧数是分母, 必须包含"两个都在场但没重叠"的帧 ——
+# 只统计重叠过的帧会把"偶尔擦一下边"算成 100% 重复。
+frames_of = {}
+for w, rows in words.items():
+    for oid, fi, a, e, r in rows:
+        frames_of.setdefault((w, oid), set()).add(fi)
+
+by_frame = {}
+for w, rows in words.items():
+    for oid, fi, a, e, r in rows:
+        by_frame.setdefault(fi, []).append((w, oid, a, {"counts": r, "size": [HW[0], HW[1]]}))
+
+# ------------------------------------------------------------------ 逐帧比 mask
+# 全程在 RLE 里做交集(mask_util.merge intersect=1), 不解码成位图: 1080x1920 解一张要
+# 2MB, 一帧五十来个实例解出来就是 100MB; RLE 上求交一次只要几微秒。
+def bbox_miss(b1, b2):
+    """外接框都不挨着就不用求交了。纯粹是省时间, 不影响结论。"""
+    return (b1[0] > b2[0]+b2[2] or b2[0] > b1[0]+b1[2] or
+            b1[1] > b2[1]+b2[3] or b2[1] > b1[1]+b1[3])
+
+pair = {}     # (词A,实例A,词B,实例B) -> dict(重复帧, 部件帧, iou 列表)
+for fi in sorted(by_frame):
+    items = by_frame[fi]
+    if len(items) < 2: continue
+    bb = [mask_util.toBbox(it[3]) for it in items]
+    for i in range(len(items)):
+        wi, oi, ai, ri = items[i]
+        for j in range(i+1, len(items)):
+            wj, oj, aj, rj = items[j]
+            if wi == wj: continue                      # 词内的实例分割由 SAM3 负责, 不是这一步的事
+            if bbox_miss(bb[i], bb[j]): continue
+            inter = float(mask_util.area(mask_util.merge([ri, rj], intersect=1)))
+            if inter <= 0: continue
+            ci, cj = inter/ai, inter/aj
+            small, big = (ai, aj) if ai < aj else (aj, ai)
+            k = (wi, oi, wj, oj) if (wi, oi) < (wj, oj) else (wj, oj, wi, oi)
+            d = pair.get(k)
+            if d is None: d = pair[k] = dict(dup=0, part=0, iou=[])
+            if ci > DUP_TH and cj > DUP_TH:
+                d["dup"] += 1
+                d["iou"].append(inter/(ai+aj-inter))
+            elif max(ci, cj) > PART_TH and small < PART_RATIO*big:
+                d["part"] += 1
+print(f"[逐帧] {len(by_frame)} 帧(步长 {STRIDE}), 有过交集的跨词实例对 {len(pair)} 组")
+
+# ------------------------------------------------------------------ 实例对定性
+# 一帧说了不算: 俯视场景里两个不相干的东西前后叠在一起, 某几帧上确实会重得很厉害。
+# 要求"共同帧里过半都判重复", 相机一动就会露馅的那种假重叠自然被筛掉。
+dup_pairs, part_pairs = [], []
+for (wa, oa, wb, ob), d in pair.items():
+    n_common = len(frames_of[(wa, oa)] & frames_of[(wb, ob)])
+    if n_common < MIN_COMMON: continue
+    rec = dict(A=f"{wa}#{oa}", B=f"{wb}#{ob}", 共同帧=n_common,
+               判重帧=d["dup"], 判部件帧=d["part"],
+               重复占比=round(d["dup"]/n_common, 3),
+               中位IoU=round(float(np.median(d["iou"])), 3) if d["iou"] else 0.0)
+    if d["dup"]/n_common >= FRAME_FRAC:
+        dup_pairs.append(((wa, oa), (wb, ob), rec))
+    elif d["part"]/n_common >= FRAME_FRAC:
+        part_pairs.append(rec)
+print(f"[实例对] 判重复 {len(dup_pairs)} 对, 判部件(不合并, 留给三维那步) {len(part_pairs)} 对")
+
+# ------------------------------------------------------------------ 词对定性
+# 分母取 max(两个词的实例数), 不取 min。这是这一步唯一的安全阀:
+#   min 做分母时, taxi(3 个) 和 car(20 个) 的配对率是 3/3 = 100%, 两个词会被合成一组,
+#   而组里只能活一个 —— 赢的是 car 就丢了出租车的形态, 赢的是 taxi 就丢了 17 辆车。
+#   max 做分母是 3/20 = 15%, 判不成同义词, 交给下游三维那步逐实例处理(那里合并的是
+#   实例不是词, 不存在"整个词消失"的问题)。
+# 合并只发生在"两个词圈的是同一批东西"上, 这也正是这一步想省掉的那部分 GPU。
+by_word_pair = {}
+for (wa, oa), (wb, ob), rec in dup_pairs:
+    by_word_pair.setdefault((wa, wb), []).append(((oa, ob), rec))
+
+n_inst = {w: len({o for o, *_ in rows}) for w, rows in words.items()}
+word_ev = {}
+for (wa, wb), lst in by_word_pair.items():
+    ma = len({p[0][0] for p in lst}); mb = len({p[0][1] for p in lst})
+    denom = max(n_inst[wa], n_inst[wb])
+    frac = min(ma, mb)/denom
+    word_ev[(wa, wb)] = dict(词A=wa, 词B=wb, 实例数=[n_inst[wa], n_inst[wb]],
+                             配对实例数=[ma, mb], 配对率=round(frac, 3),
+                             合并=bool(frac >= WORD_FRAC),
+                             实例对=[r for _, r in sorted(lst, key=lambda x: -x[1]["共同帧"])])
+
+par = {w: w for w in words}
+def find(x):
+    while par[x] != x: par[x] = par[par[x]]; x = par[x]
+    return x
+def union(a, b):
+    a, b = find(a), find(b)
+    if a != b: par[b] = a
+for (wa, wb), ev in word_ev.items():
+    if ev["合并"]: union(wa, wb)
+
+# ------------------------------------------------------------------ 选谁当代表
+# ★ 这一步不能用 mesh 的长宽高比例(三维那版靠它区分 plant pot / potted plant) ——
+#   比例要等生成之后才有, 而这一步的全部意义就是赶在生成之前。只能用 mask 算得出来的量。
+# 三个量, 按这个顺序比:
+#   1. 有效实例数。丢一个词就是丢它多出来的那些物体 —— 同义词里覆盖最全的那个赢,
+#      这是唯一有"不可逆后果"的指标(别的指标选错只是 mesh 差一点, 这个选错是物体没了)。
+#      风险是虚检多的词会占便宜, 但虚检下游还有点数/面积门槛拦, 漏掉的物体没人捡。
+#   2. 最佳候选的 pick 分 —— 直接照抄 pick_from_masks 的打分公式
+#      (面积 x (1-贴边惩罚) x min(帧数/10,1))。赢家马上就要被那一步拿去挑生成样本,
+#      与其另发明一个"完整度", 不如直接问"谁能给出更好的生成样本"。
+#   3. 总面积。放在最后是因为它单独用很危险: 词越粗、圈得越多面积越大, beach 上
+#      building 那个词就是把整个餐厅露台连人带伞烘成一坨, 按面积它稳赢。
+#      但组内是安全的 —— 能进同一组说明双向包含都过了 DUP_TH, 面积差被限死在
+#      1/DUP_TH 倍以内, 那种"吞掉一大片"的词根本进不来这个组。
+#
+# ★ 这里为什么不需要 boxes_from_masks.py 里那张"细词赢粗词"的优先级表(RANK):
+#   那张表管的是"已经生成完了, 该给这个盒子挂哪个 mesh", 不同的词挂的是不同的 mesh,
+#   粗词的 mesh 确实更泛。这一步管的是"哪张 mask 送去生成", 而 SAM3D 是看图生成的 ——
+#   timesquare 上 chair 和 folding chair 圈的是同一批折叠椅, 不管用哪个词送进去,
+#   SAM3D 看到的都是那把折叠椅的像素, 出来的 mesh 一样。词在这里只是个文件名。
+#   (实测 chair 32 个实例 / folding chair 30 个, 按实例数留 chair, 多留住 2 把椅子。)
+def stat(w):
+    rows = words[w]
+    per = {}
+    for oid, fi, a, e, r in rows: per.setdefault(oid, []).append((a, e))
+    best = 0.0
+    for oid, rs in per.items():
+        nf = min(len(rs)/FRAME_SAT, 1.0)
+        for a, e in rs:
+            best = max(best, 100.0*a/(HW[0]*HW[1]) * (1-min(e*4, 0.9)) * nf)
+    return dict(实例数=len(per), 最佳样本分=round(best, 4),
+                总面积=int(sum(a for a, e in (x for v in per.values() for x in v))),
+                活帧数中位=int(np.median([len(v) for v in per.values()])))
+
+STATS = {w: stat(w) for w in words}
+def key(w):
+    s = STATS[w]
+    return (-s["实例数"], -s["最佳样本分"], -s["总面积"], w)   # 末位加词名, 保证结果可复现
+
+groups = {}
+for w in words: groups.setdefault(find(w), []).append(w)
+
+out_groups, losers = [], []
+for g in groups.values():
+    if len(g) < 2: continue
+    g = sorted(g)
+    win = min(g, key=key)
+    lose = [w for w in g if w != win]
+    losers += lose
+    ev = [word_ev[k] for k in word_ev if k[0] in g and k[1] in g and word_ev[k]["合并"]]
+    out_groups.append(dict(词=g, 胜出=win, 淘汰=lose,
+                           各词=dict((w, STATS[w]) for w in g),
+                           证据=ev))
+out_groups.sort(key=lambda x: -len(x["词"]))
+
+json.dump(dict(
+    参数=dict(DW_DUP_TH=DUP_TH, DW_PART_TH=PART_TH, DW_PART_RATIO=PART_RATIO,
+              DW_FRAME_FRAC=FRAME_FRAC, DW_WORD_FRAC=WORD_FRAC,
+              DW_MIN_COMMON=MIN_COMMON, DW_STRIDE=STRIDE, EXCLUDE=sorted(EXCLUDE)),
+    组=out_groups, 淘汰词=sorted(set(losers)),
+    未参与=skipped, 各词=STATS,
+    # 部件关系只记录不执行 —— 留个凭据, 万一下游三维那步把某个部件误当独立物体摆出来了,
+    # 回头能在这里查到"二维早就看出它包在谁里面"。
+    部件关系=sorted(part_pairs, key=lambda r: -r["共同帧"])[:200],
+    # 没合并的词对也留着: 调门槛时最想看的就是"差一点就合并了的是哪几对"。
+    落选词对=sorted([v for v in word_ev.values() if not v["合并"]],
+                 key=lambda v: -v["配对率"])[:50],
+), open(OUT, "w"), ensure_ascii=False, indent=1)
+
+print(f"\n[分组] {len(out_groups)} 组同义词, 淘汰 {len(set(losers))} 个词")
+for g in out_groups:
+    print(f"  {g['胜出']:16s} <= {', '.join(g['词'])}")
+    for w in g["词"]:
+        s = STATS[w]
+        print(f"      {'★' if w == g['胜出'] else ' '} {w:16s} 实例{s['实例数']:3d}  "
+              f"样本分{s['最佳样本分']:8.4f}  总面积{s['总面积']:10d}  活帧中位{s['活帧数中位']:4d}")
+    for e in g["证据"]:
+        top = e["实例对"][0] if e["实例对"] else {}
+        print(f"      · {e['词A']} vs {e['词B']}: 配对 {e['配对实例数']}/{e['实例数']} "
+              f"配对率 {e['配对率']}"
+              + (f", 例 {top.get('A')}~{top.get('B')} 共同帧{top.get('共同帧')} "
+                 f"判重{top.get('重复占比')} 中位IoU{top.get('中位IoU')}" if top else ""))
+print(f"\n[done] -> {OUT}")

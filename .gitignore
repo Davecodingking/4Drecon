@@ -1,0 +1,23 @@
+# 白名单式: 默认忽略一切, 只放行代码。
+# ★ 这个仓库只用来给代码留回退点。~/sam3d 底下有 26G 的 sam-3d-objects、20G 的
+#   sam-body4d、6.6G 的 data —— 黑名单式的 .gitignore 只要漏一条就会把几十 G 吞进
+#   .git 里, 而且删不干净。所以反过来: 先 /* 全挡, 再逐条 ! 放行。
+/*
+!.gitignore
+!tools/
+!pipeline/
+!docs/
+!ROADMAP.md
+!.claude/
+.claude/*
+!.claude/skills/
+# 代码目录里也只要文本
+tools/**/__pycache__/
+pipeline/**/__pycache__/
+**/*.pyc
+!data/
+data/*
+!data/outdoor/
+data/outdoor/*
+!data/outdoor/scripts/
+!data/outdoor/ISSUES.md

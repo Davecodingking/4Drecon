@@ -1,0 +1,334 @@
+<title>穿模与墙地综述</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;600;700&family=Noto+Sans+SC:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root{
+    --bg:#F2F4F6; --surface:#FFFFFF; --surface-2:#E9EDF1; --ink:#182029; --ink-2:#4B5663; --ink-3:#7A8592;
+    --line:#D3DAE1; --accent:#2B57A6; --accent-ink:#FFFFFF; --accent-soft:#DCE6F6;
+    --warn:#B8651A; --warn-soft:#F6E7D6; --ok:#2C7A4B; --ok-soft:#DCEFE2; --code-bg:#EEF1F4;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#0E1318; --surface:#161C23; --surface-2:#1E262F; --ink:#E4E9EE; --ink-2:#A9B4BF; --ink-3:#7C8794;
+      --line:#2A333D; --accent:#7EA6EA; --accent-ink:#0E1318; --accent-soft:#1D2B44;
+      --warn:#E1A25C; --warn-soft:#3A2A16; --ok:#6FC08F; --ok-soft:#173424; --code-bg:#1B222A;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0E1318; --surface:#161C23; --surface-2:#1E262F; --ink:#E4E9EE; --ink-2:#A9B4BF; --ink-3:#7C8794;
+    --line:#2A333D; --accent:#7EA6EA; --accent-ink:#0E1318; --accent-soft:#1D2B44;
+    --warn:#E1A25C; --warn-soft:#3A2A16; --ok:#6FC08F; --ok-soft:#173424; --code-bg:#1B222A;
+  }
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion: reduce){ html{scroll-behavior:auto} }
+  body{background:var(--bg); color:var(--ink); font-family:"Noto Sans SC","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif; font-size:16px; line-height:1.75; margin:0; -webkit-font-smoothing:antialiased}
+  h1,h2,h3{font-family:"Familjen Grotesk","Noto Sans SC","PingFang SC",system-ui,sans-serif; text-wrap:balance; line-height:1.2; margin:0}
+  h1{font-size:clamp(30px,4.5vw,44px); font-weight:700; letter-spacing:-0.01em}
+  h2{font-size:26px; font-weight:700; margin-top:8px}
+  h3{font-size:18px; font-weight:600}
+  p{margin:0}
+  a{color:var(--accent); text-decoration:none; border-bottom:1px solid color-mix(in srgb,var(--accent) 40%,transparent)}
+  a:hover{border-bottom-color:var(--accent)}
+  a:focus-visible,button:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+  code,.mono{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.9em}
+  code{background:var(--code-bg); padding:1px 5px; border-radius:3px}
+  .wrap{max-width:1180px; margin:0 auto; padding:40px 24px 96px; display:grid; grid-template-columns:220px minmax(0,1fr); gap:48px}
+  @media (max-width:900px){ .wrap{grid-template-columns:minmax(0,1fr); gap:24px} nav.toc{position:static} }
+  nav.toc{position:sticky; top:24px; align-self:start; font-size:13.5px; display:flex; flex-direction:column; gap:6px}
+  nav.toc .eyebrow{margin-bottom:6px}
+  nav.toc a{color:var(--ink-2); border:0; padding:3px 0}
+  nav.toc a:hover{color:var(--accent)}
+  main{display:flex; flex-direction:column; gap:56px; min-width:0}
+  header.hero{display:flex; flex-direction:column; gap:18px; padding-bottom:28px; border-bottom:1px solid var(--line)}
+  .eyebrow{font-family:"IBM Plex Mono",monospace; font-size:12px; letter-spacing:0.12em; text-transform:uppercase; color:var(--ink-3)}
+  .lede{font-size:18px; color:var(--ink-2); max-width:68ch}
+  .meta{display:flex; flex-wrap:wrap; gap:8px 20px; font-size:13px; color:var(--ink-3); font-family:"IBM Plex Mono",monospace}
+  section{display:flex; flex-direction:column; gap:20px; scroll-margin-top:24px}
+  section > p, section li{max-width:72ch}
+  ul,ol{margin:0; padding-left:1.3em; display:flex; flex-direction:column; gap:8px}
+  .tldr{background:var(--surface); border:1px solid var(--line); border-left:4px solid var(--accent); padding:20px 24px; display:flex; flex-direction:column; gap:12px}
+  .tldr ol{gap:10px}
+  .pipeline{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px}
+  .pipeline .step{background:var(--surface); border:1px solid var(--line); padding:12px 14px; font-size:14px; display:flex; flex-direction:column; gap:4px}
+  .pipeline .step .k{font-family:"IBM Plex Mono",monospace; font-size:11.5px; color:var(--ink-3); letter-spacing:0.06em; text-transform:uppercase}
+  .pipeline .step.gap{border-style:dashed; border-color:var(--warn); background:var(--warn-soft)}
+  .pipeline .step.gap .k{color:var(--warn)}
+  .tablewrap{overflow-x:auto; border:1px solid var(--line); background:var(--surface)}
+  table{border-collapse:collapse; width:100%; font-size:14px; min-width:820px}
+  th,td{text-align:left; vertical-align:top; padding:10px 12px; border-bottom:1px solid var(--line)}
+  th{font-family:"IBM Plex Mono",monospace; font-size:12px; letter-spacing:0.06em; text-transform:uppercase; color:var(--ink-3); font-weight:500; background:var(--surface-2); position:sticky; top:0}
+  tbody tr:last-child td{border-bottom:0}
+  td.name{white-space:nowrap; font-weight:500}
+  td .venue{display:block; font-family:"IBM Plex Mono",monospace; font-size:11.5px; color:var(--ink-3); font-weight:400}
+  .pill{display:inline-block; font-family:"IBM Plex Mono",monospace; font-size:11.5px; padding:1px 7px; border-radius:3px; background:var(--surface-2); color:var(--ink-2); white-space:nowrap}
+  .pill.ok{background:var(--ok-soft); color:var(--ok)}
+  .pill.warn{background:var(--warn-soft); color:var(--warn)}
+  .pill.acc{background:var(--accent-soft); color:var(--accent)}
+  .cards{display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:14px}
+  .card{background:var(--surface); border:1px solid var(--line); padding:16px 18px; display:flex; flex-direction:column; gap:8px; font-size:14.5px}
+  .card h3{font-size:16px}
+  .card .who{font-family:"IBM Plex Mono",monospace; font-size:12px; color:var(--ink-3)}
+  .callout{background:var(--accent-soft); border:1px solid color-mix(in srgb,var(--accent) 35%,transparent); padding:14px 18px; font-size:14.5px; max-width:72ch}
+  .callout.warn{background:var(--warn-soft); border-color:color-mix(in srgb,var(--warn) 45%,transparent)}
+  .recs{display:flex; flex-direction:column; gap:14px}
+  .rec{background:var(--surface); border:1px solid var(--line); padding:16px 20px; display:grid; grid-template-columns:auto minmax(0,1fr); gap:6px 16px; align-items:start}
+  .rec .rank{font-family:"Familjen Grotesk",sans-serif; font-weight:700; font-size:26px; color:var(--accent); line-height:1; padding-top:2px}
+  .rec h3{grid-column:2}
+  .rec p,.rec ul{grid-column:2; font-size:14.5px}
+  .rec .tags{grid-column:2; display:flex; flex-wrap:wrap; gap:6px}
+  .refs{font-size:14px; columns:2; column-gap:36px}
+  @media (max-width:900px){ .refs{columns:1} }
+  .refs li{break-inside:avoid; margin-bottom:8px; padding-left:0}
+  .refs .id{font-family:"IBM Plex Mono",monospace; color:var(--ink-3); font-size:12px}
+  .num{font-variant-numeric:tabular-nums}
+  hr{border:0; border-top:1px solid var(--line); margin:0}
+</style>
+
+<div class="wrap">
+<nav class="toc" aria-label="目录">
+  <div class="eyebrow">目录</div>
+  <a href="#tldr">结论先行</a>
+  <a href="#frame">我们的流水线缺什么</a>
+  <a href="#collision">一、穿模 / 悬空 / 支撑</a>
+  <a href="#room">二、墙、地、天花板与背景</a>
+  <a href="#gravity">三、重力方向与相机</a>
+  <a href="#borrow">四、给我们流水线的具体建议</a>
+  <a href="#metrics">五、该用什么指标</a>
+  <a href="#refs">文献</a>
+</nav>
+
+<main>
+<header class="hero">
+  <div class="eyebrow">Literature review · image → 3D scene</div>
+  <h1>单图场景重建里的穿模与墙地问题</h1>
+  <p class="lede">现状：家具用 SAM 3D 逐个生成，MoGe 拟合地面法线当 z-up，歪头和悬空已经解决；剩下两件事——物体之间穿模，以及墙、地板、天花板这类大面积结构怎么表示。下面梳理 2024–2026 年直接相关的工作，重点看谁的做法能直接搬到我们这条线上。</p>
+  <div class="meta"><span>整理于 2026-08-27</span><span>覆盖 26 篇工作</span><span>重点：SAM 3D 系（4 篇）、物理后处理、房间结构</span></div>
+</header>
+
+<section id="tldr">
+  <div class="tldr">
+    <h2>结论先行</h2>
+    <ol>
+      <li><strong>穿模问题已经有一条成熟且和我们完全同构的路线：</strong>2026 年出了四篇"SAM 3D 逐物体生成 + 事后物理整理"的工作（REST3D、ϕ-Scene、RoboSnap、SimuScene），做法都是三步：推断"谁支撑谁"的支撑图 → 按支撑顺序用 SDF 逐个消除穿插 → 扔进刚体模拟器让它落稳。我们的 <code>scene_phys.py</code> 已经走完第一步（几何规则版支撑图 + 扶正 + 落地），差的是后两步。REST3D 报告 SAM 3D 原生的物体碰撞率 41.8% 降到 2.7%，稳定率 8.9% 升到 94.9%。</li>
+      <li><strong>最省事的切入点是 MV-SAM3D：</strong>它直接在 SAM 3D 的 flow 采样里加"体积重叠惩罚 + 接触约束"的引导，再对输出 mesh 做位姿微调，碰撞率 15.3% → 0，代码公开。我们已经有 SAM 3D 环境，理论上是"加一段引导"而不是换模型。</li>
+      <li><strong>墙、地、天花板：没有任何一篇用物体生成器去生成它们。</strong>所有工作都把房间结构当"平面"处理——从深度点云按语义 mask 做 RANSAC 拟平面、相邻平面求交线裁成多边形（Diorama、ACDC、RoboSnap）；被家具挡住的部分要么先"去家具化"补全图再估深度（Diorama、Li 2025），要么用小 MLP 拟合 SDF 让它自动插值（Gen3DSR）。我们手里 MoGe 点云 + SAM 3 的 wall/floor/ceiling mask 已经齐了，缺的只是这一步拟合。</li>
+      <li><strong>联合生成（MIDI、SceneGen、PixARMesh）目前不能替代后处理：</strong>它们靠训练数据学"合理布局"，没有硬约束，SceneGen 自己承认仍会穿插；而且都只在 3D-FRONT 合成室内数据上训练。</li>
+    </ol>
+  </div>
+</section>
+
+<section id="frame">
+  <h2>我们的流水线缺什么</h2>
+  <p>把现在的链路摆出来，缺口就清楚了。虚线框是文献里有成熟做法、我们还没接的环节。</p>
+  <div class="pipeline">
+    <div class="step"><span class="k">有</span>SAM 3 按类别 / 点选出实例 mask</div>
+    <div class="step"><span class="k">有</span>SAM 3D 逐物体生成形状 + 相机系位姿</div>
+    <div class="step"><span class="k">有</span>MoGe 点云 → 地面法线 → z-up，解决歪头/悬空</div>
+    <div class="step"><span class="k">有 · 几何规则版</span>支撑关系（<code>scene_phys.py</code>）：脚印覆盖 + 台面高度找"脚下是什么"，先支撑后被支撑，挂墙/吊顶/软物分类处理</div>
+    <div class="step gap"><span class="k">部分</span>去穿插：<code>scene_fix.py</code> 按 AABB 相交体积推开；文献用 SDF 接触约束（穿进去罚、离开也罚）</div>
+    <div class="step gap"><span class="k">缺</span>刚体模拟落稳；墙/地/天花板作为平面重建，被遮挡部分补全（现在墙地是 SAM 3D 物体 + 深度对齐）</div>
+  </div>
+  <p>和文献比，支撑图这一步我们不缺，差别在<strong>来源</strong>：我们用几何 + 类别白名单推断，文献多用 VLM 从图里读语义关系。几何版的好处是确定、不用 API；VLM 版能回答几何回答不了的问题——"支撑物没被分割出来"（报告里 4 个"未知"）、靠着墙（lean）、放在容器里（contained）、椅子半塞在桌下。两者可以叠加：几何版给默认，VLM 只裁决"未知"和冲突。</p>
+  <div class="callout">SAM 3D 论文自己的定位（<a href="https://arxiv.org/abs/2511.16624">arXiv 2511.16624</a>）：对每个 mask 独立预测 (R, t, s)，"没有任何物体间推理，不做碰撞检测和场景级约束"；pointmap 只是可选条件，且"形状质量不依赖 pointmap"；不重建墙地背景。它提供的唯一场景级手段是 render-and-compare 的事后位姿优化——就是我们 <code>--layout</code> 开关那个，逐物体独立、只对齐轮廓，管不了穿模。</div>
+</section>
+
+<section id="collision">
+  <h2>一、穿模 / 悬空 / 支撑：五条路线</h2>
+  <p>把 2024–2026 的工作按"约束加在哪一步"分成五类。对我们最有用的是 A、B、C，因为它们都不动生成器。</p>
+
+  <div class="cards">
+    <div class="card">
+      <h3>A · 先问 VLM"谁支撑谁"</h3>
+      <p class="who">CAST · REST3D · ϕ-Scene · Diorama · ACDC · RoboSnap</p>
+      <p>把带编号 mask 的图交给 GPT-4V / Gemini，输出每个物体的支撑父节点（地面 / 墙 / 天花板 / 某物体）和关系类型。CAST 的技巧值得抄：不直接问 support/contact，先问更细的 Stack / Lean / Hang / Clamped / Contained / Edge，多次随机着色投票（&gt;50% 才采纳），再折叠成"支撑（有向）"和"接触（无向）"两种边。REST3D 把根节点固定成 ground / wall / ceiling / ground-wall 四个，物体是"on / hanging / attached"。有了这张图，后面的优化就有了顺序（拓扑排序）和目标（贴住父节点表面）。</p>
+    </div>
+    <div class="card">
+      <h3>B · SDF 位姿优化去穿插</h3>
+      <p class="who">CAST · ϕ-Scene · RoboSnap · ACDC · Diorama（SAT）</p>
+      <p>每个物体 mesh 预计算 SDF；按支撑顺序逐个放置，只优化平移（ϕ-Scene）或旋转+平移（CAST），尺度冻结。ϕ-Scene 的损失最简洁：在当前物体和已放好的上下文物体表面各采 2048 点，双向算清距离，穿进去罚、离开超过 ε=0.005 也罚（保证接触而不是悬空），Adam lr 5e-3 最多 300 步。CAST 另加"支撑约束"（单向，把被支撑物拉到支撑面）和对地面/墙这类平面的特殊正则。Diorama 用的是凸多边形分离轴定理，粗但快。</p>
+    </div>
+    <div class="card">
+      <h3>C · 刚体模拟落稳</h3>
+      <p class="who">ϕ-Scene（Blender）· REST3D（Isaac Gym）· RoboSnap（SAPIEN）· SimuScene</p>
+      <p>SDF 只保证"不穿"，不保证"站得住"。做法：VHACD 凸分解当碰撞体，按支撑顺序逐个释放，重力下模拟 60–120 帧，位姿变化小于阈值即落稳。REST3D 更进一步，把模拟结果当能量函数（稳定性漂移 + 峰值速度 + 凸包穿插 + 与原布局偏差），用交叉熵法（CEM，每轮 2048 个候选）在 Isaac Gym 里搜 6-DoF 位姿，先按支撑树局部优化再全局优化。SimuScene 反过来用模拟当"诊断"：掉下去或穿插就回去改形状（沿重力轴拉伸、重采样 amodal 形状）。</p>
+    </div>
+    <div class="card">
+      <h3>D · 生成过程中加约束</h3>
+      <p class="who">MV-SAM3D · PhyScene · SceneGen</p>
+      <p>MV-SAM3D 在 SAM 3D 的 flow-matching 轨迹上加物理引导（罚体积重叠、要求接触），输出后再做一次带碰撞/接触约束的位姿优化，多物体碰撞率 15.32% → 0，空间准确率 60% → 92%。PhyScene（CVPR 2024）是布局扩散模型上加碰撞/房间边界/可达性引导，思路同源但对象是布局合成不是重建。SceneGen 用 64³ 体素上的重叠损失训练，作者承认仍会穿插——训练时的软约束不如推理时的硬约束。</p>
+    </div>
+    <div class="card">
+      <h3>E · 联合建模让模型自己学</h3>
+      <p class="who">MIDI · PixARMesh · SceneGen · DepR</p>
+      <p>MIDI 在多实例间加注意力，PixARMesh 把位姿和网格串成一条自回归序列，SceneGen 用场景级自注意力。共同点：布局合理性来自 3D-FRONT 先验，没有显式碰撞项，也不重建背景。我们上午跑的 PixARMesh 结果印证了这点——布局连贯，但尺寸偏大、局部仍有交叠。适合当参考，不适合当我们的物理保障。</p>
+    </div>
+    <div class="card">
+      <h3>旁支 · 可微物理直接进重建</h3>
+      <p class="who">PhyRecon（NeurIPS 2024）</p>
+      <p>把粒子刚体模拟做成可微，和体渲染一起训练隐式表面，稳定性提升 40%+。但它是多视角 NeRF/SDF 路线，和我们单图 + 生成式的设定不同，只作为"物理损失可以直接反传到几何"的参考。</p>
+    </div>
+  </div>
+
+  <h3>对照表</h3>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>工作</th><th>逐物体生成器</th><th>支撑图来源</th><th>去穿插</th><th>落稳模拟</th><th>墙 / 地</th><th>报告的物理指标</th><th>代码</th></tr></thead>
+    <tbody>
+      <tr><td class="name">REST3D<span class="venue">arXiv 2605.30338 · CMU · 2026-05</span></td><td>SAM 3D（SAM 3 + Gemini 代理式分割）</td><td>VLM 场景树，根=ground/wall/ceiling</td><td>凸包穿插能量项</td><td>Isaac Gym + CEM 搜位姿</td><td>墙面从落稳物体的包围盒拟合，挂墙物体启发式贴上</td><td class="num">碰撞 2.7%，稳定 94.9%，漂移 0.07 m（SAM 3D 原生 41.8% / 8.9% / 1.08 m）</td><td><span class="pill">项目页 + prompt</span></td></tr>
+      <tr><td class="name">ϕ-Scene<span class="venue">arXiv 2606.21596 · UCSD · 2026-06</span></td><td>SAM 3D（可选 TRELLIS.2 整体先验做 OBB 校正）</td><td>Gemini-2.5-Flash，Kahn 拓扑排序</td><td>双向 SDF 清距损失，只优化平移</td><td>Blender/BlenderProc，VHACD，120 帧</td><td>只有地面（盒碰撞体），不重建墙</td><td class="num">穿深 0.0011 vs 0.0239，落稳旋转漂移 0.6° vs 82.9°</td><td><span class="pill">项目页</span></td></tr>
+      <tr><td class="name">RoboSnap<span class="venue">arXiv 2607.06699 · 2026-07</span></td><td>SAM 3 + SAM 3D，VGGT 点云 ICP 配准</td><td>VLM 物理场景图</td><td>SDF 相位：穿插 + 支撑/接触损失</td><td>SAPIEN，与 SDF 相位交替</td><td>VGGT 前景点拟支撑平面定重力系；背景=去家具补全 + 世界模型生成 3DGS</td><td class="num">300 步后掉落率/碰撞率/漂移</td><td><span class="pill">未明</span></td></tr>
+      <tr><td class="name">SimuScene<span class="venue">arXiv 2606.03994 · SNU · 2026-06</span></td><td>逐物体生成（组合式）</td><td>—</td><td>模拟当诊断，反馈到形状修正</td><td>是（重力诊断）</td><td>未说明</td><td class="num">稳定性 + 几何对齐 SOTA（自报）</td><td><span class="pill">项目页</span></td></tr>
+      <tr><td class="name">MV-SAM3D<span class="venue">arXiv 2603.11633 · 2026-03</span></td><td>SAM 3D（多视角 latent 融合，Depth Anything 3 度量点云）</td><td>—</td><td>生成中：flow 引导罚重叠+接触；生成后：位姿优化</td><td>否</td><td>否</td><td class="num">碰撞 15.32% → 0；空间准确率 60.2% → 91.7%</td><td><span class="pill ok">GitHub</span></td></tr>
+      <tr><td class="name">CAST<span class="venue">TOG / SIGGRAPH 2025 · arXiv 2502.12894</span></td><td>自研 1.5B 遮挡感知生成器（MAE + 点云条件）</td><td>GPT-4V + Set-of-Mark，细粒度关系投票</td><td>SDF 接触 + 支撑约束，优化 R,t</td><td>否（静态，作为物理引擎初始化）</td><td>不重建；地/墙作为隐式平面参与 SDF 约束</td><td class="num">用户研究 PP 分、GPT 排名、3D-FRONT CD/F-score</td><td><span class="pill warn">未公开</span></td></tr>
+      <tr><td class="name">Diorama<span class="venue">ICCV 2025</span></td><td>CAD 检索（DuoDuoCLIP）</td><td>GPT-4o：placed on / mounted on</td><td>四阶段：朝向→放置→越界→SAT 碰撞</td><td>否</td><td>PlainRecon：去家具→Metric3D v2→法线聚类 RANSAC 平面→凸包</td><td>—</td><td><span class="pill ok">GitHub</span></td></tr>
+      <tr><td class="name">ACDC / Digital Cousins<span class="venue">CoRL 2024 · arXiv 2410.07408</span></td><td>资产检索</td><td>GPT-4 判断落地还是挂墙</td><td>de-penetration</td><td>是（仿真场景）</td><td>点云拟合地面和墙平面</td><td>—</td><td><span class="pill ok">GitHub</span></td></tr>
+      <tr><td class="name">SceneGen<span class="venue">arXiv 2508.15769 · SJTU</span></td><td>一次前向多资产</td><td>—</td><td>训练时 64³ 体素重叠损失</td><td>否</td><td>否</td><td>承认仍有穿插</td><td><span class="pill">待放出</span></td></tr>
+      <tr><td class="name">MIDI<span class="venue">CVPR 2025</span></td><td>多实例扩散</td><td>—</td><td>无显式项（注意力学）</td><td>否</td><td>否</td><td>—</td><td><span class="pill ok">GitHub</span></td></tr>
+      <tr><td class="name">PixARMesh<span class="venue">CVPR 2026</span></td><td>自回归位姿+网格</td><td>—</td><td>无</td><td>否</td><td>明确忽略</td><td>—</td><td><span class="pill ok">GitHub（已在本机跑通）</span></td></tr>
+      <tr><td class="name">TelePhysics<span class="venue">arXiv 2605.20290 · 2026-05</span></td><td>逐物体 mesh</td><td>—</td><td>统一世界坐标 + 锚定标准地面平面（Scene-Aware Pose Alignment）</td><td>是（实时交互）</td><td>地面平面</td><td>60 场景交互测试</td><td><span class="pill">项目页</span></td></tr>
+      <tr><td class="name">PhyScene<span class="venue">CVPR 2024</span></td><td>布局合成（非重建）</td><td>—</td><td>扩散引导：碰撞 + 房间边界 + 可达性</td><td>否</td><td>房间布局作为约束输入</td><td>碰撞率等</td><td><span class="pill ok">GitHub</span></td></tr>
+      <tr><td class="name">LayoutVLM / Scenethesis<span class="venue">CVPR 2025 / 2025</span></td><td>资产库</td><td>VLM 给关系 + 数值初值</td><td>关系转成可微目标函数优化</td><td>Scenethesis 有物理感知优化</td><td>房间边界约束</td><td>碰撞/稳定失败次数</td><td><span class="pill ok">有</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>读表的结论：<strong>凡是报了硬数字的，都是"SDF + 模拟"两段式</strong>；凡是只靠模型学的，要么没报碰撞指标，要么承认还有。REST3D 和 ϕ-Scene 的对照组就是裸 SAM 3D，数字可以直接当我们的基线。</p>
+</section>
+
+<section id="room">
+  <h2>二、墙、地、天花板与背景</h2>
+  <p>你观察到的现象——用 SAM 3D 逐块生成墙体会断裂、地板不完整——文献里没有人试图用物体生成器解决，原因很简单：生成器学的是"有边界的物体"，墙地是被画幅切断的无边界平面，模型只能脑补一个盒子。可用的表示分四档，按几何干净程度从高到低：</p>
+
+  <div class="cards">
+    <div class="card">
+      <h3>1 · 语义平面（推荐）</h3>
+      <p class="who">Diorama · ACDC · RoboSnap · REST3D · Total3D 传统</p>
+      <p>用 wall / floor / ceiling 的 mask 从度量深度点云里切点，每块 RANSAC 拟一个平面，法线聚类合并共面块，相邻平面求交线得到墙角、墙脚线，裁成多边形。Diorama 的 PlainRecon 三步（去家具 → Metric3D v2 → 法线聚类 + RANSAC + 凸包）是最完整的描述。产出是几十个面的干净板子，正好和紧凑家具网格风格一致，也能直接当物理碰撞体。缺点：只能表达平面，弧形墙、拱门要另处理。</p>
+    </div>
+    <div class="card">
+      <h3>2 · 先"去家具"再估深度</h3>
+      <p class="who">Diorama（LaMa）· Li 2025（专训 inpainting）· RoboSnap</p>
+      <p>被沙发挡住的那段墙脚在深度图里根本不存在。做法：把家具 mask 抠掉用 inpainting 补成空房间图，再估深度，就能得到完整的墙地平面。Diorama 用现成 LaMa；Li 2025（arXiv 2512.17955）专门训练了预测房间布局的 inpainting 模型并配"混合深度估计"，在 3D-FRONT 上超过 SOTA。这一步是"地板不完整"的直接解药。</p>
+    </div>
+    <div class="card">
+      <h3>3 · 隐式曲面自动插值</h3>
+      <p class="who">Gen3DSR（3DV 2025）</p>
+      <p>不分平面，把所有"stuff"像素反投影的点交给一个小 MLP 拟合 SDF（另一个拟颜色），marching cubes 抽面；被遮挡的区域由网络根据周围自动插值。优点是不限于平面、实现简单；作者承认大面积遮挡处会有洞和细节不足，且物体和背景之间无约束、会互相穿插。</p>
+    </div>
+    <div class="card">
+      <h3>4 · 视觉背景幕布（3DGS / 深度片）</h3>
+      <p class="who">RoboSnap · HunyuanWorld 1.0 · TelePhysics</p>
+      <p>不追求干净几何，只要看起来对：RoboSnap 用世界模型把补全后的背景生成 3DGS，再用稀疏对应对齐到重力系；HunyuanWorld 把全景图分成天空 / 背景 / 物体三层，背景用"深度片翘曲 + 自适应深度压缩"做成网格。适合展示和漫游，不适合物理和编辑。可以和第 1 档叠加：平面当碰撞体，3DGS 当外观。</p>
+    </div>
+  </div>
+
+  <h3>拿"结构"而不是"面"的工具</h3>
+  <ul>
+    <li><strong>SpatialLM</strong>（NeurIPS 2025，<a href="https://github.com/manycore-research/SpatialLM">代码 + HF 权重</a>）：输入点云，LLM 直接输出墙段、门、窗和物体有向框的 Python 结构。在 5.5 万个合成房间上训练，对我们 MoGe 单目点云的鲁棒性要试；但一旦可用，墙的拓扑（哪几面墙、门开在哪）就是免费的。</li>
+    <li><strong>Layout Anything</strong>（arXiv 2512.02952）、<strong>uLayout</strong>（arXiv 2503.21562）：单张透视图直接出房间布局线（墙-地、墙-墙、墙-天花板边界），已知内参就能升成平面。适合家具遮挡严重、点云拟合失败的情况做兜底。</li>
+    <li><strong>ZeroPlane</strong>（CVPR 2025 Highlight，<a href="https://github.com/jcliu0428/ZeroPlane">代码</a>）：野外单图平面检测 + 法线/偏移重建，14 个数据集 56 万标注训练。可替代"mask + RANSAC"那一步，直接给每块平面。</li>
+    <li>经典参照：<strong>Total3DUnderstanding</strong>（CVPR 2020）和 <strong>InstPIFu</strong>（ECCV 2022）把房间当一个长方体布局框和物体联合预测——现在看太粗，但"布局框 + 物体位姿 + 网格"三件套的问题定义就是从它们来的。</li>
+  </ul>
+
+  <div class="callout warn">四档的共同前提：<strong>深度要是度量尺度且重力对齐</strong>。ϕ-Scene 和 PixARMesh 都指出单目深度是最大误差来源；我们的 MoGe-2 已是度量深度，地面法线也有了，所以第 1、2 档的门槛主要在工程上。</div>
+</section>
+
+<section id="gravity">
+  <h2>三、重力方向与相机：你已经做对的部分，以及可以加固的地方</h2>
+  <p>"MoGe 拟地面法线当 z-up"和文献是一致的：RoboSnap 用 VGGT 前景点拟支撑平面定重力系，TelePhysics 把所有物体锚到一个标准地面平面，REST3D 用落地物体的主竖直轴对齐重力。两个可以加固的点：</p>
+  <ul>
+    <li><strong>地面看不见时的兜底：</strong>用 <a href="https://github.com/cvg/GeoCalib">GeoCalib</a>（ECCV 2024）或 PerspectiveFields 直接从图像估重力方向和焦距，不依赖地面 mask。ϕ-Scene 的代码库里就留着 PerspectiveFields 的调用。</li>
+    <li><strong>再加一个偏航：</strong>拟出墙面法线后，把主墙对齐 x 轴，得到曼哈顿坐标系。REST3D 用这个把挂墙物体贴到墙上；对我们，等于让后续所有位姿优化都在"房间坐标"里做，物体的 yaw 也有了参照。</li>
+  </ul>
+</section>
+
+<section id="borrow">
+  <h2>四、给我们流水线的具体建议</h2>
+  <p>按"改动小、收益大"排序。前三条不动 SAM 3D 本身，都是在现有 <code>run_scene.py</code> 之后加一段。</p>
+  <div class="recs">
+    <div class="rec">
+      <div class="rank">1</div>
+      <h3>在 <code>scene_phys.py</code> 的"规则三"位置接 SDF 去穿插（ϕ-Scene / CAST 配方）</h3>
+      <p>支撑图和放置顺序已经有了，直接复用。把现在"只报不推"的规则三换成：逐个放置时，对当前物体和已放好的上下文物体各采 2048 表面点，双向清距损失（穿进去罚、离开超过 ε=0.005 也罚），只优化平移，Adam 300 步。比 <code>scene_fix.py</code> 的 AABB 推开细得多——沙发和地毯那种"贴合但盒子相交"不会被误推，椅子腿伸进桌子底下这种真穿插才会动。地面用无限平面，墙做了第 2 条后也进上下文。</p>
+      <ul><li>SDF 可用 <code>mesh_to_sdf</code> 或 <code>trimesh.proximity</code> 预算网格；SAM 3D 的 mesh 面数高，先 simplify 到 1–2 万面。报告里已有的"穿模体积"指标正好当验收。</li><li>支撑图的"未知"（支撑物没分割出来）可以再补一层 VLM 裁决：只把这几个物体连同编号 mask 图发给 Gemini/GPT，按 CAST 的"细粒度关系 → 投票 → 折叠"要父节点。</li><li>ϕ-Scene 报告这一步把穿深从 0.024 压到 0.001；预计一个场景几十秒，CPU 即可。</li></ul>
+      <div class="tags"><span class="pill acc">不动生成器</span><span class="pill acc">CPU</span><span class="pill">需 VLM API</span></div>
+    </div>
+    <div class="rec">
+      <div class="rank">2</div>
+      <h3>房间壳：mask + 点云 → 平面多边形（Diorama PlainRecon）</h3>
+      <p>用 <code>labels.txt</code> 里的 wall / floor / ceiling / windows mask 切 MoGe 点云，每块 RANSAC 拟平面，法线夹角 &lt;10° 且距离接近的合并，墙与地求交线定墙脚，墙与墙求交线定墙角，最后把每面墙裁成多边形并挤出薄板。被家具挡住的墙脚按交线延伸补齐——这就是"地板不完整"的修法。作为第二阶段再加"去家具 inpainting → 重估深度"。</p>
+      <ul><li>产出直接作为第 1 条的静态上下文（墙也参与去穿插），也让"靠墙"这种关系有了目标。</li><li>SpatialLM 可以并行试一下：把同一点云喂给它，看墙段拓扑对不对，对了就省去手写交线逻辑。</li></ul>
+      <div class="tags"><span class="pill acc">不动生成器</span><span class="pill acc">CPU</span><span class="pill">数据已齐</span></div>
+    </div>
+    <div class="rec">
+      <div class="rank">3</div>
+      <h3>刚体落稳（ϕ-Scene 的 Blender 方案）</h3>
+      <p>SDF 之后再用 Blender 刚体（bpy 可 pip 装，无需 root）：VHACD 凸分解，按支撑顺序逐个释放，模拟 120 帧，15 帧窗口内位姿变化 &lt;1e-4 视为落稳。这一步解决"不穿但重心在外、一模拟就倒"的情况。REST3D 的 CEM 搜索效果更好但要 Isaac Gym，先不上。</p>
+      <div class="tags"><span class="pill acc">不动生成器</span><span class="pill">需 bpy</span><span class="pill">每场景 1–3 分钟</span></div>
+    </div>
+    <div class="rec">
+      <div class="rank">4</div>
+      <h3>把约束塞进 SAM 3D 的采样（MV-SAM3D）</h3>
+      <p>MV-SAM3D 的"layout injection"是在 SAM 3D flow 采样每一步对多个物体的 latent 加"体积重叠惩罚 + 接触"引导，输出再做位姿优化，代码公开且基于 SAM 3D。这是唯一能在生成阶段就避免穿模的现成方案，但需要改我们 <code>inference_pipeline</code> 的采样循环，且多物体要同时进显存。建议在 1–3 落地后再试，用同一批指标对比。</p>
+      <div class="tags"><span class="pill warn">动采样循环</span><span class="pill ok">代码公开</span><span class="pill">显存要评估</span></div>
+    </div>
+    <div class="rec">
+      <div class="rank">5</div>
+      <h3>不建议现在做的</h3>
+      <p>换成 MIDI / SceneGen / PixARMesh 这类联合生成：没有硬约束、只在合成室内数据上训练、没贴图，形状质量也不如 SAM 3D。它们的价值是当"布局先验"参考（ϕ-Scene 就是可选地用 TRELLIS.2 整体生成做 OBB 校正），不是替代品。</p>
+    </div>
+  </div>
+</section>
+
+<section id="metrics">
+  <h2>五、该用什么指标</h2>
+  <p>文献里已经收敛出一套物理指标，建议我们照抄，这样每一步改动都能量化，也能和 REST3D / ϕ-Scene 的数字直接比：</p>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>指标</th><th>定义</th><th>出处</th><th>参考值（SAM 3D 原生 → 后处理）</th></tr></thead>
+    <tbody>
+      <tr><td class="name">穿深 Penetration depth</td><td>物体表面采样点在其他物体 SDF 里的最大负值</td><td>ϕ-Scene</td><td class="num">0.0239 → 0.0011（归一化尺度）</td></tr>
+      <tr><td class="name">悬空距离 Floating distance</td><td>无穿插时到支撑面的最小正间隙</td><td>ϕ-Scene</td><td>—</td></tr>
+      <tr><td class="name">碰撞率 Collision rate</td><td>网格/凸包互相穿插的物体占比</td><td>REST3D · MV-SAM3D</td><td class="num">41.8% → 2.7%（REST3D）；15.3% → 0（MV-SAM3D）</td></tr>
+      <tr><td class="name">稳定率 Stability rate</td><td>模拟 60 步后平移 &lt;0.1 m 且旋转 &lt;0.1 rad 的物体占比</td><td>REST3D</td><td class="num">8.9% → 94.9%</td></tr>
+      <tr><td class="name">落稳漂移 Post-sim drift</td><td>释放后到静止的平移/旋转量</td><td>ϕ-Scene · REST3D · RoboSnap</td><td class="num">旋转 82.9° → 0.6°；位移 1.08 m → 0.07 m</td></tr>
+      <tr><td class="name">几何对齐</td><td>Chamfer / F-score@0.05 / bbox IoU（3D-FRONT 有真值）</td><td>全部</td><td>—</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>前三个不需要模拟器，用现有 mesh 就能算，可以先接进 <code>run_scene.py</code> 的日志里，给每个场景打分。</p>
+</section>
+
+<section id="refs">
+  <h2>文献</h2>
+  <ol class="refs">
+    <li><span class="id">REST3D</span> Ma et al., Reconstructing Physically Stable 3D Scenes from a Single Image, 2026. <a href="https://arxiv.org/abs/2605.30338">arXiv 2605.30338</a> · <a href="https://shirleymaxx.github.io/REST3D/">项目页</a></li>
+    <li><span class="id">ϕ-Scene</span> Li et al., Physically Grounded Image-to-3D Scene Reconstruction, 2026. <a href="https://arxiv.org/abs/2606.21596">arXiv 2606.21596</a> · <a href="https://phi-scene.github.io/">项目页</a></li>
+    <li><span class="id">RoboSnap</span> One-Shot Real-to-Sim Scene Generation, 2026. <a href="https://arxiv.org/abs/2607.06699">arXiv 2607.06699</a></li>
+    <li><span class="id">SimuScene</span> Lee et al., Simulation-Ready Compositional 3D Scene Reconstruction from a Single Image, 2026. <a href="https://arxiv.org/abs/2606.03994">arXiv 2606.03994</a></li>
+    <li><span class="id">MV-SAM3D</span> Adaptive Multi-View Fusion for Layout-Aware 3D Generation, 2026. <a href="https://arxiv.org/abs/2603.11633">arXiv 2603.11633</a> · <a href="https://github.com/devinli123/MV-SAM3D">代码</a></li>
+    <li><span class="id">TelePhysics</span> Physics-Grounded Multi-Object Scene Generation from a Single Image with Real-Time Interaction, 2026. <a href="https://arxiv.org/abs/2605.20290">arXiv 2605.20290</a></li>
+    <li><span class="id">CAST</span> Component-Aligned 3D Scene Reconstruction from an RGB Image, TOG 2025. <a href="https://arxiv.org/abs/2502.12894">arXiv 2502.12894</a> · <a href="https://dl.acm.org/doi/10.1145/3730841">ACM</a></li>
+    <li><span class="id">SAM 3D</span> 3Dfy Anything in Images, 2025. <a href="https://arxiv.org/abs/2511.16624">arXiv 2511.16624</a></li>
+    <li><span class="id">PixARMesh</span> Zhang et al., Autoregressive Mesh-Native Single-View Scene Reconstruction, CVPR 2026. <a href="https://arxiv.org/abs/2603.05888">arXiv 2603.05888</a> · <a href="https://github.com/mlpc-ucsd/PixARMesh">代码</a></li>
+    <li><span class="id">SceneGen</span> Meng et al., Single-Image 3D Scene Generation in One Feedforward Pass, 2025. <a href="https://arxiv.org/abs/2508.15769">arXiv 2508.15769</a></li>
+    <li><span class="id">MIDI</span> Huang et al., Multi-Instance Diffusion for Single Image to 3D Scene Generation, CVPR 2025. <a href="https://arxiv.org/abs/2412.03558">arXiv 2412.03558</a> · <a href="https://huanngzh.github.io/MIDI-Page/">项目页</a></li>
+    <li><span class="id">DepR</span> Zhao et al., Depth Guided Single-view Scene Reconstruction with Instance-level Diffusion, ICCV 2025. <a href="https://arxiv.org/abs/2507.22825">arXiv 2507.22825</a> · <a href="https://github.com/mlpc-ucsd/DepR">代码</a></li>
+    <li><span class="id">Diorama</span> Wu et al., Unleashing Zero-shot Single-view 3D Indoor Scene Modeling, ICCV 2025. <a href="https://arxiv.org/abs/2411.19492">arXiv 2411.19492</a> · <a href="https://github.com/3dlg-hcvc/diorama">代码</a></li>
+    <li><span class="id">Gen3DSR</span> Dogaru et al., Generalizable 3D Scene Reconstruction via Divide and Conquer from a Single View, 3DV 2025. <a href="https://arxiv.org/abs/2404.03421">arXiv 2404.03421</a> · <a href="https://github.com/AndreeaDogaru/Gen3DSR">代码</a></li>
+    <li><span class="id">Sing3D</span> Towards Geometric and Textural Consistency 3D Scene Generation via Single Image-guided Model Generation and Layout Optimization, 2025. <a href="https://arxiv.org/abs/2507.14841">arXiv 2507.14841</a></li>
+    <li><span class="id">Li 2025</span> A Modular Framework for Single-View 3D Reconstruction of Indoor Environments, 2025. <a href="https://arxiv.org/abs/2512.17955">arXiv 2512.17955</a></li>
+    <li><span class="id">ACDC</span> Dai et al., Automated Creation of Digital Cousins for Robust Policy Learning, CoRL 2024. <a href="https://arxiv.org/abs/2410.07408">arXiv 2410.07408</a></li>
+    <li><span class="id">PhyRecon</span> Ni et al., Physically Plausible Neural Scene Reconstruction, NeurIPS 2024. <a href="https://arxiv.org/abs/2404.16666">arXiv 2404.16666</a> · <a href="https://github.com/PhyRecon/PhyRecon">代码</a></li>
+    <li><span class="id">PhyScene</span> Yang et al., Physically Interactable 3D Scene Synthesis for Embodied AI, CVPR 2024. <a href="https://arxiv.org/abs/2404.09465">arXiv 2404.09465</a> · <a href="https://github.com/PhyScene/PhyScene">代码</a></li>
+    <li><span class="id">LayoutVLM</span> Sun et al., Differentiable Optimization of 3D Layout via Vision-Language Models, CVPR 2025. <a href="https://arxiv.org/abs/2412.02193">arXiv 2412.02193</a></li>
+    <li><span class="id">Scenethesis</span> A Language and Vision Agentic Framework for 3D Scene Generation, 2025. <a href="https://arxiv.org/abs/2505.02836">arXiv 2505.02836</a></li>
+    <li><span class="id">SpatialLM</span> Training Large Language Models for Structured Indoor Modeling, NeurIPS 2025. <a href="https://arxiv.org/abs/2506.07491">arXiv 2506.07491</a> · <a href="https://github.com/manycore-research/SpatialLM">代码</a></li>
+    <li><span class="id">ZeroPlane</span> Towards In-the-wild 3D Plane Reconstruction from a Single Image, CVPR 2025. <a href="https://arxiv.org/abs/2506.02493">arXiv 2506.02493</a> · <a href="https://github.com/jcliu0428/ZeroPlane">代码</a></li>
+    <li><span class="id">Layout Anything</span> One Transformer for Universal Room Layout Estimation, 2025. <a href="https://arxiv.org/abs/2512.02952">arXiv 2512.02952</a>；<span class="id">uLayout</span> <a href="https://arxiv.org/abs/2503.21562">arXiv 2503.21562</a></li>
+    <li><span class="id">HunyuanWorld 1.0</span> Generating Immersive, Explorable, and Interactive 3D Worlds from Words or Pixels, 2025. <a href="https://arxiv.org/abs/2507.21809">arXiv 2507.21809</a></li>
+    <li><span class="id">GeoCalib</span> Veicht et al., Learning Single-image Calibration with Geometric Optimization, ECCV 2024. <a href="https://arxiv.org/abs/2409.06704">arXiv 2409.06704</a> · <a href="https://github.com/cvg/GeoCalib">代码</a></li>
+    <li><span class="id">Total3D</span> Nie et al., Total3DUnderstanding, CVPR 2020. <a href="https://arxiv.org/abs/2002.12212">arXiv 2002.12212</a>；<span class="id">InstPIFu</span> Liu et al., Towards High-Fidelity Single-view Holistic Reconstruction of Indoor Scenes, ECCV 2022. <a href="https://arxiv.org/abs/2207.08656">arXiv 2207.08656</a></li>
+  </ol>
+</section>
+</main>
+</div>

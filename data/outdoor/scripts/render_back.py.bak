@@ -1,0 +1,47 @@
+#!/usr/bin/env python
+"""从原视频的相机位置渲染组装好的场景, 和真实帧并排比对。"""
+import os, json, numpy as np, trimesh, cv2
+os.environ["PYOPENGL_PLATFORM"]="egl"
+import pyrender
+
+ROOT=os.environ.get("R1","/home/jincheng/sam3d/data/outdoor/result/timesquare/r1")
+FR  =os.environ.get("FR","/home/jincheng/sam3d/data/outdoor/dataset/timesquare/frames")
+cams=json.load(open(f"{ROOT}/02_da3/cameras.json"))["cameras"]
+SCENE=os.environ.get("SCENE","07_scene.glb")
+import glob
+sc_tm=trimesh.Scene()
+for _f in os.environ.get("SCENE","07_scene.glb").split(","):
+    _s=trimesh.load(f"{ROOT}/{_f}")
+    for _n in _s.graph.nodes_geometry:
+        _T,_g=_s.graph[_n]; _m=_s.geometry[_g].copy(); _m.apply_transform(_T); sc_tm.add_geometry(_m,node_name=_f+_n)
+# 导出时按 glTF 约定翻过 y/z, 渲染要对上原相机就翻回 DA3 系
+sc_tm.apply_transform(np.array([[1,0,0,0],[0,-1,0,0],[0,0,-1,0],[0,0,0,1.]]))
+W,H=1280,720
+FRAMES=[int(x) for x in os.environ.get("FRAMES","0,40,88,120,160").split(",")]
+
+scene=pyrender.Scene(bg_color=[0.85,0.87,0.9,1.0], ambient_light=[.5]*3)
+for name,g in sc_tm.geometry.items():
+    for node in sc_tm.graph.nodes_geometry:
+        T,gname=sc_tm.graph[node]
+        if gname==name: scene.add(pyrender.Mesh.from_trimesh(g,smooth=False),pose=T)
+tiles=[]
+r=pyrender.OffscreenRenderer(W,H)
+for fi in FRAMES:
+    fn=f"{fi:04d}.jpg"
+    if fn not in cams: fn=min(cams,key=lambda k:abs(int(k[:4])-fi)); 
+    cam=cams[fn]; K=np.array(cam["intrinsic_3x3"])
+    sx=W/ (K[0,2]*2); sy=H/(K[1,2]*2)
+    pc=pyrender.IntrinsicsCamera(fx=K[0,0]*sx, fy=K[1,1]*sy, cx=K[0,2]*sx, cy=K[1,2]*sy)
+    c2w=np.linalg.inv(np.array(cam["extrinsic_w2c_4x4"]).reshape(4,4))
+    gl=c2w@np.diag([1,-1,-1,1])                       # OpenCV -> OpenGL
+    n1=scene.add(pc,pose=gl); n2=scene.add(pyrender.DirectionalLight(intensity=4.0),pose=gl)
+    col,_=r.render(scene); scene.remove_node(n1); scene.remove_node(n2)
+    real=cv2.cvtColor(cv2.imread(f"{FR}/{fn}"),cv2.COLOR_BGR2RGB)
+    real=cv2.resize(real,(W,H))
+    blend=(0.5*real+0.5*col).astype(np.uint8)
+    SZ=int(os.environ.get("TILE","426")); row=np.hstack([cv2.resize(x,(SZ,int(SZ*9/16))) for x in (real,col,blend)])
+    cv2.putText(row,f"{fn}   real | rebuilt | 50/50",(8,20),0,0.5,(255,255,0),1)
+    tiles.append(row)
+r.delete()
+cv2.imwrite(f"{ROOT}/"+os.environ.get("RBOUT","08_render_back.jpg"),cv2.cvtColor(np.vstack(tiles),cv2.COLOR_RGB2BGR),[cv2.IMWRITE_JPEG_QUALITY,90])
+print("saved",f"{ROOT}/"+os.environ.get("RBOUT","08_render_back.jpg"))

@@ -1,0 +1,208 @@
+#!/usr/bin/env python
+"""同款复制: 一类一个 mesh, 按各实例的盒子摆回街上, 加地面, 导出整场景 glb.
+尺度用高度对齐(高度几乎总能看全, 长度会被遮挡截短); 朝向用盒子长轴, 180° 未解。"""
+import os, json, numpy as np, trimesh
+TAG=os.environ.get("TAG","ts_r1")
+
+ROOT=os.environ.get("R1","/home/jincheng/sam3d/data/outdoor/result/timesquare/r1")
+OUTS="/home/jincheng/sam3d/sam-3d-objects/outputs"
+# "天"的方向。老的写法是写死 [0,-1,0] = 首帧相机的 -y —— 街头平视时相机水平, 这个假设
+# 成立(时代广场实测只偏 0.4°); 但高空俯拍时相机低着头, 它的 -y 指向斜上后方, beach 偏
+# 26.2°、carpark 偏 29.2°, 整个场景连同地面一起歪掉。
+# 现在改成读 world_up.py 从点云主平面拟合出来的真实法向, 没有那个文件才退回老假设。
+# ★ 必须在"量盒子"之前定好: 盒子的高度是沿"天"量出来的, 方向错了盒子本身就是错的,
+#   事后旋转只是把错的盒子摆正, 数字不会变对。
+def _load_up(da3):
+    import json as _j, os as _o
+    p = f"{da3}/world_up.json"
+    if _o.path.exists(p):
+        u = np.array(_j.load(open(p))["up"], dtype=float)
+        return u/np.linalg.norm(u)
+    return np.array([0,-1,0.])
+UP=_load_up(f"{ROOT}/02_da3")
+EXCLUDE=set(os.environ.get("EXCLUDE","sign,billboard,pedestrian,manhole cover").split(","))
+# 自动扫描 outputs/。ts_r1_<词> = 该类共用的 mesh; ts_r1_<词>_<实例号> = 这个实例专属的
+AVAIL={d for d in os.listdir(OUTS) if d.startswith(TAG+"_") and os.path.exists(f"{OUTS}/{d}/{d}.glb")}
+MESH={d[len(TAG)+1:].replace("_"," "):d for d in AVAIL}
+def pick_mesh(w, oid):
+    """优先用这个实例专属的 mesh, 没有才退回该类共用的"""
+    solo=f"{TAG}_{w.replace(' ','_')}_{oid}"
+    return solo if solo in AVAIL else MESH.get(w)
+SNAP_GROUND=os.environ.get("SNAP_GROUND","1")=="1"   # 强制所有物体落在地面上
+FLOAT_WORDS=set(x for x in os.environ.get("FLOAT_WORDS","awning,traffic light,billboard,sign").split(",") if x)
+BOXES=os.environ.get("BOXES", f"{ROOT}/06_all_boxes.json")   # 换成 06_all_boxes_merged.json 即含召回
+boxes=json.load(open(BOXES))
+
+cache={}
+def get_mesh(key):
+    w=key
+    if w not in cache:
+        s=trimesh.load(f"{OUTS}/{w}/{w}.glb")
+        m=s.dump(concatenate=True) if hasattr(s,"dump") else s
+        m.apply_translation(-m.bounds.mean(0))          # 中心到原点
+        cache[w]=m
+    return cache[w].copy()
+
+# --- 地面: 用所有实例的盒底拟合一个平面 (物体都站在地上) ---
+pts=[]
+for w,bs in boxes.items():
+    for b in bs:
+        c=np.array(b["中心"]); h=b["尺寸"][2]
+        pts.append(c - UP*h/2)                          # 盒底中心
+pts=np.array(pts)
+# 地面必须是水平的 —— 真实的"天"已经由 up 那步从点云主平面拟合出来了(world_up.json),
+# 在这个坐标系里地面按定义就是水平面, 只剩"多高"一个未知数。
+#
+# 老写法拟合的是带坡度的 y = a*x + b*z + c, 结果被盒底噪声带歪了约 10°:
+# carpark 的地面片在 96x67m 的范围上竖直方向跨了 17 米(y 2.08~19.34),
+# 直接斜插穿过物体群(物体 y 0.38~14.05)。以前地面是单面背朝上、看不见, 没人发现;
+# 一把法向修正过来, 它就糊住了整个画面。
+#
+# 所以只沿 UP 求一个高度: 1D RANSAC 取"盒底最扎堆"的那一层。
+# 用众数而不是最低点/中位数 —— 最低点会被一个飘到地下的误检拉走,
+# 中位数会被半空中的广告牌、树冠盒底抬高。
+# ★ 地面高度优先取点云直接拟合的那个 (world_up.py 存的 ground_h)。
+# 从盒底反推是错的源头: 俯视场景里盒子的高度被压扁, 盒底本身就散了十几米
+# (beach 实测跨 14.9m), 拿它推出来的地面必然穿过物体群中间, 上下都贴不上。
+# 地面在点云里本来就是一整片实测数据, 不该用一堆错的盒底去猜它。
+_gh = None
+try:
+    _gh = json.load(open(f"{ROOT}/02_da3/world_up.json")).get("ground_h")
+except Exception: pass
+
+hh = pts @ UP                                    # 每个盒底沿"天"方向的高度
+cand = np.sort(hh)
+best_n, best_h = -1, float(np.median(hh))
+for h0 in cand:                                  # 盒底本身就是最好的候选高度
+    n_in = int((np.abs(hh - h0) < 0.5).sum())
+    if n_in > best_n: best_n, best_h = n_in, h0
+inl = np.abs(hh - best_h) < 0.5
+best_h = float(hh[inl].mean())                   # 用内点精修
+if _gh is not None:
+    print(f"[地面] 用点云拟合的高度 {_gh:.2f} m (盒底反推会给出 {best_h:.2f} m, 不用它)")
+    best_h = float(_gh)
+else:
+    print(f"[地面] {len(pts)} 个盒底中 {int(inl.sum())} 个在地面上, "
+          f"残差中位 {np.median(np.abs(hh[inl]-best_h)):.2f} m (水平面, 高度 {best_h:.2f} m)")
+
+scene=trimesh.Scene(); n=0; skipped=[]
+# ---- 每类一个统一缩放 ----
+# 基准 = 生成这个类 mesh 时用的那个实例。它是 VLM 校验过、抠得最完整的那一个,
+# 拿它定尺寸和 mesh 本身自洽。查不到(被去重合并了)就退回"剔掉离群后的中位数"。
+#
+# 试过但不对的两条:
+#   点数最多的  —— table 点数最多的 5 号其实是误检(抠了一辆红车+卡车, 盒子 2.7x2.4m),
+#                  当基准把整类桌子撑到 1.18 米(真实 0.7)。
+#   取分布上半段 —— 理由是"遮挡只会让盒子变小", 但漏了反向的错: mask 抠多了盒子会变大
+#                  (table 有 4.8m 和 8.2m 的盒子), 两头都有噪声, 取大端等于专挑抠多的。
+PICKS=json.load(open(f"{ROOT}/04_picks/picks.json"))
+# 这些类真实世界里本来就有大有小, 不统一 —— 树 0.66~4.84m 全压成 2.78m 会把大树压矮一半
+PER_INSTANCE=set(os.environ.get("PER_INSTANCE","tree").split(","))
+def one_scale(ext, me):
+    ext=np.array(ext)
+    return (np.sort(ext)[::-1][0]/max(np.sort(me)[::-1][0],1e-6)) if ext[2]<0.2 \
+           else ext[2]/max(me[1],1e-6)
+CLASS_SCALE={}; dropped=0; DEGENERATE=set()
+for w,bs in boxes.items():
+    if w in EXCLUDE or not bs: continue
+    mk=MESH.get(w)
+    if mk is None: continue
+    me=get_mesh(mk).extents
+    S=np.array([one_scale(b["尺寸"], me) for b in bs])
+    keep=np.abs(np.log(S/np.median(S)))<np.log(2.0)        # 和中位差 2 倍以上 = 离群, 不参与
+    dropped += int((~keep).sum())
+    oid=PICKS.get(w,{}).get("obj_id")
+    hit=[b for b in bs if b["obj_id"]==oid]
+    CLASS_SCALE[w]=float(one_scale(hit[0]["尺寸"], me)) if hit else float(np.median(S[keep]))
+    src="生成实例" if hit else "离群后中位"
+    # 整类的兜底: 单个盒子已经有 ext.max()>15 的守卫, 但那守的是"盒子", 守不住"mesh 烂".
+    # carpark 的 barrier: SAM3D 把护栏生成成了一张 1.00x0.09x0.01 的薄片, 高度只有 9cm。
+    # 对高度时要除以这 0.09, 尺度被放大 17.5 倍 —— 9 个护栏全变成 17.6 米的巨大平板,
+    # 横在整个停车场上把别的都挡住了。盒子本身是正常的, 所以老守卫一个都没拦下。
+    if CLASS_SCALE[w]*me.max() > 15:
+        print(f"  [{w:16s}] 整类丢弃: 摆出来会是 {CLASS_SCALE[w]*me.max():.1f} m "
+              f"(mesh {np.round(me,3).tolist()} 太扁, 对高度时除出了大尺度)")
+        CLASS_SCALE.pop(w); DEGENERATE.add(w); continue
+    print(f"  [{w:16s}] {len(bs):3d} 个 -> 统一 {CLASS_SCALE[w]*me.max():.2f} m  ({src})")
+print(f"  定基准时忽略了 {dropped} 个离群实例")
+
+solo_used=0
+for w,bs in boxes.items():
+    if w in EXCLUDE or w in DEGENERATE: continue
+    for b in bs:
+        mk=pick_mesh(w, b["obj_id"])
+        if mk is None: continue
+        ext=np.array(b["尺寸"]); 
+        if ext[2]<0.15 or ext.max()>15: skipped.append((w,b["obj_id"],ext.round(2).tolist())); continue
+        m=get_mesh(mk); me=m.extents
+        solo_used += (mk != MESH.get(w))
+        me=m.extents
+        if mk != MESH.get(w) or w in PER_INSTANCE:       # 专属 mesh(8 辆车) 和树: 各按各的
+            s = one_scale(ext, me)
+        else:
+            s = CLASS_SCALE.get(w)
+            if s is None: continue
+        m.apply_scale(s)
+        fwd=np.array(b["长轴"]); fwd=fwd-UP*(fwd@UP); fwd/=np.linalg.norm(fwd)
+        rgt=np.cross(UP,fwd)
+        R=np.eye(4); R[:3,0],R[:3,1],R[:3,2]=rgt,UP,fwd  # mesh X->右 Y->上 Z->前
+        m.apply_transform(R)
+        c=np.array(b["中心"])
+        bottom=c-UP*ext[2]/2
+        # ★ 强制落地: 盒子高度在俯视场景里量不准, 用它算出来的"底"有的悬空有的埋地。
+        # 物体本来就该站在地上, 所以直接把底放到地面高度, 不信盒子自己算的。
+        # 本该悬空的(雨篷/树冠/灯头)靠 FLOAT_WORDS 放过, 不参与强制落地。
+        if SNAP_GROUND and w not in FLOAT_WORDS:
+            bottom = bottom - UP*((bottom@UP) - best_h)
+        # 精确落地: 把 mesh 最低点对到盒底
+        h_now=(m.vertices@UP); m.apply_translation(UP*((bottom@UP)-h_now.min()))
+        # 水平对中
+        d=c-m.bounds.mean(0); d=d-UP*(d@UP); m.apply_translation(d)
+        scene.add_geometry(m, node_name=f"{w.replace(' ','_')}_{b['obj_id']}")
+        n+=1
+
+# --- 地面片: 覆盖所有物体的范围 ---
+allp=np.array([b["中心"] for bs in boxes.values() for b in bs])
+mn,mx=allp.min(0)-8, allp.max(0)+8
+gx=np.linspace(mn[0],mx[0],2); gz=np.linspace(mn[2],mx[2],2)
+# 平面上任取一点 = best_h*UP, 再沿两个与 UP 正交的方向铺开
+_e1 = np.array([1,0,0.]); _e1 = _e1 - UP*(_e1@UP)
+if np.linalg.norm(_e1) < 1e-6: _e1 = np.array([0,0,1.]) - UP*(np.array([0,0,1.])@UP)
+_e1 /= np.linalg.norm(_e1); _e2 = np.cross(UP,_e1)
+_ctr = allp.mean(0); _ctr = _ctr - UP*(_ctr@UP) + UP*best_h
+_r = float(np.abs((allp-_ctr) @ np.c_[_e1,_e2]).max()) + 8
+V=[_ctr + a*_r*_e1 + b*_r*_e2 for a in (-1,1) for b in (-1,1)]
+V=np.array(V); F=np.array([[0,1,3],[0,3,2]])
+ground=trimesh.Trimesh(V,F)
+# 单面渲染时法向朝哪边决定从哪边看得见。不校正的话从上往下看地面是隐形的,
+# 只有从地底下才看得见, 一眼像"没生成地面"。
+# 注意这里还在 DA3 世界系, 上 = UP = [0,-1,0], 也就是 -y;
+# 文件末尾的 FLIP 才把它翻成 glTF 约定的 +y。所以这里要让法向朝 -y。
+if float(ground.face_normals[0] @ UP) < 0: ground.faces = ground.faces[:, ::-1]
+ground.visual.face_colors=[130,130,135,255]
+scene.add_geometry(ground,node_name="ground")
+
+# DA3 世界系 = 首帧相机系 (OpenCV, y 朝下), glTF 约定 y 朝上, 差 180°。
+# 内部一直用 DA3 系(渲染回图要对上原相机), 只在导出时翻过来。
+# 导出前把整个世界转正: 让真实的"天"对准 glTF 的 +y。
+# 老代码只做了 FLIP(翻 y/z), 那等于默认"天"就是 -y —— 相机低着头时这个默认是错的,
+# 于是地面和物体一起歪着导出去(beach 地面在竖直方向跨了 33 米, 本该接近 0)。
+# 注意这一步只解决"歪", 解决不了"矮": 高度是在量盒子那步定的, 那边也已经改用真实的天了。
+# ★ UP 本身就是"天": 整条链取高度用 P@UP, 值越大越高。老代码 FLIP=diag(1,-1,-1)
+# 把 UP=[0,-1,0] 映射到 +y, 也印证了这一点。第一版这里写成 -UP, 等于把天当成地,
+# 导出后地面跑到物体上方、路灯整根挂在地面下面(顶贴地、底 -4.7m)。
+_up = UP / np.linalg.norm(UP)
+_tgt = np.array([0,1,0.])                         # glTF 里的天
+_v = np.cross(_up,_tgt); _c = float(_up@_tgt)
+if np.linalg.norm(_v) < 1e-8:                     # 已经平行(或反向)
+    R3 = np.eye(3) if _c > 0 else np.diag([1,-1,-1.])
+else:
+    _k = np.array([[0,-_v[2],_v[1]],[_v[2],0,-_v[0]],[-_v[1],_v[0],0]])
+    R3 = np.eye(3) + _k + _k@_k*(1/(1+_c))        # 罗德里格斯: 把 _up 转到 _tgt
+FLIP = np.eye(4); FLIP[:3,:3] = R3
+print(f"[转正] 把真实的天转到 +y, 相对老写法差 "
+      f"{np.degrees(np.arccos(np.clip(_up@np.array([0,-1,0.]),-1,1))):.1f}°")
+scene.apply_transform(FLIP)
+dst=f"{ROOT}/"+os.environ.get("SCENE_OUT","07_scene.glb"); scene.export(dst)
+print(f"[组装] {n} 个物体 + 地面 -> {dst}  (其中 {solo_used} 个用了实例专属 mesh, 排除了 {sorted(EXCLUDE)})")
+if skipped: print(f"[跳过] {len(skipped)} 个尺寸不合理:", skipped[:6])

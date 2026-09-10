@@ -1,0 +1,430 @@
+#!/usr/bin/env python
+"""SAM-Body4D 链: 动态视频 -> 每个人逐帧的三维人体网格。
+
+和 outdoor_pipeline.py / indoor_pipeline.py 同一套写法: 这里只管步骤顺序、每步用哪个环境、
+参数是多少和为什么。算法在 ~/sam3d/sam-body4d/body4d_*_5090.py 里。
+
+依赖顺序
+    frames -> track -> check -> [人工闸: 挑人] -> pick -> mesh -> report
+
+    frames  抽帧: 降 fps + 等比缩放 + 补零四位
+    track   SAM 3 文字提示 "person" 跟踪, 出 images/ + masks/
+    check   出 mp4 和体检图给人看 (跟丢没 / 串号没)
+    pick    把人工挑的 id 落成 picked.json
+    mesh    SAM 3D Body 出网格 (可选先跑 Diffusion-VAS 补全)
+    report  网格叠回原片的 mp4 + 跟踪帧数 vs 网格帧数的对账
+
+反直觉之处
+  * 不用上游的 scripts/offline_app.py。它是"检人->跟踪->出网格"一条龙中间不能停,
+    而且首帧检人用的是 SAM 3D Body 自带的 ViTDet、只在首帧下一次框 ——
+    中途走进画面的人永远跟不到。我们用 SAM 3 的文字提示替掉了这一段。
+  * 帧目录在结果树底下 (00_frames/), 不在 dataset/<scene>/frames。因为这里的帧是
+    抽稀+缩放过的, 和 outdoor 那套原分辨率全帧不是一回事, 同名会互相污染。
+  * 产物落在 ~/sam3d/sam-body4d/outputs/<场景>/<轮次>/, 不在 data/outdoor/result/。
+    跟 sam-3d-objects 一样, 第三方仓库的产物留在它自己树里。
+
+坑
+  * ★ body4d 必须是独立 conda 环境。sam-body4d 仓库内嵌了另一份 SAM 3, 包名同样叫 sam3,
+    装进我们的 sam3 环境会把 track_all.py 依赖的那份静默替换掉。
+  * ★ 挑人会挑出不连续的 id (比如 1/2/4), 而上游用"第几个"冒充"是谁"。
+    mesh 那步会重编号成连续 1..N 并写 relabel.json。已给上游打了补丁, 但重编号仍保留 ——
+    少依赖一个补丁少一个风险。
+  * ★ 开补全 (OCC=1) 在 32G 上会 OOM。Diffusion-VAS 两个 SVD 加 SAM 3D Body 一起驻留,
+    实测撞在 25G 还要再申请 7.2G。要开先降 BATCH 和 MAX_OCC_LEN。
+  * 视频一律 H.264/yuv420p。cv2 的 mp4v 不报错但浏览器不认。
+
+用法
+    python body4d_pipeline.py --list
+    python body4d_pipeline.py --scene mayday                     # 跑到默认终点
+    python body4d_pipeline.py --scene mayday --to check          # 停在人工闸
+    python body4d_pipeline.py --scene mayday --from pick         # 挑完人接着跑
+    python body4d_pipeline.py --scene mayday --only mesh,report
+    python body4d_pipeline.py --scene mayday --check             # 只看产物在不在/过没过期
+    python body4d_pipeline.py --scene mayday -n                  # 干跑, 打印能直接粘的命令
+    PICK=1,2,4 python body4d_pipeline.py --scene mayday --from pick
+"""
+import argparse, fcntl, glob, json, os, shlex, subprocess, time
+
+HOME = os.path.expanduser("~")
+SAM3D = f"{HOME}/sam3d"
+B4D = f"{SAM3D}/sam-body4d"                    # 上游仓库 + 我们的 body4d_*_5090.py
+OUTROOT = f"{B4D}/outputs"
+DATASET = f"{SAM3D}/data/outdoor/dataset"
+
+PY = {
+    # ★ body4d 独立环境: python 3.12 + torch 2.8.0+cu128 + detectron2(自己编的)
+    #   + 内嵌 sam3 + imageio-ffmpeg。装法和坑见 sam-body4d/NOTES_5090.md
+    "body4d": f"{HOME}/miniforge3/envs/body4d/bin/python",
+    # 抽帧只要 cv2, 借 sam3d 环境, 不占 body4d 的载入时间
+    "sam3d":  f"{HOME}/miniforge3/envs/sam3d/bin/python",
+}
+
+CFG = dict(
+    # ---- 抽帧 ----
+    FPS_OUT    = "7.5",   # Diffusion-VAS 底子是 SVD, 上游按 ~8fps 喂。源 30fps 取 stride 4
+                          # 正好 7.5, 时间轴不用重采样
+    STRIDE     = "0",     # 非 0 则直接指定隔几帧取一, 忽略 FPS_OUT
+    LONG_SIDE  = "1024",  # 长边缩到多少。内部补全固定跑 512x1024, 长边给到 1024 已是 1:1。
+                          # 关心的是"人在画面里有多高"而不是画面多大 (SAM 3D Body 按人裁 patch)。
+                          # mayday 人高 345~409px 一帧不丢; pedestrian 148~372px 仍有帧被跳。
+                          # ★ 所以人像高度**不是**决定跳不跳帧的因素 —— 提分辨率救不回来, 实测过。
+    MAX_FRAMES = "96",    # 帧数上限。论文自测 90 帧/5 人/A100-80G, 先不越过
+    START_SEC  = "0",
+    JPEG_Q     = "95",
+
+    # ---- 跟踪 ----
+    PROMPT       = "person",
+    CONF         = "0.5",   # SAM 3 的 new_det_thresh。人多的场景调高
+    MIN_AREA_PCT = "1.0",   # 最大面积不到画面这个百分比的实例整条丢掉。
+                            # ★ 0.1 太松: mayday 实测混进 3 个垃圾(0.5%/0.5%/1.6%),
+                            #   真人是 16.5%/9.9%/14.2%, 中间空档很大, 1.0 卡得干净
+    JUMP_TH      = "0.25",  # 质心跳变告警(占画面宽)。★ 0.08 对打斗太紧 ——
+                            # 7.5fps 下挥拳扑击一帧移动 10~20% 是真实的, 实测 22 条全是误报
+    IOU_TH       = "0.20",
+
+    # ---- 人工闸 ----
+    PICK = "",              # 逗号分隔的 id; 空 = 留下 MIN_AREA_PCT 过滤后的全部。
+                            # 看完 03_check.jpg 再填, 或者直接改 SCENES
+
+    # ---- 出网格 ----
+    OCC         = "0",      # 1 开 Diffusion-VAS 补全。★ 32G 上开了会 OOM, 见文件头
+    BATCH       = "8",      # 上游默认 64 (论文写 32), 我们显存只有人家 40%。
+                            # ★ 注意 max_occ_len 会被 min(它, BATCH) 夹, 两个参数不独立
+    MAX_OCC_LEN = "25",
+
+    # ---- 出图 ----
+    RP_FPS = "8",
+    ALPHA  = "0.6",         # 网格叠回原片的不透明度
+)
+
+SCENE_TAG = {"mayday": "md", "pedestrian": "pd"}
+SCENES = {
+    # 2538x1066 (2.381:1 超宽), 335 帧。酒吧三人打架, 重度互遮挡 + 运动模糊 + 低光。
+    # 人占画面高 60~90%, 分辨率不是瓶颈。
+    "mayday": dict(PICK="1,2,4"),      # 跟出 6 个, 1/2/4 是真正打架的三个人
+
+    # 1920x1080, 269 帧。游戏引擎渲染, 很多行人但动作慢。
+    # ★ 镜头在平移, 第 50 帧之后画面里基本没人了。SAM 3 只在首帧下提示,
+    #   跑满 68 帧的话后半段全是"跟丢", 但那不是跟丢, 是人真的走了。
+    #   所以截到 44 帧 (约前 6 秒), 让数字有意义。
+    # ★ LONG_SIDE 用原生 1920。注意: 这**不是**为了救那几帧被跳过的 ——
+    #   实测从 1024 提到 1920 (人像高 78->148), 跳过的还是同样那 8/1/3 帧,
+    #   一帧没救回来。跳过的真实原因是 SAM 3D Body 自己返回全零 bbox 拒绝出网格,
+    #   判据在它内部, 还没定位。用 1920 纯粹是"人本来就小, 没必要再缩"。
+    "pedestrian": dict(MAX_FRAMES="44", LONG_SIDE="1920"),
+}
+
+
+def resolve_cfg(scene, R1=None):
+    """CFG 默认值 <- 场景覆盖 <- 环境变量。和 outdoor_pipeline 同一套。
+    环境变量层只认已经在 CFG 里的键, 所以 CFG 同时也是"可调参数白名单"。"""
+    cfg = dict(CFG)
+    cfg.update(SCENES.get(scene, {}))
+    cfg.update({k: v for k, v in os.environ.items() if k in CFG})
+    return cfg
+
+
+class Ctx:
+    def __init__(self, scene, run):
+        self.scene, self.run = scene, run
+        self.tag = f"{SCENE_TAG.get(scene, scene[:3])}_{run}"
+        d = f"{DATASET}/{scene}"
+        # ★ 这两段素材叫 <scene>.mp4, 不是 outdoor 写死的 video.mp4
+        cand = [f"{d}/{scene}.mp4", f"{d}/video.mp4"] + sorted(glob.glob(f"{d}/*.mp4"))
+        self.VID = next((p for p in cand if os.path.exists(p)), cand[0])
+        self.R1 = f"{OUTROOT}/{scene}/{run}"
+        self.LOG = f"{self.R1}/logs"
+        self.FR = f"{self.R1}/00_frames"
+        self.TRK = f"{self.R1}/02_body4d"
+        self.cfg = resolve_cfg(scene, self.R1)
+
+    @property
+    def MESH(self):
+        """出网格的运行目录。开/关补全各一份, 才能并排比。"""
+        return f"{self.R1}/04_mesh_occ{1 if self.cfg['OCC'] == '1' else 0}"
+
+
+LOCK = "/tmp/outdoor_pipeline_gpu.lock"        # ★ 和另外两条 pipeline 共用一把锁
+
+
+class GpuLock:
+    """一张 32G 卡塞不下两个常驻大模型。抢不到就排队, 不杀别人。"""
+    def __enter__(self):
+        self.f = open(LOCK, "a+")
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("    [等待] 另一条 pipeline 正在占用 GPU, 排队中...", flush=True)
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
+
+
+def wait_gpu(need_mb, dry=False, timeout=10800):
+    """等到卡上没有别人的进程且余量够。★ 只等不杀 —— 别人的活不归我们管。"""
+    if dry:
+        return
+    me, t0 = os.getpid(), time.time()
+    while True:
+        q = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True)
+        others = sum(int(r.split(",")[1]) for r in q.stdout.strip().splitlines()
+                     if r.strip() and int(r.split(",")[0]) != me and int(r.split(",")[1]) > 2000)
+        g = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True)
+        used, total = [int(x) for x in g.stdout.strip().splitlines()[0].split(",")]
+        if not others and total - used >= need_mb:
+            return
+        if time.time() - t0 > timeout:
+            raise SystemExit(f"[失败] 排了 {timeout/60:.0f}min 队还是轮不上 GPU")
+        print(f"    [等待GPU] 别人占 {others}MB, 空闲 {total-used}MB, 要 {need_mb}MB", flush=True)
+        time.sleep(30)
+
+
+def stamp_path(c, key):
+    return f"{c.LOG}/.stamp_{key}"
+
+
+def sh(cmd, log=None, dry=False, cwd=None, sep=None):
+    line = cmd if isinstance(cmd, str) else " ".join(shlex.quote(x) for x in cmd)
+    print(f"    $ {line}" + (f"   > {os.path.basename(log)}" if log else ""), flush=True)
+    if dry:
+        return 0
+    if log:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        if sep:
+            with open(log, "a") as f:
+                f.write(sep)
+    with (open(log, "a") if log else open(os.devnull, "w")) as f:
+        out = f if log else None
+        r = subprocess.run(cmd, shell=isinstance(cmd, str), cwd=cwd,
+                           stdout=out or None, stderr=subprocess.STDOUT if out else None)
+    if r.returncode:
+        raise SystemExit(f"[失败] 退出码 {r.returncode}: {line}")
+    return r.returncode
+
+
+def envcmd(py, script, env, args=()):
+    """环境变量写在命令行最前面, 这样 -n 打印出来的就是能直接粘去跑的命令。"""
+    pre = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items())
+    return (pre + " " if pre else "") + f"{shlex.quote(py)} {shlex.quote(script)} " + \
+        " ".join(shlex.quote(str(x)) for x in args)
+
+
+GPUENV = dict(CUDA_HOME="/usr/local/cuda-12.8", TORCH_CUDA_ARCH_LIST="12.0",
+              PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
+
+
+# ============================ 各步骤 ============================
+
+def s_frames(c, dry):
+    """抽帧。降 fps + 等比缩放 + 补零四位。理由见 body4d_frames.py 的文件头。"""
+    g = c.cfg
+    sh(envcmd(PY["sam3d"], f"{SAM3D}/pipeline/body4d_frames.py", {},
+              ["--video", c.VID, "--out", c.FR, "--fps", g["FPS_OUT"],
+               "--stride", g["STRIDE"], "--long-side", g["LONG_SIDE"],
+               "--max-frames", g["MAX_FRAMES"], "--start-sec", g["START_SEC"],
+               "--quality", g["JPEG_Q"]]),
+       f"{c.LOG}/00_frames.log", dry)
+
+
+def s_track(c, dry):
+    """SAM 3 文字提示跟踪。产出的 images/+masks/ 就是 SAM 3D Body 那半段要吃的格式。"""
+    g = c.cfg
+    wait_gpu(9000, dry)
+    sh(envcmd(PY["body4d"], f"{B4D}/body4d_track_5090.py", GPUENV,
+              ["--frames", c.FR, "--out", c.TRK, "--prompt", g["PROMPT"],
+               "--conf", g["CONF"], "--min-area-pct", g["MIN_AREA_PCT"],
+               "--jump-th", g["JUMP_TH"], "--iou-th", g["IOU_TH"]]),
+       f"{c.LOG}/02_track.log", dry, cwd=B4D)
+
+
+def s_check(c, dry):
+    """体检: 出 03_track.mp4 + 03_check.jpg。★ 这是人工闸 —— 看完再决定挑谁。"""
+    sh(envcmd(PY["body4d"], f"{B4D}/body4d_check_5090.py", {},
+              ["--dir", c.TRK, "--fps", c.cfg["RP_FPS"], "--prefix", "03"]),
+       f"{c.LOG}/03_check.log", dry, cwd=B4D)
+    if not dry:
+        print(f"    ★ 人工闸: 看 {c.R1}/03_track.mp4 和 03_check.jpg,")
+        print(f"      决定要还原哪几个人, 填进 SCENES['{c.scene}']['PICK'] 或 PICK=1,2,4 环境变量")
+
+
+def s_pick(c, dry):
+    """把人工决定落成 picked.json。空 PICK 就是留下 track 过滤后的全部。"""
+    rep = f"{c.TRK}/track_report.json"
+    pick = c.cfg["PICK"]
+    code = f'''
+import json, os
+rep = json.load(open({rep!r}))
+cov = {{int(k): v for k, v in rep["coverage"].items()}}
+pick = [int(x) for x in {pick!r}.split(",") if x.strip()] or sorted(cov)
+miss = [i for i in pick if i not in cov]
+if miss:
+    raise SystemExit(f"[失败] PICK 里的 id {{miss}} 跟踪结果里没有。有的是 {{sorted(cov)}}")
+json.dump(dict(keep_ids=pick, decided_by=("human" if {pick!r} else "auto-全留"),
+               scene={c.scene!r}, run={c.run!r},
+               coverage={{str(i): cov[i] for i in pick}},
+               dropped={{str(i): cov[i] for i in cov if i not in pick}}),
+          open({c.TRK!r} + "/picked.json", "w"), ensure_ascii=False, indent=1)
+print(f"[挑人] 留 {{pick}}, 丢 {{[i for i in cov if i not in pick]}}")
+'''
+    sh([PY["sam3d"], "-c", code], f"{c.LOG}/03_pick.log", dry)
+
+
+def s_mesh(c, dry):
+    """SAM 3D Body 出网格。OCC=1 时先跑 Diffusion-VAS 补全 (32G 上会 OOM, 见文件头)。"""
+    g = c.cfg
+    wait_gpu(26000 if g["OCC"] == "1" else 15000, dry)
+    sh(envcmd(PY["body4d"], f"{B4D}/body4d_mesh_5090.py", GPUENV,
+              ["--dir", c.TRK, "--out", c.MESH, "--completion", g["OCC"],
+               "--batch-size", g["BATCH"], "--max-occ-len", g["MAX_OCC_LEN"]]),
+       f"{c.LOG}/04_mesh.log", dry, cwd=B4D)
+
+
+def s_report(c, dry):
+    """叠加视频 + 对账。★ 对账那一半是硬的: 跟踪帧数和网格帧数对不上就退出码非 0。"""
+    sh(envcmd(PY["body4d"], f"{B4D}/body4d_report_5090.py", {},
+              ["--run", c.MESH, "--track", c.TRK, "--fps", c.cfg["RP_FPS"],
+               "--alpha", c.cfg["ALPHA"], "--prefix", "05"]),
+       f"{c.LOG}/05_report.log", dry, cwd=B4D)
+
+
+# ============================ 步骤表 ============================
+
+STEPS = [
+    ("frames", "sam3d",  "抽帧: 降fps + 等比缩放 + 补零四位",      s_frames),
+    ("track",  "body4d", "SAM 3 文字提示跟踪 -> images/ + masks/", s_track),
+    ("check",  "body4d", "体检 mp4 + 总览图 (人工闸)",             s_check),
+    ("pick",   "sam3d",  "把人工挑的 id 落成 picked.json",         s_pick),
+    ("mesh",   "body4d", "SAM 3D Body 出人体网格",                 s_mesh),
+    ("report", "body4d", "网格叠原片 mp4 + 帧数对账",              s_report),
+]
+DEFAULT_END = "report"
+GPU_STEPS = {"track", "mesh"}
+
+# 只列关键产物, 不求全。@FR = 帧目录, @TRK = 跟踪目录, @MESH = 出网格目录
+ARTIFACTS = {
+    "frames": ["@FR/0000.jpg", "@FR/frames.json"],
+    "track":  ["@TRK/images/00000000.jpg", "@TRK/masks", "@TRK/track_report.json"],
+    "check":  ["03_track.mp4", "03_check.jpg"],
+    "pick":   ["@TRK/picked.json"],
+    "mesh":   ["@MESH/mesh_report.json", "@MESH/relabel.json", "@MESH/rendered_frames"],
+    "report": ["05_mesh_overlay.mp4", "05_summary.txt"],
+}
+
+# ★ 加边之前先确认依赖在 STEPS 里排在前面 —— 没有拓扑排序, 列表顺序就是执行顺序,
+#   往回指的依赖会静默失效。
+DEPS = {
+    "track":  ["frames"],
+    "check":  ["track"],
+    "pick":   ["track"],          # 不写 check: 闸是给人看的, 不是产物依赖
+    "mesh":   ["track", "pick"],
+    "report": ["mesh"],
+}
+
+
+def _resolve(c, p):
+    for k, v in (("@FR", c.FR), ("@TRK", c.TRK), ("@MESH", c.MESH)):
+        if p.startswith(k):
+            return v + p[len(k):]
+    return os.path.join(c.R1, p)
+
+
+def do_check(c):
+    when, bad = {}, 0
+    for k, e, d, _ in STEPS:
+        sp = stamp_path(c, k)
+        t = os.path.getmtime(sp) if os.path.exists(sp) else None
+        paths = [_resolve(c, p) for p in ARTIFACTS.get(k, [])]
+        miss = [p for p in paths if not os.path.exists(p)]
+        if not paths:
+            print(f"  {k:8s} " + (f"跑过 {time.strftime('%F %T', time.localtime(t))}"
+                                  if t else "--  (没有产物, 也没跑过)"))
+        elif miss:
+            print(f"  {k:8s} 缺 {', '.join(os.path.relpath(m, c.R1) for m in miss[:3])}")
+            bad += 1
+        elif t is None:
+            print(f"  {k:8s} 有  (产物在, 无完成戳, 跑一次这步即可)")
+        else:
+            older = [u for u in DEPS.get(k, []) if u in when and when[u] > t + 1]
+            note = f"  <- 比依赖的 {'/'.join(older)} 旧, 该重跑" if older else ""
+            print(f"  {k:8s} OK  {time.strftime('%F %T', time.localtime(t))}{note}")
+            if older:
+                bad += 1
+        if t:
+            when[k] = t
+    print("全部就绪" if not bad else f"{bad} 处需要注意")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scene", default="mayday")
+    ap.add_argument("--run", default="b1")
+    ap.add_argument("--from", dest="a", default=None)
+    ap.add_argument("--to", dest="b", default=None)
+    ap.add_argument("--only", default=None, help="逗号分隔")
+    ap.add_argument("-n", "--dry-run", action="store_true")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--check", action="store_true", help="不跑, 只看产物在不在/有没有过期")
+    ap.add_argument("--dump-cfg", action="store_true")
+    ap.add_argument("--tag-only", action="store_true")
+    g = ap.parse_args()
+
+    keys = [s[0] for s in STEPS]
+    if g.dump_cfg:
+        c = Ctx(g.scene, g.run)
+        print(c.tag if g.tag_only else json.dumps(c.cfg, ensure_ascii=False))
+        return
+    if g.list:
+        for k, e, d, _ in STEPS:
+            print(f"  {k:8s} [{e:7s}] {d}" + ("   <- 默认终点" if k == DEFAULT_END else ""))
+        return
+    for x in [g.a, g.b] + (g.only.split(",") if g.only else []):
+        if x and x not in keys:
+            raise SystemExit(f"没有这个步骤: {x}\n可选: {', '.join(keys)}")
+
+    c = Ctx(g.scene, g.run)
+    if g.check:
+        do_check(c)
+        return
+
+    if g.only:
+        sel = [s for s in STEPS if s[0] in g.only.split(",")]
+    else:
+        i = keys.index(g.a) if g.a else 0
+        j = keys.index(g.b) if g.b else keys.index(DEFAULT_END)
+        sel = STEPS[i:j + 1]
+
+    os.makedirs(c.LOG, exist_ok=True)
+    print(f"场景 {c.scene}  轮次 {c.run}  标签 {c.tag}")
+    print(f"视频 {c.VID}")
+    print(f"结果 {c.R1}")
+    print(f"补全 {'开' if c.cfg['OCC'] == '1' else '关'}  ->  {os.path.basename(c.MESH)}")
+    print(f"步骤 {' -> '.join(s[0] for s in sel)}" + ("   [干跑]" if g.dry_run else ""))
+    print()
+
+    for k, e, d, fn in sel:
+        t = time.time()
+        sep = f"\n{'='*70}\n== {k}  {time.strftime('%F %T')}\n{'='*70}\n"
+        print(f"== {k}  [{e}]  {d}", flush=True)
+        _o = globals()["sh"]
+        globals()["sh"] = lambda *a, **kw: _o(*a, **{**kw, "sep": kw.get("sep", sep)})
+        try:
+            if k in GPU_STEPS and not g.dry_run:
+                with GpuLock():
+                    fn(c, g.dry_run)
+            else:
+                fn(c, g.dry_run)
+        finally:
+            globals()["sh"] = _o
+        if not g.dry_run:
+            open(stamp_path(c, k), "w").write(time.strftime("%F %T"))
+        print(f"   {time.time()-t:.1f}s\n", flush=True)
+    print("[全部完成]")
+
+
+if __name__ == "__main__":
+    main()

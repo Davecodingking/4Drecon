@@ -1,0 +1,92 @@
+#!/usr/bin/env python
+"""召回支路第 2 步: 把逐帧的检测聚成实例, 再和 SAM3 已有的实例合并, 挑出"漏检"。
+
+两件事, 都是因为 WildDet3D 是单帧模型、没有 track ID:
+  1. 跨帧关联 —— 同一个物体在不同帧各被检一次, 得认出它们是同一个。
+     做法是反投影到世界系之后按三维位置聚类: 场景是静止的, 同一个物体在各帧的世界坐标
+     应该落在一起。这比在图像上做关联可靠, 因为相机在动而物体不动。
+  2. 和 SAM3 合并 —— 两边都有的, 用 SAM3 的 (它有 mask, 下游要靠 mask 去生成);
+     只有 WildDet3D 有的, 就是 SAM3 漏掉的, 送去补抠 mask。
+
+跨词去重也在这里做: chair 和 folding chair 会各检一遍同一把椅子, 位置几乎重合。
+"""
+import os, json, numpy as np
+from collections import Counter
+R1  = os.environ.get("R1","/home/jincheng/sam3d/data/outdoor/result/timesquare/r1")
+DET = os.environ.get("DET_OUT", f"{R1}/12_wd_detections.json")
+SAM = os.environ.get("SAM_BOXES", f"{R1}/06_all_boxes.json")
+OUT = os.environ.get("RECALL_OUT", f"{R1}/13_recall.json")
+MIN_VIEWS = int(os.environ.get("MIN_VIEWS","3"))   # 至少在这么多帧里被检到才算数, 挡单帧幻觉
+DIST_F    = float(os.environ.get("DIST_F","0.5"))  # 聚类半径 = 物体尺寸 x 这个系数
+MATCH_F   = float(os.environ.get("MATCH_F","0.7")) # 和 SAM3 实例的匹配半径同理
+UP = np.array([0,-1,0.])
+
+dets = json.load(open(DET))["检测"]
+print(f"[输入] {len(dets)} 个逐帧检测")
+
+# ---------- 1. 跨帧关联: 同词的检测按三维位置贪心聚类 ----------
+def cluster(items, fac):
+    """贪心: 按分数从高到低, 每个检测要么并进已有簇, 要么自成一簇。
+    半径取物体自身尺寸的一个比例 —— 一辆车和一把椅子该用的容差差着一个数量级。"""
+    items = sorted(items, key=lambda d: -d["分"])
+    cl = []
+    for d in items:
+        c = np.array(d["中心"]); r = fac*max(np.mean(d["尺寸"]), 0.3)
+        hit = None
+        for g in cl:
+            if np.linalg.norm(c - g["中心"]) < max(r, fac*max(np.mean(g["尺寸"]),0.3)):
+                hit = g; break
+        if hit is None:
+            cl.append(dict(中心=c, 尺寸=np.array(d["尺寸"]), 成员=[d]))
+        else:
+            hit["成员"].append(d)
+            m = hit["成员"]
+            hit["中心"] = np.median([x["中心"] for x in m], 0)
+            hit["尺寸"] = np.median([x["尺寸"] for x in m], 0)
+    return cl
+
+inst = []
+for word in sorted({d["词"] for d in dets}):
+    for g in cluster([d for d in dets if d["词"]==word], DIST_F):
+        frames = {x["帧"] for x in g["成员"]}
+        if len(frames) < MIN_VIEWS: continue          # 单帧/两帧的当幻觉丢掉
+        A = np.array([x["长轴"] for x in g["成员"]])
+        sgn = np.sign(A @ A[0]); sgn[sgn==0]=1
+        a1 = (A*sgn[:,None]).mean(0); a1 /= max(np.linalg.norm(a1),1e-9)
+        if (sgn>0).sum()*2 < len(sgn): a1 = -a1
+        best = max(g["成员"], key=lambda x: x["分"])
+        inst.append(dict(词=word, 中心=g["中心"].tolist(), 尺寸=g["尺寸"].tolist(),
+                         长轴=a1.tolist(), 见帧数=len(frames), 分=float(best["分"]),
+                         最佳帧=best["帧"], 框2d=best["框2d"],
+                         朝向分歧=round(float(min((sgn>0).mean(),(sgn<0).mean())),3)))
+print(f"[聚类] -> {len(inst)} 个实例 (要求见于 >= {MIN_VIEWS} 帧)")
+
+# ---------- 2. 跨词去重: 同一把椅子被 chair / folding chair 各检一遍 ----------
+inst.sort(key=lambda x: (-x["见帧数"], -x["分"]))
+keep = []
+for a in inst:
+    ca = np.array(a["中心"]); ra = DIST_F*max(np.mean(a["尺寸"]),0.3)
+    if any(np.linalg.norm(ca-np.array(b["中心"])) < max(ra, DIST_F*max(np.mean(b["尺寸"]),0.3))
+           for b in keep): continue
+    keep.append(a)
+print(f"[跨词去重] {len(inst)} -> {len(keep)}")
+
+# ---------- 3. 和 SAM3 已有实例比对 ----------
+sam = [dict(b, 词=w) for w,bs in json.load(open(SAM)).items() for b in bs]
+print(f"[SAM3] 已有 {len(sam)} 个实例")
+new = []
+for a in keep:
+    ca = np.array(a["中心"]); r = MATCH_F*max(np.mean(a["尺寸"]),0.3)
+    m = None
+    for b in sam:
+        cb = np.array(b["中心"])
+        if np.linalg.norm(ca-cb) < max(r, MATCH_F*max(np.mean(b["尺寸"]),0.3)): m = b; break
+    if m is None: new.append(a)
+    else: a["对上SAM3"] = f"{m['词']}#{m['obj_id']}"
+matched = len(keep)-len(new)
+print(f"[合并] {matched} 个和 SAM3 对得上 (用 SAM3 的 mask), {len(new)} 个是 SAM3 漏掉的")
+for i,a in enumerate(new): a["obj_id"] = 10000+i          # 召回实例的 ID 从 10000 起, 不和 SAM3 撞
+print("  漏检按词:", dict(Counter(a["词"] for a in new).most_common(10)))
+json.dump(dict(召回=new, 对上=matched, 总实例=len(keep)), open(OUT,"w"),
+          ensure_ascii=False, indent=1)
+print(f"\n[done] -> {OUT}")

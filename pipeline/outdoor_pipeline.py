@@ -1,0 +1,1135 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""室外逐物体三维重建 —— 全流程调度脚本 (r1 版, plant pot 修复之后)
+
+这个文件不实现算法, 只做三件散在别处、丢了就没人记得的事:
+  1. 步骤的先后顺序 (依赖关系不是直觉上的顺序, 见下)
+  2. 每一步该用哪个 conda 环境 (这条链跨了三个环境, 用错就 import 失败)
+  3. 每一步的参数取值, 以及这些取值是怎么来的 (注释里写清楚)
+
+算法本体仍在 ~/sam3d/data/outdoor/scripts/*.py, 每个都能单独重跑。
+故意不把它们合并成一个大文件: 环境不同合不了, 而且调门槛时能只重跑一步这个性质很值钱。
+
+------------------------------------------------------------------ 依赖顺序
+词表 -> 深度 -> 跟踪 -> 挑图 -> VLM验图 -> 生成(每类一个) -> 量mesh比例
+     -> 量盒子 -> 生成(逐实例) -> 组装 -> 物理修正 -> 渲染回图
+
+反直觉的两处, 是踩过才知道的:
+  * 量盒子(boxes) 要在 生成(gen) 之后。因为跨词去重时靠 mesh 的长宽高比例来判断
+    "这个红花盆到底该叫 plant pot 还是 potted plant" —— 没有 mesh 就没有比例。
+  * 逐实例生成(solo) 要在 量盒子 之后。要先有 06_all_boxes.json 才知道有哪些实例。
+
+------------------------------------------------------------------ 一个潜伏很久的坑
+调 SAM3D 的 run.py 必须显式设 CONDA_PREFIX (它内部 inference.py 直接读这个变量,
+没有就 KeyError)。这个变量只有 conda activate 才会设, 直接调环境里的 python 是没有的。
+这坑在驱动里潜伏了很久没暴露: gen / solo 两步每次都因为"产物已有, 跳过"而没真正调过
+run.py, 直到第一次真的要生成新东西才炸。教训是"这步跑过了没报错"不等于"这步能跑"。
+
+------------------------------------------------------------------ 哪些脚本是死的
+scripts/ 里有 6 个文件不在这条链上, 别照着它们改:
+  all_instances_boxes.py  已被 boxes_from_masks.py 取代 (首轮版, 门槛按帧数不按点数)
+  pick_for_sam3d.py       已被 pick_from_masks.py 取代 (首轮版, 每次自己重跑一遍跟踪)
+  sam3_video_probe.py     首轮试 SAM3 视频跟踪能不能用的探针
+  sam3_cutouts.py         首轮看抠图效果的小工具
+  mask_to_box.py          首轮的单张 mask 转框
+上面五个都指向 result/timesquare/ 下已经删掉的目录, 现在直接跑会报文件不存在。
+  diag_bld.py             还活着, 但不在链上 —— 查楼摆放的诊断工具, 手动跑
+
+------------------------------------------------------------------ 用法
+  python3 outdoor_pipeline.py --list                # 看所有步骤
+  python3 outdoor_pipeline.py -n                    # 干跑, 只打印命令不执行
+  python3 outdoor_pipeline.py --from boxes --to render
+  python3 outdoor_pipeline.py --only phys
+  python3 outdoor_pipeline.py --scene timesquare --run r1
+"""
+import os, sys, json, time, glob, argparse, subprocess, shlex
+
+HOME   = os.path.expanduser("~")
+SAM3D  = f"{HOME}/sam3d"
+SCRIPTS= f"{SAM3D}/data/outdoor/scripts"
+TOOLS  = f"{SAM3D}/tools"      # 看结果的脚本都在这里, 常用的放一处好找
+GEN    = f"{SAM3D}/sam-3d-objects"          # SAM 3D Objects 仓库
+DA3REPO= f"{SAM3D}/Depth-Anything-3"
+
+# 每个 conda 环境的 python。装了什么 (2026-09-10 实测):
+#   sam3      sam3 包 + pycocotools + cv2 + torch        无 trimesh / pyrender
+#   sam3d     pycocotools + trimesh + pyrender + cv2 + **transformers 4.57.1**
+#   spatiallm depth_anything_3 在这里, 且只在这里
+#
+# ★ 2026-09-10: trellis2 这个环境被清理掉了(腾磁盘), VLM 那三步(vlm / verify / vlm_sizes)
+#   随之全挂, 退出码 127。它在这条链上的唯一身份从来就是"装了 transformers 4.57.1 的那个
+#   环境" —— 名字是历史遗留(当初为 TRELLIS.2 建的), 跟 TRELLIS 本身没关系。
+#   所以不必重建那一整套, 把 transformers==4.57.1 装进 sam3d 就行:
+#     * 不碰 torch —— Blackwell 的 2.8.0+cu128/sm_120 是调通过的, 重装等于把已解决的问题重解
+#     * 不碰 huggingface_hub —— 不钉版本会把它推到 1.30, 而 gradio/moge/timm 依赖 0.36,
+#       那才是真会连锁崩的地方。钉 4.57.1 之后它纹丝不动(实测 dry-run 确认)
+#     * 净新增 4 个包(regex/tokenizers/transformers/accelerate), 零覆盖
+#   trellis2 这个键保留但指向 sam3d, 免得步骤表和各处 envcmd 全要改。
+PY = {
+    "sam3":      f"{HOME}/miniforge3/envs/sam3/bin/python",
+    "sam3d":     f"{HOME}/miniforge3/envs/sam3d/bin/python",
+    "trellis2":  f"{HOME}/miniforge3/envs/sam3d/bin/python",   # ← 见上, 环境没了, 活挪进 sam3d
+    "spatiallm": f"{HOME}/miniforge3/envs/spatiallm/bin/python",
+    # WildDet3D 走 vis4d, 钉 pydantic<2 + numpy<2, 塞进上面任何一个都会打架, 必须独立
+    "wilddet":   f"{HOME}/miniforge3/envs/wilddet/bin/python",
+}
+WD3REPO = f"{SAM3D}/WildDet3D"
+
+# ------------------------------------------------------------------ 参数
+# 这些值都是调出来的, 改之前先看注释里写的"为什么是这个数"。
+CFG = dict(
+    NFR         = "8",      # VLM 扫几帧列词表。用户明确要求先用 8 帧
+    MAX_FRAMES  = "180",    # DA3 用多少帧。深度帧越多, 每个实例可用的帧越多
+    PROCESS_RES = "504",    # DA3 处理分辨率, 出来的深度图是 280x504
+    MIN_FRAMES  = "2",      # 挑生成样本的下限, 只防单帧误检
+    MIN_AREA_PCT= "0.05",   # 候选实例的最小面积占比(%)
+    TOPK        = "8",      # VLM 每类最多验几个候选
+    MIN_POINTS  = "300",    # 盒子门槛: 反投影合并后点数。首轮用"活够8帧"是错的 ——
+                            # 近处的车 2 帧就上万点, 远处的车 20 帧也才几百点
+    SAMPLE_FRAMES="8",      # 取样: 用面积最大的这么多帧。是取样不是门槛
+    CONF_MIN    = "2.0",    # 深度置信度下限, 见 boxes_from_masks.py 里的注释
+    VOX         = "0.15",   # 去重用的体素边长(米)
+    DUP_TH      = "0.55",   # 双向包含都超过 = 同一个物体
+    PART_TH     = "0.70",   # 单向包含超过 = 部件, 并进父体
+    # 二维跨词去重(dedup 那步)。名字带 DW_ 前缀是为了和上面三维那套分开 —— 两边都叫
+    # "包含率", 但一个量的是体素占用、一个量的是像素, 数值不可通用。
+    DW_DUP_TH   = "0.55",   # 同一帧上双向包含都超过 = 这一帧算重复
+    DW_PART_TH  = "0.70",   # 单向包含超过 = 可能是部件(只记录不合并, 留给三维那步)
+    DW_PART_RATIO="0.55",   # 且小的面积不到大的这个比例才算部件。和 DW_DUP_TH 取同一个值:
+                            # 完全包含时"较小的包含率"就等于面积比, 两个门槛是同一条线的
+                            # 两侧, 取同值中间才不留既判不成重复也判不成部件的灰带
+    DW_FRAME_FRAC="0.50",   # 共同帧里过半都判重复才算数。一帧说了不算: 俯视场景里两个
+                            # 不相干的东西前后叠在一起, 某几帧确实会重得很厉害
+    DW_WORD_FRAC= "0.60",   # 词对配对率门槛。分母取 max(两词实例数) 不取 min ——
+                            # 见 dedup_words.py 里 car/taxi 那段注释
+    SOLO        = "*",      # 逐实例生成的类; "*" = 除 SOLO_KEEP 外全部
+                            # ★ 2026-09-10 默认从 "car" 改成 "*"。
+                            #   共用一个 mesh 是特例, 不该是默认: 街上的人各不相同、车各不相同,
+                            #   15 个人共用一个模型会变成满街同一件格子衬衫。
+                            #   而且旧默认有个连带问题 —— 人在闸口把一个词标成 solo, 候选池
+                            #   会从"1 个代表"炸成"N 个实例", pick/verify 得重跑, 而重跑出来的
+                            #   那批新候选**没有再回到闸口给人看**就直接进生成了。
+                            #   默认就是 "*" 的话候选池一次挑定, 不再重建, 人一次看全。
+                            #   要共用的词写进 SOLO_KEEP。
+    SOLO_KEEP   = "",       # 白名单: 这些类可以合并, 全类共用一个 mesh
+    SOLO_TH     = "0.5",    # 逐实例生成的面积下限(%), 太小生成必是垃圾
+                            # 俯视场景要大幅降低, 见 beach/carpark 的 per-scene 覆盖
+    PER_INSTANCE= "tree",   # 这些类不做类内统一尺度(树高矮差太多, 统一了全变矮)
+    EXCLUDE     = "sign,billboard,pedestrian,manhole cover,bollard,awning,building",
+                            # 排除: 前四个是贴在墙上/地上的平面, 当独立物体摆必然出错;
+                            # bollard 实际是垃圾桶误检; awning 是雨篷, 悬空没有支撑;
+                            # building 走 buildings 那条支线, 不能混进物体场景 —— 一旦
+                            # 03_masks/building.npz 存在, 量盒子时楼会把墙上的广告牌和
+                            # 招牌当成"部件"吸走(实测 billboard 23->19, sign 13->10),
+                            # 这本身没错, 但楼不该出现在 07_scene.glb 里
+    SNAP        = "0.8",    # 落地: 底面离地在这个范围内才吸附, 超过视为本就悬空
+    ITERS       = "12",     # 推开穿模的迭代轮数
+    MARGIN      = "0.02",   # 推开后留的缝(米)
+    RB_FRAMES   = "0,40,88,120,160",   # 渲染回图用哪几个机位
+    WD_FRAMES   = "5",      # WildDet3D 每个实例问几帧, 取中位数
+    WD_MINPIX   = "400",    # 2D 框小于这么多像素就不问, 问了也是噪声
+    WD_DEPTH    = "1",      # 喂 DA3 深度钉尺度。不给内参它默认 focal=max(H,W), 尺度会整体偏
+    DET_STRIDE  = "5",      # 召回: 每隔几帧全图检一次 (180 帧不必全检)
+    DET_SCORE   = "0.8",    # 召回: 检测分数下限。分数上限约 1.1 不是概率;
+                            # 0.8 时每帧约 60 个, 和画面里实际物体数量级相当
+    MIN_VIEWS   = "3",      # 召回: 聚类后至少见于这么多帧才算数, 挡单帧幻觉
+    DIST_F      = "0.5",    # 召回: 跨帧聚类半径 = 物体尺寸 x 它 (车和椅子容差差一个量级)
+    MATCH_F     = "0.7",    # 召回: 和 SAM3 已有实例的匹配半径同理(只在 MATCH_2D=0 时用)
+    MATCH_2D    = "1",      # 召回: 和 SAM3 比对走二维框 IoU 而不是三维距离。见 s_recall 的注释
+    IOU_SELF    = "0.5",    # 召回: WD 实例之间去重, 框 vs 框
+    IOU_SAM     = "0.3",    # 召回: WD 的框 vs SAM3 mask 的外接框
+    SELF_3D_F   = "0.8",    # 召回: 两个 WD 实例没有共同帧时的三维退路半径
+    REC_MIN_PCT = "0.15",   # 召回: 补抠出的 mask 太小就不生成, 出来必是垃圾
+    REC_MIN_IOU = "0.3",    # 召回: 补抠结果和输入框重合不够就丢
+    BLD_CONF    = "1.0",    # 楼的深度置信度下限。楼在 100m 外, 置信度恰好等于 DA3 的
+                            # 下限 1.00, 用物体那档 2.0 会一个点都剩不下
+    BUILDING_WORDS = "",    # 哪些词算"楼"。空 = 这个场景没有建筑, BUILDING_MODE 自动降成 scene
+    BUILDING_MODE  = "scene",   # 楼怎么出。三选一, 见 _bmode():
+                            #   building+scene     楼一个 glb + 场景一个 glb, 各自渲染回图
+                            #   scenewithbuilding  一个 glb, 楼和物体在一起
+                            #   scene              一个 glb, 没有楼(楼连生成都不生成)
+    EXTRA_WORDS = "",       # 追加给 SAM3 跟踪的词, 词表之外的。逗号分隔。
+                            # ★ 为什么必须有这个配置项: 列词那步的 prompt 明确让 VLM
+                            #   "跳过建筑立面", 所以词表里永远不会有楼。楼只能从这里注入。
+                            #   2026-09-08 beach 那 4 栋楼是手敲 EXTRA_WORDS= 跑出来的,
+                            #   没进配置 —— 结果是重跑 track 楼就消失, 交付物不可复现。
+)
+
+# 上面那些阈值是在 timesquare 这一个"游戏引擎渲染"素材上调出来的。换实拍素材(噪声更大、
+# 深度更差)多半要重调, 所以每个场景可以在这里覆盖, 不用去改 CFG 也不用每次敲环境变量。
+SCENE_TAG = {"timesquare": "ts", "warpengine": "we", "beach": "be", "carpark": "cp"}
+
+SCENES = {
+    "timesquare": {},        # 基准场景 —— CFG 的默认值就是在它上面调的
+    "warpengine": {},        # 还没跑过, 跑的时候把调出来的值填这里
+    # 下面两个是 2026-09-07 新加的。素材 1920x1080, 比时代广场(1280x720)清晰但帧少
+    # (beach 109 帧 / carpark 132 帧 vs 180)。阈值先沿用时代广场那套, 跑出来再按实际调。
+    # 两段都是高空俯视, 物体在画面里比平视街景小得多, 面积类门槛要放宽。
+    # SOLO="*" = 除白名单外全部逐实例生成 —— 用户的判断是"基本所有类都不能合并",
+    # 同类外观差异大(沙滩伞至少四种花色, 停车场轿车/皮卡/箱货/搅拌车混在一起)。
+    "beach":      dict(MAX_FRAMES="109", MIN_AREA_PCT="0.02", SOLO="*", SOLO_KEEP="",   # chair 唯一那个实例被去重判成了 bench#2(4 个共同帧 IoU 0.964,
+                                             # 看图确认是同一把白色板条椅), 这个白名单已经空转
+                       # 建筑 glb 只用 cabin(绿顶木亭子) 和 shed(长条集装箱建筑), 两个抠得都干净。
+                       # ★ building 这个词必须排除: 它抠出来的是整个蓝色餐厅露台, 连同平台上
+                       # 所有遮阳伞/桌/椅/人一起烘成一坨。而那些伞桌椅本身还在被单独检测
+                       # (umbrella 24 个实例 / chair 12 / table 10), 放进去同一批物体会被摆两次。
+                       # 教训: 补词能救回漏检(没有 building 这个词, 22 个建筑实例一个都没有),
+                       # 但补进去的词必须看抠图验一遍 —— 词太宽泛会把一大片场景圈成一个物体。
+                       # 同样是补的词, cabin 对 building 错, 差别只在词的粒度。
+                       # (wooden pavilion / kiosk 跑出 0 实例, archway / beach hut 被 VLM 否掉。)
+                       # 2026-09-08 换了新素材(Coney Island 木栈道), 老的 cabin/shed 不存在了。
+                       # 列词那步的 prompt 明确让 VLM 跳过建筑立面, 所以词表里一个建筑词都没有,
+                       # 建筑词是用 track_all 的 EXTRA_WORDS 单独跟踪进来的:
+                       #   building   OOM 挂掉(峰值 29.2G, 分段也不行) —— 匹配的东西太多, 粒度太粗
+                       #   pavilion   0 个实例
+                       #   storefront / shop / restaurant  各 5 个, 抠的是同一批楼, 质量都不错
+                       #   kiosk      1 个, 抠到的是热狗车不是楼
+                       # 去重那步(2026-09-08 新增)判定 shop/storefront/restaurant 是同一批楼,
+                       # kiosk 抠到的是热狗车, 并进了热狗车那组。
+                       # ★ 这里必须写"去重之后活下来的那个词" —— 另外两个词的实例已经被判掉,
+                       #   写它们等于这个 glb 是空的, 而那 5 栋楼会留在主场景里(建筑不进主场景
+                       #   靠的就是 BUILDING_WORDS 这张表), 两头都错。
+                       #   去重从词级改成实例级(同日)之后胜出者从 storefront 变成 restaurant:
+                       #   三个词在 RANK 表里同档、实例数都是 5, 一路平到底最后按词名定,
+                       #   restaurant 字典序最小。三个词抠的是同一批楼, 换名字不换东西。
+                       # ★ 2026-09-09: 这两行以前是手敲命令行的, 没进配置 ——
+                       #   重跑 track 楼就消失, 昨天交付的 4 栋楼从流水线跑不出来。
+                       #   现在 s_track 会把 EXTRA_WORDS 传给 track_all.py, 可复现了。
+                       #   building 不写进来: 实测 OOM(峰值 29.2G), 而且粒度太粗,
+                       #   会把整个餐厅露台连桌椅一起烘成一坨。
+                       EXTRA_WORDS="storefront,shop,restaurant",
+                       BUILDING_WORDS="restaurant",
+                       BUILDING_MODE="building+scene",
+                       # 沙滩纹理均一(大片沙子和海面), DA3 只有 9% 的像素置信度过 2.0
+                       # (停车场 92.6%, 时代广场 77.7%)。注意这个差别是画面内容造成的,
+                       # 不是相机运动: carpark 相机也只走了 1.48m 但置信度比时代广场还高。
+                       # 照搬 2.0 会把整个场景滤空, 降到 1.0 保住 100% 的像素;
+                       # 点数门槛跟着降, 因为可用像素虽多但深度本身更糙。
+                       CONF_MIN="1.0", MIN_POINTS="150",
+                       # 用户要求"直接全跑实例"。俯视素材物体极小: chair 0.14%、
+                       # trash can 0.08%、bollard 0.05% 都已经是各自类里最大的那个,
+                       # 沿用 0.5% 等于 SOLO 根本不触发, 最后还是全类共用一个 mesh。
+                       # 降到 0.03% 覆盖绝大多数; 再往下生成出来必是垃圾, 留作下限。
+                       SOLO_TH="0.03",
+                       EXCLUDE="sign,billboard,awning,manhole cover,bollard,fence,railing,person,stair,building"),
+    "carpark":    dict(MAX_FRAMES="132", MIN_AREA_PCT="0.02", SOLO="*", SOLO_KEEP="van",
+                       SOLO_TH="0.03",   # 同 beach: 俯视物体小, 0.5% 等于不触发
+                       EXCLUDE="sign,billboard,awning,manhole cover,bollard,fence,fence post,scaffolding"),
+}
+# 生效顺序: CFG 默认值 <- 场景覆盖 <- 环境变量 (环境变量最大, 方便临时试一个值)
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("review_decisions", f"{SCRIPTS}/review_decisions.py")
+review = _ilu.module_from_spec(_spec); _spec.loader.exec_module(review)
+
+def resolve_cfg(scene, R1=None):
+    """生效顺序: CFG 默认值 <- 场景覆盖 <- 人工闸决策 <- 环境变量。
+
+    人工闸排在环境变量之前 —— 临时敲一个环境变量试值, 应该压得过闸的决定;
+    但闸的决定要压得过写死在 SCENES 里的默认, 否则人在闸口做的判断永远轮不上。"""
+    cfg = dict(CFG)
+    cfg.update(SCENES.get(scene, {}))
+    if R1:
+        review.apply_to_cfg(cfg, R1)
+    cfg.update({k: v for k, v in os.environ.items() if k in CFG})
+    return cfg
+
+# 生成样本的人工指定: VLM 验图只保证"是不是这个词", 不保证"抠得全不全"。
+# table 自动选中的候选只有一块光桌面没有腿, 用户看了候选图后指定第 6 个(实例8/第32帧),
+# 那个连 X 形支架一起抠到了, 生成出来才是完整的折叠桌。
+# 词 -> (实例号, 帧号)。★ 按场景分开 —— 这本来是个全局 dict, 但它写的是
+# "timesquare 那张折叠桌该用第 8 个实例的第 32 帧", 换个场景根本没有 table 这个词,
+# 读 npz 直接 FileNotFoundError 把整条链打断(carpark 实测)。
+PICK_OVERRIDE_BY_SCENE = {
+    # timesquare: VLM 只判"是不是桌子", 判不了"抠得全不全"。自动选中的那张只有一块光桌面
+    # 没有腿, 用户看了候选图后指定第 6 个候选(实例8/第32帧), 那张连 X 形支架一起抠到了。
+    "timesquare": {"table": (8, 32)},
+}
+
+
+# ------------------------------------------------------------------ 执行
+class Ctx:
+    def __init__(self, scene, run):
+        self.scene = scene; self.run = run
+        self.tag = f"{SCENE_TAG.get(scene, scene[:3])}_{run}"     # timesquare+r1 -> ts_r1
+        self.FR  = f"{SAM3D}/data/outdoor/dataset/{scene}/frames"
+        self.VID = f"{SAM3D}/data/outdoor/dataset/{scene}/video.mp4"
+        self.R1  = f"{SAM3D}/data/outdoor/result/{scene}/{run}"
+        self.LOG = f"{self.R1}/logs"
+        self.cfg = resolve_cfg(scene, self.R1)   # R1 要先算出来: 人工闸的决策文件在它下面
+
+LOCK = "/tmp/outdoor_pipeline_gpu.lock"
+
+class GpuLock:
+    """吃显存的步骤串行执行。不是调参数能解决的问题: 单份 SAM3D 驻留 20GB 出头,
+    32G 卡装不下两份。之前 beach 和 carpark 并行跑 gen, 两边同时被 CUDA OOM 杀掉,
+    而且日志一停就再没有新内容, 靠"看日志有没有更新"的监控反而永远静默。"""
+    def __enter__(self):
+        import fcntl
+        self.f = open(LOCK, "w")
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("    [等待] 另一个场景正在占用 GPU, 排队中...", flush=True)
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+    def __exit__(self, *a):
+        import fcntl
+        fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
+
+def stamp_path(c, key): return f"{c.LOG}/.stamp_{key}"
+
+def sh(cmd, log=None, dry=False, cwd=None, sep=None):
+    line = cmd if isinstance(cmd, str) else " ".join(shlex.quote(c) for c in cmd)
+    print(f"    $ {line}" + (f"   > {os.path.basename(log)}" if log else ""), flush=True)
+    if dry: return 0
+    if log:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        if sep:                                   # 每次跑打一条带时间的分隔线
+            with open(log, "a") as f: f.write(sep)
+    with (open(log, "a") if log else open(os.devnull, "w")) as f:
+        out = f if log else None
+        r = subprocess.run(cmd, shell=isinstance(cmd, str), cwd=cwd,
+                           stdout=out or None, stderr=subprocess.STDOUT if out else None)
+    if r.returncode: raise SystemExit(f"[失败] 退出码 {r.returncode}: {line}")
+    return r.returncode
+
+def envcmd(py, script, env, args=()):
+    """把环境变量写在命令行前面, 这样 --dry-run 打印出来的就是能直接粘去跑的命令"""
+    pre = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items())
+    return f"{pre} {shlex.quote(py)} {shlex.quote(script)} " + " ".join(map(shlex.quote, args))
+
+
+# ------------------------------------------------------------------ 各步骤
+def s_frames(c, dry):
+    """抽帧。文件名必须补零成 0000.jpg —— 这是踩过的最大的坑:
+    0.jpg/1.jpg/... 按字典序排是 0,1,10,100,101,...,2,20, DA3 拿到的就是乱序的视频,
+    90 个相机位姿会塌成一个点, 而且不报错。"""
+    os.makedirs(c.FR, exist_ok=True)
+    if glob.glob(f"{c.FR}/0000.jpg") and not dry:
+        print("    帧已存在, 跳过"); return
+    # 本机没装 ffmpeg, 用 cv2 抽。原来写 ffmpeg 一直没暴露, 是因为 timesquare 的帧
+    # 是当初手工抽好的, frames 这步从来没真跑过。
+    code = f'''
+import cv2, os
+cap = cv2.VideoCapture({c.VID!r}); i = 0
+while True:
+    ok, f = cap.read()
+    if not ok: break
+    cv2.imwrite(f"{c.FR}/{{i:04d}}.jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 95]); i += 1
+cap.release(); print(f"[done] 抽出 {{i}} 帧 (文件名补零到四位, 这是必须的)")
+'''
+    sh([PY["sam3d"], "-c", code], f"{c.LOG}/00_frames.log", dry)
+
+def s_vlm(c, dry):
+    """Qwen3-VL 扫 8 帧列词表。只让它列名词, 不让它画框 —— 定位交给 SAM3。
+    词表一个不改: 这是"VLM 能不能自己列全"的实验, 掺了手写词就没意义了。"""
+    sh(envcmd(PY["trellis2"], f"{SCRIPTS}/vlm_list_objects.py",
+              dict(FR=c.FR, OD=c.R1, NFR=c.cfg["NFR"])), f"{c.LOG}/01_vlm.log", dry)
+
+def s_da3(c, dry):
+    """Depth Anything 3 出米制深度 + 相机位姿。只有 spatiallm 环境装了它。
+    世界系 = 第一帧的相机系, OpenCV 约定(y 朝下), 所以后面所有脚本里 UP = [0,-1,0]。"""
+    sh(f'{shlex.quote(PY["spatiallm"])} {shlex.quote(f"{DA3REPO}/da3_to_ply.py")} '
+       f'--images {shlex.quote(c.FR)} --out {shlex.quote(f"{c.R1}/02_da3")} '
+       f'--max-frames {c.cfg["MAX_FRAMES"]} --process-res {c.cfg["PROCESS_RES"]} --use-ray-pose',
+       f"{c.LOG}/02_da3.log", dry)
+
+def s_up(c, dry):
+    """定出场景真正的"天"。老代码写死"首帧相机的 -y 就是天", 街头平视成立(时代广场偏
+    0.4°), 高空俯拍不成立(beach 偏 26.2°, carpark 29.2°) —— 相机低着头, 它的上方是斜的,
+    整个场景连同地面一起歪掉。改成从点云最大平面拟合地面法向。
+    必须排在量盒子之前: 盒子高度是沿"天"量的, 方向错了盒子就错, 事后旋转救不回来。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/world_up.py", dict(R1=c.R1)),
+       f"{c.LOG}/02_up.log", dry)
+
+def s_track(c, dry):
+    """SAM3 视频跟踪, 每个词跑一次, 结果 RLE 压缩落盘。跟踪只跑这一次,
+    后面挑图/量盒子/逐实例生成全部从 03_masks/*.npz 读, 不再碰 GPU。
+    防 OOM 三级都在 track_all.py 里(显存卸到 CPU / 密集词提高检出阈值 / 分段)。"""
+    sh(envcmd(PY["sam3"], f"{SCRIPTS}/track_all.py",
+              dict(FR=c.FR, R1=c.R1, EXTRA_WORDS=c.cfg["EXTRA_WORDS"])),
+       f"{c.LOG}/03_track.log", dry)
+
+def s_dedup(c, dry):
+    """跨词去重(二维): 同一批物体被几个同义词各抠一遍, 赶在生成之前判掉多余的词。
+    ★ 位置就是这一步的全部意义。原来的跨词去重在 boxes 那步(三维体素), 而 boxes 排在
+    gen 之后 —— 它要拿 mesh 的长宽高比例来选词, 于是三个同义词已经各烧过一次 SAM3D
+    (每次 1-2 分钟 GPU) 才发现是重复的, 去掉的只是盒子的重, mesh 白生成。
+    挪到 track 之后, 判据只用 mask 就够: 同一帧上两个词的 mask 重得够多就是同一个东西,
+    不必经过深度和尺度 —— 而深度和尺度恰恰是这条链上最不可靠的两环(beach 的深度尺度
+    实测差过 6.4 倍)。同一条思路在 merge_recall.py 上验证过, 假漏检从 46 降到 4。
+    排除表要和挑图那步用同一份: 排除词本来就不下游, 让它参与只会有一种坏结果 ——
+    它当选了组代表, 整组物体跟着它一起被排除掉。
+    boxes 那步的三维体素去重留着当兜底, 专管"两个词从来没在同一帧同时出现"的死角。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/dedup_words.py",
+              dict(R1=c.R1, EXCLUDE=_gen_excl(c),
+                   DW_DUP_TH=c.cfg["DW_DUP_TH"], DW_PART_TH=c.cfg["DW_PART_TH"],
+                   DW_PART_RATIO=c.cfg["DW_PART_RATIO"],
+                   DW_FRAME_FRAC=c.cfg["DW_FRAME_FRAC"], DW_WORD_FRAC=c.cfg["DW_WORD_FRAC"])),
+       f"{c.LOG}/03_dedup.log", dry)
+
+BMODES = ("building+scene", "scenewithbuilding", "scene")
+
+def _bwords(c, follow_dedup=True):
+    """这个场景里哪些词算"楼"。
+
+    ★ 不能只用 BUILDING_WORDS 那几个字面词。beach 的楼被 storefront/shop/restaurant
+      三个词各抠一遍, 去重那步判成同一批、只留一个代表 —— 而代表是谁会变
+      (三个词同档、实例数相同时按词名定, 跟踪结果稍变就换人)。
+      两个后果都不报错:
+        1. BUILDING_MODE=scene 只排除 restaurant, shop/storefront 顶上来照样生成、照样进场景;
+        2. 代表换人后 s_assemble 用的还是原来那个词, 楼留在主场景里, 同时 building glb 少几栋。
+      所以这里把"和建筑词同组的所有词"一起算进来 —— 跟组走, 不跟字面词走。
+    """
+    bw = {w.strip() for w in c.cfg["BUILDING_WORDS"].split(",") if w.strip()}
+    # EXTRA_WORDS 注入的词就是为了抠楼的, 也一并算 —— 它们本来就是同一批东西的不同说法
+    bw |= {w.strip() for w in c.cfg.get("EXTRA_WORDS", "").split(",") if w.strip()}
+    if not (follow_dedup and bw):
+        return bw
+    dw = f"{c.R1}/03_dedup_words.json"
+    if not os.path.exists(dw):
+        return bw
+    try:
+        d = json.load(open(dw))
+    except Exception:
+        return bw
+    grown = set(bw)
+    for g in d.get("组", []):
+        words = {str(m).rsplit("#", 1)[0] for m in g.get("实例", [])}
+        rep = g.get("代表词") or g.get("胜出")
+        if rep: words.add(rep)
+        if words & bw:                      # 这一组里只要有一个是建筑词, 整组都算楼
+            grown |= words
+    if grown != bw:
+        print(f"    [建筑词跟组] {sorted(bw)} -> {sorted(grown)}")
+    return grown
+
+def _bmode(c):
+    """这个场景的建筑模式。三选一:
+         building+scene     楼一个 glb + 场景一个 glb, 各自渲染回图
+         scenewithbuilding  一个 glb, 楼和物体在一起
+         scene              一个 glb, 没有楼(楼连生成都不生成, 不烧那份 GPU)
+    没有建筑词就没有"楼"可谈, 一律降成 scene —— 否则 building+scene 会出一个空 glb,
+    而空 glb 不报错, 又是一处静默失效。"""
+    m = c.cfg["BUILDING_MODE"].strip()
+    if m not in BMODES:
+        raise SystemExit(f"[失败] BUILDING_MODE={m!r} 不认识, 只能是 {list(BMODES)}")
+    if not _bwords(c):
+        if m != "scene":
+            print(f"    [建筑模式] BUILDING_WORDS 是空的, {m} 降成 scene")
+        return "scene"
+    return m
+
+def _boxes_arg(c):
+    """摆场景该读哪份盒子。有召回合并过的就用合并版 —— 这是"召回捡回来的东西进不进场景"
+    的唯一开关。
+    ★ 原来这里看的是环境变量 USE_RECALL, 而且默认关: 召回五步照跑、显存照烧, 结果永远
+      进不了 07_scene.glb, 表面上还"全跑完了没报错"。室内一直是"文件在就用", 是对的,
+      这里跟室内对齐。"""
+    m = f"{c.R1}/06_all_boxes_merged.json"
+    b = f"{c.R1}/06_all_boxes.json"
+    if not os.path.exists(m): return {}
+    # ★ 陈旧的 merged 不许静默采用。改成"文件在就用"之后这个坑比原来的 USE_RECALL 更容易踩:
+    #   重跑过 boxes/scale 之后 base 是新的、merged 还是上一轮的, 整场景会退回旧盒子摆。
+    if os.path.exists(b) and os.path.getmtime(m) < os.path.getmtime(b):
+        # ★ 这里原来只把话写进一个变量就 return 了 —— 既不抛也不打印, 注释说"不许静默采用",
+        #   代码做的正好是静默采用。硬停: 拿上一轮的盒子摆整个场景, 出来的东西看着没毛病。
+        raise SystemExit(
+            f"[失败] {os.path.basename(m)} 比 {os.path.basename(b)} 旧, 拒绝使用。\n"
+            f"       合并盒子 {time.strftime('%m-%d %H:%M', time.localtime(os.path.getmtime(m)))}, "
+            f"基础盒子 {time.strftime('%m-%d %H:%M', time.localtime(os.path.getmtime(b)))}\n"
+            f"       量盒子那步重跑过了, 召回的合并结果已经过期。重跑 recall_merge, "
+            f"或者删掉 merged 那份用基础盒子摆。")
+    return {"BOXES": m}
+
+def _gen_excl(c):
+    """挑图/逐实例生成 那两步用的排除表。
+    建筑词要不要生成, 取决于模式:
+      building+scene / scenewithbuilding —— 要生成, 所以从排除表里减掉建筑词
+        (主场景排不排它们是 s_assemble 的事, 生成那步要是先挡掉, 楼就一个都没有)
+      scene —— 不出楼, 那就连生成都别生成, 把建筑词加进排除表, 省掉那份 GPU"""
+    ex = {w.strip() for w in c.cfg["EXCLUDE"].split(",") if w.strip()}
+    bw = _bwords(c)
+    ex = (ex | bw) if _bmode(c) == "scene" else (ex - bw)
+    return ",".join(sorted(ex))
+
+def _gen_excl_set(c):
+    """_gen_excl 的集合版, 给 _gen 过滤磁盘目录用。"""
+    return {w.strip() for w in _gen_excl(c).split(",") if w.strip()}
+
+def s_pick(c, dry):
+    """每类挑一个实例的一帧当生成样本。打分 = 面积 x (1-贴边惩罚) x min(帧数/10,1)。
+    首轮那个"活够20帧"的硬门槛去掉了 —— 打分本来就在挑最大最完整的, 硬门槛只误杀
+    (桌子 12 个实例被它全砍光, 一个 mesh 都没生成)。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/pick_from_masks.py",
+              dict(R1=c.R1, FR=c.FR, TAG=c.tag, EXCLUDE=_gen_excl(c),
+                   MIN_FRAMES=c.cfg["MIN_FRAMES"],
+                   MIN_AREA_PCT=c.cfg["MIN_AREA_PCT"],
+                   # ★ 必须和 s_solo 传给 gen_per_instance.py 的三个值一模一样。
+                   # 挑图这步靠它们判断"这个词会不会走逐实例", 走的话就不写类目录
+                   # (不然同一张 mask 被写两遍, 生成两个一样的 mesh)。两边判据一旦不一致,
+                   # 会出现两边都以为对方会写 -> 那个词整个从场景里消失。
+                   SOLO=c.cfg["SOLO"], SOLO_KEEP=c.cfg["SOLO_KEEP"], SOLO_TH=c.cfg["SOLO_TH"],
+                   )), f"{c.LOG}/04_pick.log", dry)
+
+def s_verify(c, dry):
+    """让 VLM 看抠图确认"这块到底是不是这个词", 不是就换下一个候选。
+    起因: table 挑中的实例圈的是一辆轿车+卡车。打分只看面积/贴边/活多久, 纯几何,
+    从不校验内容 —— 测量交给几何, 判断交给 VLM。
+    提问要放宽("可能只是物体的一部分/可能糊"), 严格问法会把正常抠图也否掉。"""
+    sh(envcmd(PY["trellis2"], f"{SCRIPTS}/verify_picks.py",
+              dict(R1=c.R1, FR=c.FR, TAG=c.tag, TOPK=c.cfg["TOPK"], MIN_AREA_PCT=c.cfg["MIN_AREA_PCT"])),
+       f"{c.LOG}/07_verify.log", dry)
+
+def _overrides(c):
+    return review.overrides(c.R1, PICK_OVERRIDE_BY_SCENE.get(c.scene, {}))
+
+def s_override(c, dry):
+    """人工指定生成样本。VLM 只判"是不是", 判不了"全不全"。
+    ★ 这一步是路线图里唯一要永久保留的人工干预, 所以它的输入必须是机器可读的 ——
+      2026-09-09 之前它只读源码里那张 dict, 闸口填的东西到不了这里。"""
+    # "不生成"落一个盘上的名单, _gen 会照着挡。词级的 EXCLUDE 挡不住单个候选,
+    # 而人在闸口否掉的往往就是某一个实例, 不是整个词。
+    review.write_skip(c.R1, dry)
+    code = f'''
+import os,sys,json,numpy as np,cv2
+from pycocotools import mask as mask_util
+sys.path.insert(0,{SCRIPTS!r})
+from imgio import imwrite_stable
+R1={c.R1!r}; FR={c.FR!r}; OV={_overrides(c)!r}
+if not OV: print("[人工指定] 这个场景没有人工指定, 跳过")
+for w,(oid,fi) in OV.items():
+    _p=f"{{R1}}/03_masks/{{w.replace(chr(32),chr(95))}}.npz"
+    if not os.path.exists(_p):
+        print(f"[跳过] {{w}} 这个场景里没有这个词"); continue
+    z=np.load(_p,allow_pickle=True)
+    meta=z["meta"]; counts=z["counts"]; H,W=z["hw"]
+    hit=[i for i,(o,f,a,e) in enumerate(meta) if int(o)==oid and int(f)==fi and a>0]
+    if not hit: print(f"[跳过] {{w}} 没有 实例{{oid}}/第{{fi}}帧"); continue
+    m=mask_util.decode({{"counts":counts[hit[0]],"size":[int(H),int(W)]}}).astype(np.uint8)
+    d=os.path.expanduser(f"~/sam3d/sam-3d-objects/my_images/{c.tag}_{{w.replace(chr(32),chr(95))}}")
+    os.makedirs(d,exist_ok=True)
+    imwrite_stable(f"{{d}}/frame.png",cv2.imread(f"{{FR}}/{{fi:04d}}.jpg")); imwrite_stable(f"{{d}}/mask.png",m*255)
+    p=json.load(open(f"{{R1}}/04_picks/picks.json")); p.setdefault(w,{{}}).update(obj_id=oid,frame=fi,人工指定=True)
+    json.dump(p,open(f"{{R1}}/04_picks/picks.json","w"),ensure_ascii=False,indent=1)
+    print(f"[人工指定] {{w}} -> 实例{{oid}} 第{{fi}}帧")
+'''
+    sh([PY["sam3d"], "-c", code], f"{c.LOG}/07_override.log", dry)
+
+def _word_of(tag, dirname):
+    """目录名反推词: cp_r1_manhole_cover -> "manhole cover"; cp_r1_car_3 -> "car"。"""
+    n = dirname[len(tag)+1:] if dirname.startswith(tag + "_") else dirname
+    if is_solo(dirname): n = n.rsplit("_", 1)[0]      # 实例目录, 去掉尾巴上的编号
+    return n.replace("_", " ")
+
+def _gen(c, dirs, log, dry):
+    """调 SAM 3D Objects 逐个生成。--hq = 烘焙 1024 贴图, 慢 1-2 分钟但清晰得多。
+    注意它是"补全"式生成: 只看到出租车的后侧也会生成一辆完整的车, 楼也会生成四个立面。
+
+    ★ 这里必须再过一道排除表。挑图那步已经"排除的词不写盘"了, 但那只挡得住这一次 ——
+    上一轮留在 my_images/ 里的目录还躺在盘上, 而 s_gen 是 glob 磁盘目录不是读 picks.json,
+    照样会捡起来生成一遍, 正好是想省掉的那段 GPU。cyberpunk 的 couch 是靠人手动删目录
+    才没撞上, 靠人记得删不算修好。"""
+    ex = _gen_excl_set(c)
+    if ex:
+        keep = [d for d in dirs if _word_of(c.tag, os.path.basename(d)) not in ex]
+        if len(keep) != len(dirs):
+            print(f"    [排除] 盘上还留着 {len(dirs)-len(keep)} 个排除词的目录, 不生成: "
+                  + ", ".join(sorted({_word_of(c.tag, os.path.basename(d))
+                                      for d in dirs if d not in keep})), flush=True)
+        dirs = keep
+    # 人在闸口逐个否掉的候选。EXCLUDE 是词级的, 挡不住"这个词留着但这一个实例不要",
+    # 而闸口最常见的判断恰好是后者。名单由 s_override 落盘。
+    dirs = review.filter_dirs(c.R1, dirs)
+    failed = []
+    for i, d in enumerate(dirs, 1):
+        n = os.path.basename(d)
+        g = f"{GEN}/outputs/{n}/{n}.glb"
+        # ★ 只看"在不在"是不够的 —— 这条正是"人在闸口换候选"一直不生效的原因:
+        #   s_override 会重写 my_images/<n>/frame.png, mesh 却还是上一轮那个,
+        #   于是 picks.json 改了、场景里摆的没变, 而且一声不吭。
+        #   抠图比 mesh 新就必须重跑。室内(indoor_pipeline._gen_dirs)早就这么做了, 室外没跟上。
+        #   +1 秒容差: 同一次跑里两个文件的 mtime 可能只差毫秒, 不留容差会每次都重生成。
+        # ★ 要看 frame.png **和** mask.png 里较新的那个。只看 frame 是不够的:
+        #   frame.png 的内容只由帧号决定, "同一帧换一个实例"时它一个字节都不变,
+        #   真正的选择写在 mask.png 里 —— 于是"改用"在同帧换实例时静默变成空操作。
+        _newest = max((os.path.getmtime(f"{d}/{x}") for x in ("frame.png", "mask.png")
+                       if os.path.exists(f"{d}/{x}")), default=0)
+        if os.path.exists(g) and _newest <= os.path.getmtime(g) + 1:
+            print(f"    [{i}/{len(dirs)}] {n} 已有且不过期, 跳过"); continue
+        if os.path.exists(g):
+            print(f"    [{i}/{len(dirs)}] {n} 抠图比 mesh 新, 重新生成", flush=True)
+        print(f"    [{i}/{len(dirs)}] {n}", flush=True)
+        # run.py 里 inference.py 直接读 os.environ["CONDA_PREFIX"], 没有就 KeyError。
+        # 那个变量只有 conda activate 才会设, 直接调环境里的 python 是没有的。
+        # (这个坑一直潜伏着: 之前每次 gen 都因为"已有, 跳过"没真正调过 run.py。)
+        try:
+            sh(envcmd(PY["sam3d"], f"{GEN}/run.py",
+                      dict(CONDA_PREFIX=os.path.dirname(os.path.dirname(PY["sam3d"])),
+                           # SAM3D 每次启动都去 HuggingFace 拉 DINO 主干, HF 一抽风就 504。
+                           # 权重本地已有缓存, 强制离线即可。这个坑随网络状况时好时坏。
+                           HF_HUB_OFFLINE="1"),
+                      ["--image", f"{d}/frame.png", "--mask", f"{d}/mask.png",
+                       "--out", n, "--hq"]), log, dry, cwd=GEN)
+        except SystemExit as e:
+            # 批量步骤不能一个失败就整批中断: 之前 HF 504 时 beach 卡在第 15 个,
+            # 后面 9 个连试都没试。单个失败记下来继续, 最后统一报。
+            failed.append(n); print(f"       ↑ 这个失败了, 继续下一个 ({e})", flush=True)
+    _gen_report(failed)
+
+def is_solo(name):
+    """ts_r1_<词>_<实例号> 是某个实例专属的; ts_r1_<词> 是这一类共用的。
+    只能靠"最后一段是不是纯数字"来分 —— 按下划线个数数会把 folding_chair /
+    manhole_cover / street_lamp 这些多词类名全部误判成实例。"""
+    tail = name.split("_")[-1]
+    return tail.isdigit()
+
+def _gen_report(failed):
+    """★ 有失败就退非零码, 不能只 print。
+    只打印的话驱动照样盖完成戳, 而 --check 看的是 logs/solo_jobs.txt(那是清单不是 mesh),
+    于是"20 个逐实例 mesh 一个都没生成出来"这件事对 --check 完全不可见。
+    单个失败不中断整批(上面 try 住了), 但整批跑完必须让人知道 —— 已有的下次会跳过, 只补缺的。"""
+    if not failed: return
+    raise SystemExit(f"    [失败] {len(failed)} 个没生成出来: {', '.join(failed)}\n"
+                     f"       别的都好了。单独重跑这一步只会补这几个(已有且不过期的会跳过)。")
+
+def s_relabel(c, dry):
+    """挪类别: 人在闸口说"这几个其实是别的东西", 把实例在 mask 文件之间搬家。
+    mask 一个像素不改, 只换标签。搬完下游照常读 npz, 一行不用改。
+    没有决策就是空转。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/relabel_words.py", dict(R1=c.R1)),
+       f"{c.LOG}/04_relabel.log", dry)
+
+def s_gen(c, dry):
+    """每类生成一个 mesh(同款复制)。楼走 buildings 那条支线, 这里不管。
+    ★ 只认 04_picks/picks.json 里真的挑中的词, 不再照盘上目录生成 ——
+      盘是有记忆的: 上一轮留下的类目录(某个词后来改成逐实例了, 或者被去重判掉了)还躺在
+      那儿, 照 glob 就会把它捡起来再生成一遍, 正是想省掉的那段 GPU。"""
+    pj = f"{c.R1}/04_picks/picks.json"
+    if os.path.exists(pj):
+        want = {f"{c.tag}_{w.replace(' ','_')}" for w in json.load(open(pj))}
+        dirs = sorted(d for d in glob.glob(f"{GEN}/my_images/{c.tag}_*")
+                      if os.path.basename(d) in want)
+        stale = sorted(os.path.basename(d) for d in glob.glob(f"{GEN}/my_images/{c.tag}_*")
+                       if not is_solo(os.path.basename(d)) and os.path.basename(d) not in want)
+        if stale:
+            print(f"    [跳过] 盘上 {len(stale)} 个类目录不在这轮的挑图结果里(改成逐实例了/被去重判掉了/"
+                  f"被排除了), 不生成: {', '.join(x[len(c.tag)+1:] for x in stale)}", flush=True)
+    else:
+        dirs = sorted(d for d in glob.glob(f"{GEN}/my_images/{c.tag}_*")
+                      if not is_solo(os.path.basename(d)))
+    _gen(c, dirs, f"{c.LOG}/05_gen.log", dry)
+
+def s_ratio(c, dry):
+    """量出每个类 mesh 的长宽高比例, 存成 05_mesh_ratio.json。
+    下一步跨词去重要用它: 一个红花盆同时被 plant pot / planter / potted plant 三个词抠到,
+    这三个词不是粗细关系而是三种形态, 优先级表本来就无从排起 —— 但比例是量得出来的,
+    矮胖的盒子对上 plant pot(0.95x0.98x1.0), 细高的对上 potted plant(0.5x1.0x0.49)。
+    ★ 存的必须是"从大到小排好序"的比例: boxes_from_masks.py 的 shape_cost 把盒子的
+    三条边排序后直接和这里的数对齐, 存原始 x/y/z 顺序会让整个形状匹配失效。
+    预先算好存盘, 是因为量盒子那步在 sam3 环境跑, 那里没有 trimesh。"""
+    code = f'''
+import os,glob,json,trimesh,numpy as np
+r={{}}
+for p in sorted(glob.glob({GEN+"/outputs/"+c.tag+"_*/*.glb"!r})):
+    n=os.path.basename(os.path.dirname(p))[len({c.tag!r})+1:].replace("_"," ")
+    s=trimesh.load(p); m=s.to_geometry() if hasattr(s,"to_geometry") else s
+    e=np.sort(np.array(m.extents))[::-1]          # ★ 必须降序排
+    r[n]=(e/max(e[0],1e-9)).tolist()
+json.dump(r,open({c.R1+"/05_mesh_ratio.json"!r},"w"),indent=1)
+print(f"[done] {{len(r)}} 类的 mesh 比例")
+'''
+    sh([PY["sam3d"], "-c", code], f"{c.LOG}/05_ratio.log", dry)
+
+def s_meshes(c, dry):
+    """把生成的 glb 渲成灰底一览图, 肉眼查有没有生成歪的。"""
+    sh(envcmd(PY["sam3d"], f"{TOOLS}/render_meshes.py",
+              dict(R1=c.R1, TAG=c.tag, GEN_OUT=f"{GEN}/outputs")),
+       f"{c.LOG}/05_meshes.log", dry)
+
+def s_boxes(c, dry):
+    """把每个实例跨帧反投影成点云, 拟合带朝向的盒子, 再跨词去重。
+    去重用三维体素占用而不是中心距 —— 中心距分不清"重复"和"部件"(树冠 vs 整个盆栽)。
+    留哪个词: 先比 mesh 形状, 形状分不开再退回优先级表(car/taxi 的 mesh 都是轿车, 形状分不出来)。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/boxes_from_masks.py",
+              dict(R1=c.R1, MIN_POINTS=c.cfg["MIN_POINTS"], CONF_MIN=c.cfg["CONF_MIN"],
+                   SAMPLE_FRAMES=c.cfg["SAMPLE_FRAMES"],
+                   VOX=c.cfg["VOX"], DUP_TH=c.cfg["DUP_TH"], PART_TH=c.cfg["PART_TH"])),
+       f"{c.LOG}/06_boxes.log", dry)
+
+def s_vlm_sizes(c, dry):
+    """问 Qwen 要词表里每个词的典型真实高度(米), 给下一步当尺子。
+    纯文本问答, 不看图 —— "车多高"是常识问题, 混进逐帧的视觉调用里纯属浪费。
+    读现成的 01_vlm_vocab.json, 不重跑列词那步(重跑会换出一批不一样的词)。"""
+    sh(envcmd(PY["trellis2"], f"{SCRIPTS}/vlm_sizes.py", dict(OD=c.R1)),
+       f"{c.LOG}/06_vlm_sizes.log", dry)
+
+def s_scale(c, dry):
+    """标定并施加全局尺度, 把 DA3 那层从"它以为的米"改成真米。
+    DA3 自称米制, 但俯拍素材上判得离谱: carpark 的车量出来 0.23 m, 真车 1.48 m, 差 6.55 倍。
+    后果不是"看着小"这么简单 —— SNAP=0.8 变成实际 5.2 m, assemble 的 "ext[2]<0.15 就丢"
+    把真实 0.85 m 的长椅误杀, WildDet3D 的真米盒子也接不进来。
+    ★ 必须排在 boxes 之后(要拿盒子当尺子), 改完深度盒子就过期, 脚本自己会重量一遍。
+    ★ 幂等靠 cameras.json 里的 metric_scale_applied, 乘过就拒绝再乘。原始数据备份在 02_da3/_prescale/。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/world_scale.py",
+              dict(R1=c.R1, MIN_POINTS=c.cfg["MIN_POINTS"], CONF_MIN=c.cfg["CONF_MIN"],
+                   SAMPLE_FRAMES=c.cfg["SAMPLE_FRAMES"], VOX=c.cfg["VOX"],
+                   DUP_TH=c.cfg["DUP_TH"], PART_TH=c.cfg["PART_TH"])),
+       f"{c.LOG}/06_scale.log", dry)
+
+def s_solo(c, dry):
+    """SOLO 里的类逐实例各生成一个 mesh。街上的车型号各不相同, 复用一个 mesh
+    会变成满街同款。太小的实例(<SOLO_TH%)不单独生成 —— 那么小生成出来必是垃圾, 继续复用。
+    注意: gen_per_instance.py 里的 R1/FR 是写死的, 换场景要改那个文件。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/gen_per_instance.py",
+              dict(R1=c.R1, FR=c.FR, TAG=c.tag, EXCLUDE=_gen_excl(c),
+                   SOLO=c.cfg["SOLO"], SOLO_KEEP=c.cfg["SOLO_KEEP"], TH=c.cfg["SOLO_TH"])),
+       f"{c.LOG}/06_solo_pick.log", dry)
+    jobs = f"{c.LOG}/solo_jobs.txt"
+    names = open(jobs).read().split() if os.path.exists(jobs) else []
+    _gen(c, [f"{GEN}/my_images/{n}" for n in names], f"{c.LOG}/06_gen_solo.log", dry)
+
+def s_assemble(c, dry):
+    """按盒子把 mesh 摆回街上, 加一个 RANSAC 拟合的地面, 导出整场景。
+    尺度按高度对齐(高度几乎总能看全, 长度会被遮挡截短), 且同一类统一成一个尺度,
+    基准取"当初拿去生成 mesh 的那个实例"(它是 VLM 验过的, 最可信)。
+    地面必须用 RANSAC: 最小二乘会被挂在墙上的广告牌带偏 1.51m, RANSAC 残差 0.07~0.09m。
+    注意地面是用 06_all_boxes.json 里"全部"盒子的底面拟合的, EXCLUDE 在这之后才生效 ——
+    所以被排除的类照样影响地面高度(实测多跟了一次 building 让地面动了 2.5cm)。"""
+    ex = c.cfg["EXCLUDE"]
+    # 楼进不进主场景, 由模式决定 —— scenewithbuilding 就是"进", 那一支什么都不加。
+    if _bmode(c) != "scenewithbuilding" and _bwords(c):
+        # ★ 用跟组后的集合。写死那个词的话, 去重代表一换人楼就留在主场景里, 而且不报错。
+        ex += "," + ",".join(sorted(_bwords(c)))
+    print(f"    [建筑模式] {_bmode(c)}")
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/assemble_scene.py",
+              dict(R1=c.R1, TAG=c.tag, GEN_OUT=f"{GEN}/outputs", SOLO_KEEP=c.cfg.get("SOLO_KEEP",""), EXCLUDE=ex,
+                   PER_INSTANCE=c.cfg["PER_INSTANCE"],
+                   **_boxes_arg(c))),
+       f"{c.LOG}/07_assemble.log", dry)
+
+def s_phys(c, dry):
+    """落地 + 推开穿模。纯几何不用物理引擎 —— 室外地面就是一个平面, 比室内简单。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/scene_phys.py",
+              dict(R1=c.R1, SNAP=c.cfg["SNAP"], ITERS=c.cfg["ITERS"], MARGIN=c.cfg["MARGIN"])),
+       f"{c.LOG}/07_phys.log", dry)
+
+def s_render(c, dry):
+    """从原视频的机位渲染重建结果, 和实拍并排比对。护栏和路灯杆应当重合。"""
+    for scene, out in (("07_scene.glb", "08_render_back.jpg"),
+                       ("07_scene_phy.glb", "08_render_back_phy.jpg")):
+        sh(envcmd(PY["sam3d"], f"{SCRIPTS}/render_back.py",
+                  dict(R1=c.R1, FR=c.FR, SCENE=scene, RBOUT=out, FRAMES=c.cfg["RB_FRAMES"])),
+           f"{c.LOG}/08_render.log", dry)
+
+def s_boxes_wd(c, dry):
+    """量盒子的第二条路: WildDet3D 把 2D 框抬成 3D 框, 出 06_all_boxes_wilddet.json。
+    在默认链上, 也在 drive.py 的"召回"那一段里, 每次全跑都会跑到 —— 它吃显存, 别按"额外的"估开销。
+    和 boxes 出同一个格式, 下游不用改。
+    存在的理由是现行 PCA 那条有两个几何上无解的毛病: 朝向只有轴没有正反, 尺寸只量得到
+    朝相机那一面所以系统性偏小。这条是学出来的先验, 理论上两个都能补 —— 待验证。"""
+    sh(envcmd(PY["wilddet"], f"{SCRIPTS}/boxes_from_wilddet.py",
+              dict(R1=c.R1, FR=c.FR, WD3=WD3REPO, WD_FRAMES=c.cfg["WD_FRAMES"],
+                   WD_MINPIX=c.cfg["WD_MINPIX"], WD_DEPTH=c.cfg["WD_DEPTH"])),
+       f"{c.LOG}/06_boxes_wilddet.log", dry)
+
+def s_compare(c, dry):
+    """PCA 出框 vs WildDet3D 出框 的对照表。要 boxes 和 boxes_wd 都跑过。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/compare_boxes.py", dict(R1=c.R1)),
+       f"{c.LOG}/06_compare.log", dry)
+
+def s_assemble_wd(c, dry):
+    """用 WildDet3D 的盒子摆一遍, 和 PCA 版并存 -> 17_scene_wd.glb。
+    除盒子来源外和 assemble 走完全同一套代码, 这样两版的差异只可能来自出框方式本身。"""
+    ex = c.cfg["EXCLUDE"]
+    if c.cfg["BUILDING_WORDS"]: ex += "," + c.cfg["BUILDING_WORDS"]
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/assemble_scene.py",
+              dict(R1=c.R1, TAG=c.tag, GEN_OUT=f"{GEN}/outputs", SOLO_KEEP=c.cfg.get("SOLO_KEEP",""), EXCLUDE=ex, PER_INSTANCE=c.cfg["PER_INSTANCE"],
+                   BOXES=f"{c.R1}/06_all_boxes_wilddet.json", SCENE_OUT="17_scene_wd.glb")),
+       f"{c.LOG}/17_assemble_wd.log", dry)
+
+def s_phys_wd(c, dry):
+    """WildDet3D 版的落地 + 推开穿模。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/scene_phys.py",
+              dict(R1=c.R1, SCENE_IN="17_scene_wd.glb", PHY_OUT="17_scene_wd_phy.glb",
+                   SNAP=c.cfg["SNAP"], ITERS=c.cfg["ITERS"], MARGIN=c.cfg["MARGIN"])),
+       f"{c.LOG}/17_phys_wd.log", dry)
+
+def s_render_wd(c, dry):
+    """WildDet3D 版的渲染回图, 和 08_render_back_phy.jpg 并排看。
+    ★ 注意渲染回图看不出绝对尺度错误: 相机/地面/物体在同一个缩小了的世界里互相自洽,
+    carpark 的车只有 1.12m(真值 4.6) 渲出来照样正常。尺度错只有导进引擎或跟别的资产
+    混用才暴露 —— 别拿"渲染对得上"当尺度没问题的证据。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/render_back.py",
+              dict(R1=c.R1, FR=c.FR, SCENE="17_scene_wd_phy.glb",
+                   RBOUT="18_render_back_wd_phy.jpg", FRAMES=c.cfg["RB_FRAMES"])),
+       f"{c.LOG}/18_render_wd.log", dry)
+
+def s_building_scene(c, dry):
+    """把建筑类单独摆成一个 glb (beach 要"物体一个、建筑一个"), 并跑物理修正。
+    做法是复用已验证的 assemble_scene + scene_phys, 只把 EXCLUDE 反过来 —— 除建筑外全排除。
+    比 assemble_buildings.py 那条可靠: 那条按实心盒子摆, 已知盒心会落到马路中间。"""
+    if _bmode(c) != "building+scene":
+        print(f"    [建筑模式] {_bmode(c)} 不需要单独的 building glb, 跳过"); return
+    # 和 assemble 读同一份盒子 —— 只靠召回捡回来的建筑, 用 base 那份会漏掉
+    _bx = _boxes_arg(c).get("BOXES", f"{c.R1}/06_all_boxes.json")
+    allw = set(json.load(open(_bx)))
+    want = _bwords(c) & allw          # 跟组后的建筑词, 只留盒子里真有的
+    # ★ BUILDING_WORDS 指向一个已经不存在的词时, 这一步会两头都错而且一声不吭:
+    #   ex 变成"全部词" -> building glb 是空的; 同时 s_assemble 那句 ex += BUILDING_WORDS
+    #   变成 no-op -> 那几栋楼留在主场景里。跨词去重把词换了代表(storefront -> restaurant)
+    #   就会触发, 所以先去 03_dedup_words.json 里跟一下代表词, 跟不上就报错停下。
+    dw = f"{c.R1}/03_dedup_words.json"
+    if os.path.exists(dw):
+        d = json.load(open(dw)); moved = {}
+        for g in d.get("组", []):
+            rep = g.get("代表词") or g.get("胜出")
+            for m in g.get("实例", g.get("词", [])):
+                w0 = m.rsplit("#", 1)[0] if "#" in str(m) else str(m)
+                if w0 != rep: moved[w0] = rep
+        for w in sorted(want - allw):
+            if w in moved and moved[w] in allw:
+                print(f"    [跟随去重] BUILDING_WORDS 里的 {w!r} 已并进 {moved[w]!r}, 自动改用后者")
+                want.discard(w); want.add(moved[w])
+    miss = sorted(want - allw)
+    if miss:
+        raise SystemExit(f"[失败] BUILDING_WORDS 里这些词在 06_all_boxes.json 里不存在: {miss}\n"
+                         f"       硬停在这里, 因为放过去会两头错且不报错: building glb 会是空的,"
+                         f" 同时这些楼会留在主场景里。\n"
+                         f"       现有的词: {sorted(allw)}")
+    ex = ",".join(sorted(allw - want))
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/assemble_scene.py",
+              dict(R1=c.R1, TAG=c.tag, GEN_OUT=f"{GEN}/outputs", SOLO_KEEP=c.cfg.get("SOLO_KEEP",""), EXCLUDE=ex, PER_INSTANCE=c.cfg["PER_INSTANCE"],
+                   SCENE_OUT="20_buildings.glb",
+                   **_boxes_arg(c))),
+       f"{c.LOG}/20_building.log", dry)
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/scene_phys.py",
+              dict(R1=c.R1, SCENE_IN="20_buildings.glb", PHY_OUT="20_buildings_phy.glb",
+                   SNAP=c.cfg["SNAP"], ITERS=c.cfg["ITERS"], MARGIN=c.cfg["MARGIN"])),
+       f"{c.LOG}/20_building.log", dry)
+    # building+scene 模式要"各自渲染回图" —— 楼这一份在这里出, 物体那份在 s_render 出。
+    # 用同一批帧 (RB_FRAMES), 这样两张图能逐帧对着看。
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/render_back.py",
+              dict(R1=c.R1, FR=c.FR, SCENE="20_buildings_phy.glb",
+                   RBOUT="20_render_back_buildings.jpg", FRAMES=c.cfg["RB_FRAMES"])),
+       f"{c.LOG}/20_building.log", dry)
+
+# ---------- 召回支路: WildDet3D 和 SAM3 并行, 捡回 SAM3 漏掉的 ----------
+# 为什么要有这条: geometric 那条(boxes_wd)吃的是 SAM3 的框, SAM3 漏掉的它看都看不到,
+# 而当初看中 WildDet3D 的理由之一正是召回。这条让它直接看原图, 各找各的, 最后合并。
+#     帧 -> Qwen 列词 -> SAM3 跟踪       -> mask + track ID  ┐
+#                     -> WildDet3D 按词检测(原图)  -> 3D 框  ┤-> 合并
+#     两边都有 -> 用 SAM3 的 mask; 只有框没 mask -> 框喂回 SAM3 补抠 -> 捡回漏检
+def s_detect(c, dry):
+    """召回1: WildDet3D 文本模式全图检测, 逐帧各检各的(它没有 track ID)。"""
+    sh(envcmd(PY["wilddet"], f"{SCRIPTS}/detect_wilddet.py",
+              dict(R1=c.R1, FR=c.FR, WD3=WD3REPO, DET_STRIDE=c.cfg["DET_STRIDE"],
+                   DET_SCORE=c.cfg["DET_SCORE"])), f"{c.LOG}/12_detect.log", dry)
+
+def s_recall(c, dry):
+    """召回2: 逐帧检测按三维位置聚成实例(场景静止, 同一物体各帧世界坐标应重合),
+    跨词去重, 再和 SAM3 已有实例比对, 挑出 SAM3 漏掉的。"""
+    # ★ FR 必须传: 二维那条要读原帧的尺寸。
+    # MATCH_2D=1 是"和 SAM3 比对时用二维框 IoU, 不用三维距离"。三维那版有个必然的毛病 ——
+    # 拿 WildDet3D 的三维位置去判"是不是同一个物体", 而它的三维位置本身就不准, 判出来的
+    # "新物体"多半只是同一个东西被放歪了。timesquare 48 个"漏检"逐个画到照片上一看,
+    # 没有一个落在空白处; 同一辆卡车被当成三个新物体。改成二维后 48 -> 11, carpark 46 -> 4。
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/merge_recall.py",
+              dict(R1=c.R1, FR=c.FR, MIN_VIEWS=c.cfg["MIN_VIEWS"], DIST_F=c.cfg["DIST_F"],
+                   MATCH_F=c.cfg["MATCH_F"], MATCH_2D=c.cfg["MATCH_2D"],
+                   IOU_SELF=c.cfg["IOU_SELF"], IOU_SAM=c.cfg["IOU_SAM"],
+                   SELF_3D_F=c.cfg["SELF_3D_F"])), f"{c.LOG}/13_recall.log", dry)
+
+def s_recall_mask(c, dry):
+    """召回3: 漏检的只有框没 mask, 把框喂回 SAM3 补抠一张, 好让 SAM3D 能生成。
+    ★ 框必须是"左上xywh 归一化", 且要在返回的一组候选里按 IoU 挑, 见脚本文件头。"""
+    sh(envcmd(PY["sam3"], f"{SCRIPTS}/mask_recall.py",
+              dict(R1=c.R1, FR=c.FR, TAG=c.tag, REC_MIN_PCT=c.cfg["REC_MIN_PCT"],
+                   REC_MIN_IOU=c.cfg["REC_MIN_IOU"],
+                   EXCLUDE=_gen_excl(c))), f"{c.LOG}/14_recall_mask.log", dry)
+
+def s_recall_merge(c, dry):
+    """召回5: 把召回实例的盒子并进主盒子文件 -> 06_all_boxes_merged.json。
+    之后 assemble 传 BOXES 指向它, 召回的东西才会进场景。原文件不动, 随时能切回。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/merge_boxes_recall.py",
+              dict(R1=c.R1, TAG=c.tag, GEN_OUT=f"{GEN}/outputs")),
+       f"{c.LOG}/15_merge_boxes.log", dry)
+
+def s_recall_gen(c, dry):
+    """召回4: 给补抠出来的漏检实例生成 mesh。清单在 logs/recall_jobs.txt。"""
+    jobs = f"{c.LOG}/recall_jobs.txt"
+    names = open(jobs).read().split() if os.path.exists(jobs) else []
+    _gen(c, [f"{GEN}/my_images/{n}" for n in names], f"{c.LOG}/14_recall_gen.log", dry)
+
+# ---------- 楼: 支线, 摆放是坏的 ----------
+def s_buildings(c, dry):
+    """★ 已知有问题, 不要当成能用的结果。
+    生成没问题(SAM3D 出的楼体很好), 坏在摆放:
+      1. 楼是斜着看的一面墙, 反投影出来是顺着视线方向的一片薄片, 按"实心盒子"去套
+         盒心就落到马路正中间。16 号楼因此把相机整个包住, 180 帧全在楼里面。
+         (盒子进深 43m/49m/40m —— 一面墙不可能有 40 米厚, 这数字本身就是证据)
+      2. 楼顶超出画面, 量到的高度系统性偏小。
+      3. 一大半楼在 100~240m 外, 相机总共只走了 10.4m, 那个距离根本三角化不出来。
+    正确做法是拟合平面而不是盒子, 落脚点从楼底边往地面打射线; 远处的直接不要。"""
+    z = f"{c.R1}/03_masks/building.npz"
+    if not os.path.exists(z) and not dry:
+        print("    没有 building.npz (词表里没有 building), 跳过"); return
+    code = f'''
+import os,json,numpy as np,cv2
+from pycocotools import mask as mask_util
+z=np.load({z!r},allow_pickle=True); meta=z["meta"]
+live={{}}
+for o,f,a,e in meta:
+    if a>0: live.setdefault(int(o),[]).append((int(a),int(f)))
+best={{}}
+for o,rows in live.items():
+    rows.sort(reverse=True); best[o]=rows[0]
+open({c.LOG+"/building_jobs.txt"!r},"w").write("\\n".join(f"{c.tag}_building_{{o}}" for o in sorted(best)))
+print(f"[done] {{len(best)}} 栋待生成")
+'''
+    sh([PY["sam3d"], "-c", code], f"{c.LOG}/08_bld_pick.log", dry)
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/assemble_buildings.py",
+              dict(R1=c.R1, TAG=c.tag, CONF=c.cfg["BLD_CONF"],
+                   GEN_OUT=f"{GEN}/outputs")), f"{c.LOG}/08_bld.log", dry)
+
+def s_merge(c, dry):
+    """把物体场景和楼合成一个 glb, 顺带报 AABB 穿模, 再出俯视图和渲染回图。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/merge_glb.py",
+              dict(R1=c.R1, SRC="07_scene_phy.glb,10_buildings.glb", DST="11_scene_full.glb")),
+       f"{c.LOG}/11_merge.log", dry)
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/render_back.py",
+              dict(R1=c.R1, FR=c.FR, SCENE="11_scene_full.glb", RBOUT="11_render_full.jpg",
+                   TILE="520", FRAMES=c.cfg["RB_FRAMES"])), f"{c.LOG}/11_merge.log", dry)
+    sh(envcmd(PY["sam3d"], f"{TOOLS}/topview.py", dict(R1=c.R1, FR=c.FR)),
+       f"{c.LOG}/11_merge.log", dry)
+
+
+STEPS = [
+    ("frames",   "-",         "抽帧(补零成 0000.jpg)",           s_frames),
+    ("vlm",      "trellis2",  "Qwen3-VL 列词表",                 s_vlm),
+    ("da3",      "spatiallm", "DA3 米制深度 + 相机位姿",          s_da3),
+    ("up",       "sam3d",     "定出真实的\"天\"(地面法向)",         s_up),
+    ("track",    "sam3",      "SAM3 视频跟踪, 落盘",              s_track),
+    ("dedup",    "sam3d",     "跨词去重(二维 mask), 判掉同义词",    s_dedup),
+    ("relabel",  "sam3d",     "挪类别(闸口说这几个是别的东西)",   s_relabel),
+    ("pick",     "sam3d",     "每类挑生成样本",                   s_pick),
+    ("verify",   "trellis2",  "VLM 验证抠图内容",                 s_verify),
+    ("override", "sam3d",     "人工指定生成样本(按场景配)",       s_override),
+    ("gen",      "sam3d",     "SAM3D 每类生成一个 mesh",          s_gen),
+    ("ratio",    "sam3d",     "量 mesh 长宽高比例",               s_ratio),
+    ("meshes",   "sam3d",     "mesh 一览图",                      s_meshes),
+    ("boxes",    "sam3d",     "反投影量盒子 + 跨词去重",           s_boxes),
+    ("vlm_sizes","trellis2",  "问 VLM 要每个词的真实高度(尺子)",   s_vlm_sizes),
+    ("scale",    "sam3d",     "标定全局尺度 -> 真米 + 重量盒子",   s_scale),
+    ("solo",     "sam3d",     "car 逐实例生成",                   s_solo),
+    ("boxes_wd", "wilddet",   "量盒子(WildDet3D)",                s_boxes_wd),
+    ("compare",  "sam3d",     "两种出框方式对照表",               s_compare),
+    # ★ 2026-09-09: 召回五步整体挪到 assemble 之前。
+    #   原来 assemble 排在 recall_merge 之前, 而且依赖里没有它 —— 五个召回步(三个吃满
+    #   显存)照跑, 但 07_scene.glb 早就出好了, 召回捡回来的物体一个也进不去, 而且不报错。
+    #   召回没法再往前挪(detect 吃深度 npy, 必须在 scale 之后), 但可以挪到组装之前。
+    ("detect",   "wilddet",   "召回1: 全图按词检测",              s_detect),
+    ("recall",   "sam3d",     "召回2: 聚类 + 和SAM3合并",         s_recall),
+    ("recall_mask","sam3",    "召回3: 框喂回SAM3补抠mask",        s_recall_mask),
+    ("recall_gen","sam3d",    "召回4: 漏检实例生成mesh",          s_recall_gen),
+    ("recall_merge","sam3d",  "召回5: 盒子并进主文件",            s_recall_merge),
+    ("assemble", "sam3d",     "摆回街上 + 地面 -> 07_scene.glb",  s_assemble),
+    ("phys",     "sam3d",     "落地 + 推开穿模",                  s_phys),
+    ("render",   "sam3d",     "渲染回图比对",                     s_render),
+    ("building_scene","sam3d", "楼单独出 glb + 物理 + 渲染回图",    s_building_scene),
+    ("assemble_wd","sam3d",   "WildDet3D版组装 -> 17_scene_wd.glb", s_assemble_wd),
+    ("phys_wd",  "sam3d",     "WildDet3D版物理修正",              s_phys_wd),
+    ("render_wd","sam3d",     "WildDet3D版渲染回图",              s_render_wd),
+    ("buildings","sam3d",     "楼(★摆放是坏的)",                  s_buildings),
+    ("merge",    "sam3d",     "物体+楼合并 + 俯视图",             s_merge),
+]
+# 主链一路跑到 render_wd: 两个版本的场景 + 两份渲染回图 + 对照表 + 召回, 一条命令出全。
+# 召回本来挂在支线上, 跑新场景默认根本不跑 —— 但它在 timesquare 上已经验证过(多找回
+# 48 个物体), 不该再当实验。楼那两步(buildings/merge)仍是支线, 那条摆放是坏的。
+DEFAULT_END = "render_wd"
+
+
+# 每一步应当产出什么 (用来做 --check; 只列关键产物, 不求全)
+ARTIFACTS = {
+    "frames":   ["@FR/0000.jpg"],          # @FR = 帧目录, 不在 R1 底下
+    "vlm":      ["01_vlm_vocab.json"],
+    "da3":      ["02_da3/cameras.json", "02_da3/depth"],
+    "up":       ["02_da3/world_up.json"],
+    "track":    ["03_masks"],
+    "dedup":    ["03_dedup_words.json"],
+    "pick":     ["04_picks/picks.json"],
+    "verify":   ["04_picks/vlm_verify.json"],
+    "gen":      [],                       # 产物在 sam-3d-objects/outputs/, 单独查
+    "ratio":    ["05_mesh_ratio.json"],
+    "meshes":   ["05_meshes.jpg"],
+    "boxes":    ["06_all_boxes.json"],
+    "vlm_sizes":["01_vlm_sizes.json"],
+    "scale":    ["02_da3/world_scale.json"],
+    "solo":     ["logs/solo_jobs.txt"],
+    "override": [],                       # 只改 my_images/ 里的抠图, R1 底下没有产物
+    "relabel": ["03_relabel_done.json"],
+    "assemble": ["07_scene.glb"],
+    "phys":     ["07_scene_phy.glb"],
+    "render":   ["08_render_back.jpg", "08_render_back_phy.jpg"],
+    "boxes_wd": ["06_all_boxes_wilddet.json"],
+    "detect":   ["12_wd_detections.json"],
+    "recall":   ["13_recall.json"],
+    "recall_mask": ["14_recall_ready.json"],
+    "recall_gen": [],
+    "recall_merge": ["06_all_boxes_merged.json"],
+    "compare":  [],
+    # ★ 这两步都会**按条件跳过**(没有建筑 mask, 或 BUILDING_MODE 不是 building+scene),
+    #   而跳过之后驱动照样盖完成戳。声明了产物的话 --check 就永远报"缺", 人会以为该重跑。
+    #   条件跳过的步骤只认完成戳, 不认产物。
+    "building_scene": [],
+    "assemble_wd": ["17_scene_wd.glb"],
+    "phys_wd":   ["17_scene_wd_phy.glb"],
+    "render_wd": ["18_render_back_wd_phy.jpg"],
+    "buildings":[],
+    "merge":    ["11_scene_full.glb", "11_topview.jpg"],
+}
+
+# 每一步真正依赖谁的产物。--check 靠它判断"过期", 而不是靠"比前面所有步骤旧"——
+# 那种偷懒判法只要有人乱序重跑一步就会级联误报一片。
+DEPS = {
+    "vlm": ["frames"],          "da3": ["frames"],        "track": ["frames"],
+    "up": ["da3"],   "dedup": ["track"],        "relabel": ["dedup"],   "pick": ["track", "dedup", "relabel"],
+    "verify": ["pick"],       "override": ["verify"],
+    "gen": ["override"],        "ratio": ["gen"],         "meshes": ["gen"],
+    "boxes": ["track", "ratio", "up", "dedup", "relabel"],   # relabel 会搬 03_masks/*.npz, 而量盒子读的就是它
+    "vlm_sizes": ["vlm"],       "scale": ["boxes", "vlm_sizes"],
+    "solo": ["scale"],          "assemble": ["scale", "solo", "verify", "recall_merge", "boxes"],
+    "phys": ["assemble"],       "render": ["phys"],
+    "boxes_wd": ["track", "da3", "up", "scale"],
+    "compare": ["boxes", "boxes_wd", "up"],  "building_scene": ["assemble"],
+    "assemble_wd": ["boxes_wd", "solo"], "phys_wd": ["assemble_wd"], "render_wd": ["phys_wd"],
+    # 召回不依赖盒子 —— 二维比对读的是 03_masks 的 mask。写成依赖 boxes 会把它
+    # 无谓地拖到 gen/ratio 之后, 而它本可以排在生成之前。
+    # detect 反投影用的是深度和相机, 尺度改了它就过期 —— 必须依赖 scale, 否则召回出来的
+    # 盒子还在旧坐标系里, 并进主文件会摆错位置(carpark 实测: 用旧相机投影差 2~8 px,
+    # 用新相机差 9~80 px, 差得不明显但确实是错的)。
+    "detect": ["da3", "vlm", "up", "scale"],   "recall": ["detect", "track"],
+    "recall_mask": ["recall"],  "recall_gen": ["recall_mask"],
+    "recall_merge": ["recall_gen", "up"],
+    # ★ 补 scale: assemble_buildings 读深度和相机平移, scale 就地改过它们
+    "buildings": ["track", "da3", "scale"],
+    "merge": ["phys", "buildings", "up"]  # topview.py 现在读 world_up.json,
+}
+
+def do_check(c):
+    """看一遍产物在不在、有没有过期。过期 = 比上一步的产物还旧, 说明上游重跑过而它没跟上。"""
+    print(f"场景 {c.scene}  轮次 {c.run}\n")
+    when = {}; bad = 0
+    for k, e, d, _ in STEPS:
+        if k == "gen":
+            g = [x for x in glob.glob(f"{GEN}/outputs/{c.tag}_*/*.glb")
+                 if not is_solo(os.path.basename(os.path.dirname(x)))]
+            st = stamp_path(c, k)
+            if g and os.path.exists(st): when[k] = os.path.getmtime(st)
+            # ★ 生成类的步骤也要判过期。原来这里直接 continue, 于是"override 重跑过 ->
+            #   gen 该重出"这条链在 --check 里整段隐形(assemble 又不依赖 override, 接不上)。
+            _t = (os.path.getmtime(stamp_path(c, k))
+                  if os.path.exists(stamp_path(c, k)) else None)
+            if _t is not None: when[k] = _t
+            _old = [u for u in DEPS.get(k, []) if u in when and when[u] > (_t or 0) + 1]
+            if _old or not g: bad += 1
+            _n = f"  ← 比依赖的 {'/'.join(_old)} 旧, 该重跑" if _old else ""
+            print(f"  {k:10s} {'有' if g else '缺':2s}  {len(g)} 个类 mesh{_n}"); continue
+        paths = [p.replace("@FR", c.FR) if p.startswith("@FR") else os.path.join(c.R1, p)
+                 for p in ARTIFACTS.get(k, [])]
+        if not paths:
+            # 没有声明产物的步骤(override / compare / recall_gen / building_scene ...)
+            # ★ 也要判过期。原来这条分支只打印时间就 continue —— 于是这几步永远不会
+            #   被报成"该重跑", 而 override 恰好是人工闸的落地点, 它过期是常态。
+            st = stamp_path(c, k)
+            if os.path.exists(st):
+                when[k] = os.path.getmtime(st)
+                _old = [u for u in DEPS.get(k, []) if u in when and when[u] > when[k] + 1]
+                if _old: bad += 1
+                print(f"  {k:10s} 跑过 {time.strftime('%m-%d %H:%M', time.localtime(when[k]))}"
+                      + (f"  ← 比依赖的 {'/'.join(_old)} 旧, 该重跑" if _old else ""))
+            else:
+                print(f"  {k:10s} --  (没有产物, 也没跑过)")
+            continue
+        miss = [p for p in paths if not os.path.exists(p)]
+        if miss:
+            print(f"  {k:10s} 缺  {', '.join(os.path.basename(m) for m in miss)}"); bad += 1; continue
+        st = stamp_path(c, k)
+        if not os.path.exists(st):          # 产物在, 但不是这个驱动跑出来的
+            # ★ 这也要计进 bad。原来只换个措辞就 continue, 最后一行照样打"全部就绪" ——
+            #   而"产物在、戳不在"恰好是**产物已经过期**的典型形状: 比如 scale 就地改完深度、
+            #   撤掉 .stamp_boxes 之后重量盒子失败, 盘上那份盒子就是缩放前的旧坐标系。
+            print(f"  {k:10s} 有  (产物在, 无完成戳 —— 可能是上一轮留下的, 跑一次这步)"); bad += 1; continue
+        t = os.path.getmtime(st); when[k] = t
+        older = [u for u in DEPS.get(k, []) if u in when and when[u] > t + 1]
+        note = f"  ← 比依赖的 {'/'.join(older)} 旧, 该重跑" if older else ""
+        if older: bad += 1
+        print(f"  {k:10s} 有  {time.strftime('%m-%d %H:%M', time.localtime(t))}{note}")
+    print(f"\n{'全部就绪' if not bad else f'{bad} 处需要注意'}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scene", default="timesquare")
+    ap.add_argument("--run",   default="r1")
+    ap.add_argument("--from",  dest="a", default=None)
+    ap.add_argument("--to",    dest="b", default=None)
+    ap.add_argument("--only",  default=None, help="逗号分隔")
+    ap.add_argument("-n", "--dry-run", action="store_true")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--tag-only", action="store_true",
+                    help="配合 --dump-cfg: 只打 tag。驱动别自己抄 tag 表 —— 抄一份就会漂移")
+    ap.add_argument("--dump-cfg", action="store_true",
+                    help="把解析后的配置打成 JSON。给人工闸用 —— 闸要知道 SOLO/EXCLUDE\n                          才能把逐实例候选也摆出来, 而那些值只有这里算得出来。")
+    ap.add_argument("--check", action="store_true", help="不跑, 只看产物在不在/有没有过期")
+    g = ap.parse_args()
+
+    keys = [s[0] for s in STEPS]
+    if g.dump_cfg:
+        _c = Ctx(g.scene, g.run)
+        print(_c.tag if g.tag_only else json.dumps(_c.cfg, ensure_ascii=False))
+        return
+    if g.list:
+        print(f"步骤 (默认跑到 {DEFAULT_END} 为止; buildings/merge 不在任何分段里, 要显式 --only):\n")
+        for k, e, d, _ in STEPS:
+            print(f"  {k:10s} [{e:9s}] {d}")
+        return
+    for x in filter(None, [g.a, g.b] + (g.only.split(",") if g.only else [])):
+        if x not in keys: raise SystemExit(f"没有这个步骤: {x}\n可选: {', '.join(keys)}")
+
+    if g.only:
+        sel = [s for s in STEPS if s[0] in g.only.split(",")]
+    else:
+        i = keys.index(g.a) if g.a else 0
+        j = keys.index(g.b) if g.b else keys.index(DEFAULT_END)
+        sel = STEPS[i:j+1]
+
+    c = Ctx(g.scene, g.run)
+    if g.check: return do_check(c)
+    os.makedirs(c.LOG, exist_ok=True)
+    print(f"场景 {c.scene}  轮次 {c.run}")
+    print(f"帧   {c.FR}")
+    print(f"结果 {c.R1}")
+    print(f"步骤 {' -> '.join(s[0] for s in sel)}" + ("   [干跑]" if g.dry_run else "") + "\n")
+    GPU_STEPS = {"vlm","vlm_sizes","da3","track","verify","gen","solo","boxes_wd","detect",
+                 "recall_mask","recall_gen"}
+    for k, e, d, fn in sel:
+        t = time.time()
+        for lg in glob.glob(f"{c.LOG}/*.log"): pass
+        c._sep = f"\n{'='*70}\n== {k}  {time.strftime('%F %T')}\n{'='*70}\n"
+        print(f"== {k}  [{e}]  {d}", flush=True)
+        _o = globals()["sh"]
+        globals()["sh"] = lambda *a, **kw: _o(*a, **{**kw, "sep": kw.get("sep", c._sep)})
+        try:
+            if k in GPU_STEPS and not g.dry_run:
+                with GpuLock(): fn(c, g.dry_run)
+            else:
+                fn(c, g.dry_run)
+        finally: globals()["sh"] = _o
+        if not g.dry_run: open(stamp_path(c, k), "w").write(time.strftime("%F %T"))
+        print(f"   {time.time()-t:.1f}s\n", flush=True)
+    print("[全部完成]")
+
+if __name__ == "__main__":
+    main()

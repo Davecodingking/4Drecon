@@ -1,0 +1,324 @@
+# 室外重建流水线 · 六段六闸
+
+一条视频进去,一个摆好的三维场景出来。中间断六次,每断一次人看一眼。
+自动的部分自动跑,机器判不了的地方停下来等人。
+
+```
+drive.py --scene <场景> --run <轮次>          跑到下一道闸就停
+drive.py --scene <场景> --run <轮次> --go     人看过了, 继续
+drive.py --scene <场景> --run <轮次> --status 现在停在哪
+drive.py --scene <场景> --run <轮次> --reset  回到第一段(只重置进度, 不清完成戳)
+加 -n 干跑, 只打印要执行的命令
+```
+
+室内走同一份驱动加 `--indoor`,分五段(没有 WildDet3D 对照那一支),
+物体链用的是同一批 `data/outdoor/scripts/` 脚本。
+
+---
+
+## 一、全貌
+
+```mermaid
+flowchart TD
+  classDef auto fill:#fff,stroke:#c9d5d4,color:#0d1719
+  classDef gate fill:#dcebed,stroke:#0e6b78,color:#0e6b78,font-weight:bold
+  classDef human fill:#f9e6dc,stroke:#b04a1e,color:#b04a1e,font-weight:bold
+  classDef br   fill:#eeeaf6,stroke:#7a6aa8,color:#4a3f6b,stroke-dasharray:4 3
+  classDef stop fill:#f8e0e4,stroke:#9d2036,color:#9d2036
+
+  subgraph S1["第 1 段 · 地基"]
+    direction TB
+    frames["frames<br/>抽帧"] --> vlm["vlm<br/>列词表"] --> da3["da3<br/>深度 + 相机位姿"] --> up["up<br/>定出'天'朝哪"]
+  end
+  up --> G1{{"闸 1 · 看地基<br/>只看"}}
+
+  G1 -->|"--go"| track
+  subgraph S2["第 2 段 · 生成前"]
+    direction TB
+    track["track<br/>SAM3 按词跟踪"] --> dedup["dedup<br/>跨词去重"] --> relabel["relabel<br/>挪类别"] --> pick["pick<br/>挑生成样本"] --> verify["verify<br/>VLM 验图"] --> override["override<br/>换抠图"]
+  end
+  override --> G2{{"闸 2 · 审候选<br/>★ 要你填"}}
+
+  G2 -->|"--go"| gen
+  subgraph S3["第 3 段 · 尺度"]
+    direction TB
+    gen["gen<br/>每类生成 mesh"] --> ratio["ratio<br/>量 mesh 比例"] --> meshes["meshes<br/>mesh 一览图"] --> boxes["boxes<br/>反投影量盒子"] --> vlm_sizes["vlm_sizes<br/>问 VLM 要尺子"] --> scale["scale<br/>标定到真米"]
+  end
+  scale --> G3{{"闸 3 · 看尺度<br/>只看"}}
+  scale -. "一致率不达标<br/>退非零码" .-> STOP["就地停<br/>闸 3 根本出不来"]
+  scale -. "施加成功后<br/>当场重量盒子" .-> boxes
+
+  G3 -->|"--go"| solo
+  subgraph S4["第 4 段 · 召回"]
+    direction TB
+    solo["solo<br/>逐实例生成"] --> boxes_wd["boxes_wd<br/>WD 量盒子"] --> compare["compare<br/>两种出框对照"] --> detect["detect<br/>全图按词检测"] --> recall["recall<br/>聚类 + 合并"] --> recall_mask["recall_mask<br/>框喂回 SAM3 补抠"]
+  end
+  recall_mask --> G4{{"闸 4 · 审召回<br/>★ 要你填"}}
+
+  G4 -->|"--go"| recall_gen
+  subgraph S5["第 5 段 · 验收"]
+    direction TB
+    recall_gen["recall_gen<br/>漏检实例生成"] --> recall_merge["recall_merge<br/>盒子并进主文件"] --> assemble["assemble<br/>摆回街上 + 地面"] --> phys["phys<br/>落地 + 推开穿模"] --> render["render<br/>渲染回图"]
+  end
+  render --> G5{{"闸 5 · 看场景<br/>只看"}}
+
+  G5 -->|"--go"| building_scene
+  subgraph S6["第 6 段 · 收尾"]
+    direction TB
+    building_scene["building_scene<br/>楼单独出"] --> assemble_wd["assemble_wd<br/>WD 版组装"] --> phys_wd["phys_wd<br/>WD 版物理"] --> render_wd["render_wd<br/>WD 版回图"]
+  end
+  render_wd --> G6{{"闸 6 · 看成品<br/>只看"}}
+  G6 -->|"--go"| DONE(["全部跑完"])
+
+  G2 -. "① 决定变了 → 回跑" .-> relabel
+  G4 -. "① 决定变了 → 回跑" .-> relabel
+  G2 -. "改完不加 --go 再跑<br/>图重出, 状态不动" .-> G2
+  G4 -. "改完不加 --go 再跑<br/>图重出, 状态不动" .-> G4
+  boxes_wd -. "WD 盒子" .-> assemble_wd
+
+  class frames,vlm,da3,up,track,dedup,relabel,pick,verify,override auto
+  class gen,ratio,meshes,boxes,vlm_sizes,scale,solo,detect,recall,recall_mask auto
+  class recall_gen,recall_merge,assemble,phys,render,building_scene,render_wd auto
+  class boxes_wd,compare,assemble_wd,phys_wd br
+  class G1,G3,G5,G6 gate
+  class G2,G4 human
+  class STOP stop
+```
+
+---
+
+## 二、每一步在干什么
+
+`环境` 是这一步用哪个 conda env;`GPU` 标记的吃显存,驱动用文件锁串行。
+
+### 第 1 段 · 地基 —— 这三样错了后面全废,而且这一段最便宜
+
+| 步骤 | 环境 | GPU | 干什么 | 产物 |
+|---|---|:-:|---|---|
+| `frames` | — | | 把视频按固定间隔抽成图,文件名补零成 `0000.jpg` | `frames/` |
+| `vlm` | trellis2 | ● | Qwen3-VL 看几帧,列出画面里有哪些东西 | `01_vlm_vocab.json` |
+| `da3` | spatiallm | ● | 一次算出每帧的深度图和相机位姿(它自称米制,但常常不准) | `02_da3/` |
+| `up` | sam3d | | 从点云主平面拟合出"天"朝哪,后面所有高度都沿它量 | `02_da3/world_up.json` |
+
+### 第 2 段 · 生成前 —— 生成是最贵的一步,而"该不该生成"机器判不了
+
+| 步骤 | 环境 | GPU | 干什么 | 产物 |
+|---|---|:-:|---|---|
+| `track` | sam3 | ● | SAM3 按词在整段视频里跟踪,每个实例每帧一张 mask | `03_masks/*.npz` |
+| `dedup` | sam3d | | 不同的词圈到同一个东西就合并(shop / storefront / restaurant) | `03_dedup_words.json` |
+| `relabel` | sam3d | | 按你的决定把某几个实例从一个词搬到另一个词,mask 不动只换标签 | `03_masks/` |
+| `pick` | sam3d | | 每个词挑最完整的实例、最清楚的一帧,抠出来给生成用 | `04_picks/` |
+| `verify` | trellis2 | ● | 再让 VLM 看一眼抠图里到底是不是那个词,不是就换一张 | `04_picks/vlm_verify.json` |
+| `override` | sam3d | | 把你点名的"用这个实例的这一帧"覆盖掉自动挑的 | `my_images/` |
+
+### 第 3 段 · 尺度 —— 把 DA3 那层"它以为的米"校准成真米
+
+| 步骤 | 环境 | GPU | 干什么 | 产物 |
+|---|---|:-:|---|---|
+| `gen` | sam3d | ● | SAM3D 拿抠图生成 mesh,一个词一个(它会补全看不见的那半边) | `outputs/` |
+| `ratio` | sam3d | | 量每个 mesh 自己的长宽高比例,后面对齐尺寸要用 | `05_mesh_ratio.json` |
+| `meshes` | sam3d | | 把生成出来的 mesh 排成一张一览图 | `05_meshes.jpg` |
+| `boxes` | sam3d | | mask 沿深度反投影成点云,PCA 出每个实例的三维盒子 | `06_all_boxes.json` |
+| `vlm_sizes` | trellis2 | ● | 问 VLM 每个词现实里大概多高,拿来当尺子 | `01_vlm_sizes.json` |
+| `scale` | sam3d | | 尺子 ÷ 量到的高度 = 全局倍数 k,就地乘进深度和相机 | `02_da3/world_scale.json` |
+
+### 第 4 段 · 召回 —— SAM3 漏掉的东西,换一条路捡回来
+
+| 步骤 | 环境 | GPU | 干什么 | 产物 |
+|---|---|:-:|---|---|
+| `solo` | sam3d | ● | 不复用的词,每个实例各裁一张图单独生成 mesh | `outputs/` |
+| `boxes_wd` | wilddet | ● | 换 WildDet3D 再量一遍盒子,和上面那套对照 | `06_all_boxes_wilddet.json` |
+| `compare` | sam3d | | 两种出框方式并排比,出一张对照图 | `92_compare_pca_vs_wd.jpg` |
+| `detect` | wilddet | ● | WildDet3D 在整幅画面上按词找一遍,捞 SAM3 漏掉的 | `12_wd_detections.json` |
+| `recall` | sam3d | | 检测框做三维聚类,和 SAM3 已有的实例合并去重 | `13_recall.json` |
+| `recall_mask` | sam3 | ● | 把漏检的框当提示喂回 SAM3,补出 mask | `14_recall_ready.json` |
+
+### 第 5 段 · 验收 —— 补生成 → 合并 → 摆回街上 → 落地 → 渲染回图
+
+| 步骤 | 环境 | GPU | 干什么 | 产物 |
+|---|---|:-:|---|---|
+| `recall_gen` | sam3d | ● | 给通过闸 4 的漏检实例生成 mesh | `outputs/` |
+| `recall_merge` | sam3d | | 召回的盒子并进主盒子文件 | `06_all_boxes_merged.json` |
+| `assemble` | sam3d | | 按盒子把 mesh 缩放、转向、摆回街上,再铺一块地面 | `07_scene.glb` |
+| `phys` | sam3d | | 让物体落到地面上,把互相穿模的推开 | `07_scene_phy.glb` |
+| `render` | sam3d | | 用原相机把场景渲染回去,和实拍并排比 | `08_render_back_phy.jpg` |
+
+### 第 6 段 · 收尾 —— 楼单独出一份,再出 WildDet3D 版的整个场景做对照
+
+| 步骤 | 环境 | GPU | 干什么 | 产物 |
+|---|---|:-:|---|---|
+| `building_scene` | sam3d | | 楼单独出 glb(**只有 `BUILDING_MODE=building+scene` 才真跑**,默认是 `scene`,跳过) | `20_buildings_phy.glb` |
+| `assemble_wd` | sam3d | | 用 WildDet3D 的盒子,把整个场景再摆一遍 | `17_scene_wd.glb` |
+| `phys_wd` | sam3d | | WD 版的落地和推开 | `17_scene_wd_phy.glb` |
+| `render_wd` | sam3d | | WD 版渲染回图,和主线那版并排比 | `18_render_back_wd_phy.jpg` |
+
+---
+
+## 三、六道闸 —— 你到底要做什么
+
+图和文件路径都在 `{R1}` 底下,`R1 = data/outdoor/result/<场景>/<轮次>`。
+
+### 闸 1 · 看地基(只看)
+
+1. 看地面拟合得对不对 —— `02_ground_check.jpg`
+2. 看相机轨迹够不够长 —— `02_da3_topview.png`
+3. 轨迹太短或天偏太多 → 这条素材重建不了,考虑重拍
+4. 没问题就 `--go`
+
+> 视差够不够,看的是**相机挪的距离 ÷ 物体距离**,不是帧数。
+> timesquare 走了 19.7 m 效果最好;carpark 1.5 m、beach 0.9 m,朝向和尺度都不可靠。
+
+### 闸 2 · 审候选(★ 要你填)
+
+1. 看**联络图** —— `05_review_sheet.jpg`,每格一个待生成候选,左上角是编号
+2. 看**复用表** —— `05_reuse_table.jpg`,同一个词该不该共用一个 mesh
+3. 在 `05_review.json` 里逐条填 `决定`,还能填 `复用组` / `改类别` / `改用`
+4. 再跑一次**不加** `--go` → 两张图按新决定重出,回到第 1 步。不限次
+5. 满意了才 `--go`
+
+### 闸 3 · 看尺度(只看)
+
+1. 看倍数 k 和一致率,以及是哪几个词带偏了 —— `02_da3/world_scale.json`
+   (没施加时报告在 `world_scale_estimate.json`,`world_scale.json` 不写 —— 那个文件在,才代表世界真校准过了)
+2. 扫一眼生成出来的 mesh 像不像那个东西 —— `05_meshes.jpg`
+3. 一致率低 → 改 `01_vlm_sizes.json` 里那个词的参照高度,重跑 `scale`
+4. 或者 `SCALE_APPLY=0` 重跑,明确接受这个场景不校准
+5. `--go`
+
+### 闸 4 · 审召回(★ 要你填)
+
+**一次出四张图,`recall check` 只是第一张。**
+
+1. 看 **recall check** —— `95_recall_check_2d.jpg`,补抠回来的每个长什么样、和谁重叠
+2. 在 `05_review_afterrecall.json` 里,不要的填 `drop`,其余默认 `keep`
+3. 再跑一次**不加** `--go` → 重出召回后的两张图,回到第 1 步。不限次
+4. 看**召回后的联络图** —— `05_review_sheet_afterrecall.jpg`,召回的排在最后、黄框
+5. 看**召回后的复用表** —— `05_reuse_table_afterrecall.jpg`,并进来之后类内还整不整齐
+6. 顺带看两种出框方式差在哪 —— `92_compare_pca_vs_wd.jpg`
+7. 满意了才 `--go`
+
+### 闸 5 · 看场景(只看)
+
+1. 三栏对比:左实拍 / 中重建 / 右叠加 —— `08_render_back_phy.jpg`
+2. 看被跳过的是哪些、按什么原因分的 —— `logs/07_assemble.log`
+3. `--go`
+
+### 闸 6 · 看成品(只看)
+
+1. 主线这版渲染回图 —— `08_render_back_phy.jpg`
+2. WD 版渲染回图,两条出框路线并排比 —— `18_render_back_wd_phy.jpg`
+3. 再敲一次 `--go` 才会打印"全部跑完"
+
+---
+
+## 四、闸口能填什么
+
+写在 `05_review.json`(召回前)或 `05_review_afterrecall.json`(召回后)的每一条候选上。
+
+| 字段 | 值 | 意思 | 落到哪 |
+|---|---|---|---|
+| `决定` | `keep` | 照常生成(默认) | — |
+| | `drop` | 这一条不要 | `不生成` → 挡生成,也挡组装 |
+| | `drop-word` | 整个词作废 | `排除词` → `EXCLUDE` |
+| | `solo` | 这个词逐实例生成 | `逐实例词` → `SOLO` |
+| | `shared` | 这个词共用一个 mesh | `共用词` → `SOLO_KEEP` |
+| `复用组` | 数字 | 词内分成几组,每组共用一个 | 展开成 `改类别`(挪进 `词~N`)+ `共用词` |
+| `改类别` | 目标词 | 这个实例其实是别的东西,mask 不动只换标签 | `改类别` → `relabel_words.py` |
+| `改用` | `[实例号, 帧号]` | 换一张抠图 | `指定样本` → `override` / `gen_per_instance` |
+
+`--apply` 把这些汇总成 `05_review_applied.json`,下游统一读它。**别再手敲环境变量。**
+
+几条约束:
+
+- **召回候选不支持 `改用`** —— 它的抠图是按检测框现抠的,没有别的帧可换。填了会当场硬停。
+- **同一行不能既填 `改类别` 又填 `改用`** —— 搬家会重编实例号,换抠图会套到别的物体上。分两次做。
+- **同一行不能既填 `改类别` 又填 `复用组`** —— 两个都是挪类别,展开时后者会静默压掉前者。
+
+---
+
+## 五、两个回路
+
+### 1. 闸口自循环 —— 改完再看,不限次
+
+改决策文件 → 再跑一次**不加** `--go` → 图按新决定重出 → 再看。
+`.drive_state.json` 不动,不消耗任何 GPU。
+
+一个细节:格子的**标注和边框颜色**立刻反映新决定,但"枚举出哪些候选"读的是**上一次 `--apply` 落地的**
+`05_review_applied.json`。所以刚填的 `shared` / `drop-word` 要等 `--go` 之后才会改变候选清单本身。
+
+### 2. 落地回跑 —— `--go` 时把决定推回上游
+
+`--go` 之后 `apply_decisions` 做三件事:
+
+1. 跑 `review_gate.py --apply`,写出 `05_review_applied.json`
+2. 比对落地前后**哪几类决定变了**(`排除词` / `逐实例词` / `共用词` / `改类别` / `指定样本`)
+3. 变了就重跑回跑清单里**已经跑过的**那些步骤,然后才进下一段
+
+回跑清单:
+
+```
+relabel → pick → verify → override → gen → ratio → boxes → solo
+```
+
+**回跑到哪一步,由"这步跑过没有"决定,不由哪道闸决定。**
+全新第一遍走到闸 2 时,后四步还没跑过,只回跑到 `override`;
+之后就一直是全段回跑 —— `--reset` 只重置进度,**不清完成戳**。
+
+**只改 `drop` 不触发回跑** —— 生成那步当场读决策文件,没有时序依赖。
+
+为什么必须一直回跑到 `gen` / `boxes`:填了"共用"的词,`pick` 不重挑就没有类 mesh、
+又被 `SOLO_KEEP` 挡住不逐实例,组装时两头都找不到,**整个词从场景里消失且不报错**;
+填了"改类别"的实例被 `relabel` 搬进 `词~N.npz`,`boxes` 不重跑的话盒子文件里还是老词,一样全没。
+
+回跑不贵:抠图按**内容**判变没变(`imgio.imwrite_stable`),内容没变时间戳就不动,
+`gen` / `solo` 会照常"已有且不过期,跳过"。
+
+---
+
+## 六、失败和分支
+
+- **任何一步退非零码就地停**,既不进闸也不前进。下次不带 `--go` 会**从这一段第一步整段重来**,
+  靠各步"已有且不过期就跳过"兜住成本。
+- **`scale` 一致率不达标** → 退非零码。`scale` 是第 3 段最后一步,所以那种情况下**闸 3 根本出不来**,
+  报告在 `world_scale_estimate.json`。
+- **`scale` 施加成功后会在同一步里重量一遍盒子**(深度变了,老盒子作废)。
+- **WildDet3D 是并行对照路线,不是支线** —— 它在默认链上,每次全跑都会跑,而且吃显存。
+  `boxes_wd` 有两个下游:同段的 `compare`,和第 6 段那整套 WD 版场景。
+- **`buildings` / `merge` 才是真支线** —— 不属于任何一段,`drive.py` 永远跑不到,
+  只能手工 `--only` 触发。楼的摆放是坏的,这是有意保留的。
+
+---
+
+## 七、已知的坑
+
+- **`改类别` 是单向的。** 实例在 mask 文件之间物理搬家,改错了撤不回来,
+  只能手工从 `03_masks_prerelabel/` 拷回,并清掉 `03_relabel_done.json`。
+- **闸 4 的回跑只扫到 `solo`,不刷新第 4 段自己的产物。** 在闸 4 填"改类别"之后,
+  `13_recall.json` / `14_recall_ready.json` / `06_all_boxes_wilddet.json` 里仍是搬家前的标签,
+  而且不会重跑、`--check` 也不报(它们不依赖 `relabel`)。
+- **删掉 `05_review_afterrecall.json` 回到召回前**,但删完要**先不加 `--go` 跑一次**把它重建出来,
+  否则下一次 `--go` 会硬停在 `--apply`。
+- **第一遍的 `relabel` 是空转**,那时还没有任何决定;而且它只被 `改类别` / `复用组` 唤醒,
+  只填 `drop-word` / `solo` / `shared` 的那趟它照样空转。
+- **180° 朝向没解。** 长轴对齐只解得了 90°,正反不知道。
+
+---
+
+## 八、这份文档的事实来源
+
+改流水线之后要同步改这里。每一节的权威位置:
+
+| 这份文档的哪一节 | 去哪核 |
+|---|---|
+| 分段、每段步骤、哪道闸 | `.claude/skills/run-recon-pipeline/drive.py` 的 `SEGMENTS` |
+| 每道闸看什么图 | `drive.py` 的 `check_ground` / `check_picks` / `check_scale` / `check_recall` / `check_scene` / `check_final` —— 每个函数第二个返回值就是"该看的图" |
+| 回跑清单 | `drive.py` 的 `apply_decisions`,`LOOP` 和 `todo` 那两行 |
+| 步骤名、环境、说明 | `pipeline/outdoor_pipeline.py` 的 `STEPS`;跑 `--list` 直接打印 |
+| 产物、依赖 | 同文件的 `ARTIFACTS` / `DEPS` |
+| 哪些吃显存 | 同文件的 `GPU_STEPS` |
+| 闸口能填什么 | `tools/review_gate.py` 的 `--apply` 那一段;字段含义见 `data/outdoor/scripts/review_decisions.py` 的模块注释 |
+| 尺度的退出码和文件 | `data/outdoor/scripts/world_scale.py` |
+
+**加一个新步骤要改五处**:`STEPS` / `ARTIFACTS` / `DEPS` / `GPU_STEPS` / `drive.py` 的 `SEGMENTS`。
+漏了第五处不会报错,只会静默不跑 —— 跨词去重就这么漏过一次。
+现在 `drive.py` 启动时的 `check_segments()` 会核这一条。

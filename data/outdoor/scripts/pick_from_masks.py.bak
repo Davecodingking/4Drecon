@@ -1,0 +1,58 @@
+#!/usr/bin/env python
+"""每类挑一个最好的实例和它最完整的一帧, 存 frame.png + mask.png 给 SAM3D.
+只从 03_masks/*.npz 读, 不碰 GPU, 所以调打分可以秒级重跑.
+
+打分 = mask面积 x (1-贴边惩罚) x min(帧数/10, 1)
+首轮的 20 帧硬门槛去掉了 —— 打分已经在挑最大最完整的, 硬门槛只会误杀
+(桌子 12 个实例全被它砍掉, 一个 mesh 都没生成)。只留 2 帧的下限防单帧误检。
+"""
+import os, json, numpy as np, cv2
+from pycocotools import mask as mask_util
+TAG=os.environ.get("TAG","ts_r1")
+
+ROOT = os.environ.get("R1","/home/jincheng/sam3d/data/outdoor/result/timesquare/r1")
+FR   = os.environ.get("FR","/home/jincheng/sam3d/data/outdoor/dataset/timesquare/frames")
+MK   = f"{ROOT}/03_masks"; OUT=f"{ROOT}/04_picks"; os.makedirs(OUT, exist_ok=True)
+MIN_FRAMES  = int(os.environ.get("MIN_FRAMES","2"))       # 硬下限, 防单帧误检
+FRAME_SAT   = float(os.environ.get("FRAME_SAT","10"))     # 帧数加分到此饱和
+MIN_AREA_PCT= float(os.environ.get("MIN_AREA_PCT","0.05"))# 太小的生成一定是垃圾
+# ★ 组装那步会排除的词, 这里就别挑图了 —— 排除以前只在组装生效, 前面照挑图、照验图、
+#   照生成 mesh, 跑完再扔。cyberpunk 上那个错的 sofa 就是这么白跑出来的。
+#   过滤放在最早这一步: 省掉 VLM 验图 + SAM3D 生成两段 GPU 时间。
+EXCLUDE = {w.strip() for w in os.environ.get("EXCLUDE","").split(",") if w.strip()}
+HAVE = {int(f[:4]) for f in os.listdir(f"{ROOT}/02_da3/depth") if f.endswith("_depth.npy")}
+
+picked={}
+for fn in sorted(os.listdir(MK)):
+    z=np.load(f"{MK}/{fn}", allow_pickle=True)
+    meta=z["meta"]; counts=z["counts"]; H,W=z["hw"]; word=str(z["word"])
+    if word in EXCLUDE:
+        print(f"[{word}] 在 EXCLUDE 里, 不挑图不生成"); continue
+    if len(meta)==0 or meta["area"].max()==0: continue
+    live={}
+    for i,(oid,fi,a,e) in enumerate(meta):
+        if a==0 or int(fi) not in HAVE: continue
+        live.setdefault(int(oid),[]).append((i,int(fi),int(a),float(e)))
+    best=None
+    for oid,rows in live.items():
+        if len(rows)<MIN_FRAMES: continue
+        nf=min(len(rows)/FRAME_SAT, 1.0)                     # 帧数因子, 10 帧封顶
+        for i,fi,a,e in rows:
+            s = a * (1-min(e*4,0.9)) * nf
+            if best is None or s>best[0]: best=(s,oid,fi,a,e,i,len(rows))
+    if best is None: continue
+    s,oid,fi,a,e,i,nfr = best
+    if 100*a/(H*W) < MIN_AREA_PCT: 
+        print(f"[{word}] 最好的也只占 {100*a/(H*W):.3f}% 画面, 太小, 跳过"); continue
+    m=mask_util.decode({"counts":counts[i],"size":[int(H),int(W)]}).astype(bool)
+    name=word.replace(" ","_")
+    d=os.path.expanduser(f"~/sam3d/sam-3d-objects/my_images/{TAG}_{name}"); os.makedirs(d,exist_ok=True)
+    img=cv2.imread(f"{FR}/{fi:04d}.jpg")
+    cv2.imwrite(f"{d}/frame.png", img); cv2.imwrite(f"{d}/mask.png", m.astype(np.uint8)*255)
+    ov=img.copy(); ov[m]=(0.5*ov[m]+0.5*np.array([60,60,230])).astype(np.uint8)
+    cv2.imwrite(f"{OUT}/{name}.jpg", ov, [cv2.IMWRITE_JPEG_QUALITY,88])
+    picked[word]=dict(obj_id=oid, frame=fi, 面积占比=round(100*a/(H*W),3), 活帧数=nfr,
+                      贴边=round(e,3), 候选数=len(live), 目录=d)
+    print(f"[{word}] 实例#{oid} 第{fi}帧 占{100*a/(H*W):.2f}% 活{nfr}帧 贴边{e:.3f} ({len(live)}个候选)")
+json.dump(picked, open(f"{OUT}/picks.json","w"), ensure_ascii=False, indent=1)
+print(f"\n[done] {len(picked)} 类待生成")
