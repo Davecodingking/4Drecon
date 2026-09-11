@@ -903,302 +903,295 @@ def make_handler(store):
 PAGE = r"""<!doctype html>
 <meta charset="utf-8"><title>Gate Review</title>
 <style>
- /* ================================================================ 暗房
-    这一屏的工作是: 扫一排抠图, 划掉坏的, 放行。所以图是唯一亮源, 其余全部压暗。
-    抠图的灰底(#b4b4b4 上下)是后端烤进去的、改不了 —— 那就让整页比它暗得多,
-    灰底自然成为焦点, 而不是和卡片背景打架。                          */
+ /* ================================================================ 瑞士
+    国际主义平面设计的三件套 —— 网格、无衬线、客观摄影 —— 正好是这一屏的三件事:
+    候选是网格里的单元, 判定是排版(选中 = 实心黑块, 正片), 抠图是客观摄影。
+
+    ★ 后端烤的抠图灰底是 210 = #d2d2d2 (cutout_rgb 里写死的; 上一版注释写成 #b4b4b4,
+      是错的)。它放在白纸上只有 1.51:1, 并排的两张灰图之间隔 1px 网格线只剩 1.26:1 ——
+      一排图会糊成一条灰带。所以图版的边界**不靠色差, 靠网格**: 每个单元白底,
+      图版缩进一圈白边(裱框), 图和字共用同一条左边线; 单元之间走发丝线。 */
  :root{
-   --ink:#0a0b0d;        /* 页面底 —— 真暗, 不是带蓝的深灰 */
-   --stock:#131519;      /* 片基: 卡片/面板 */
-   --raise:#191c21;      /* 抬起一层: 顶栏、弹层头 */
-   --rule:#23262c;       /* 细线 */
-   --paper:#e9e7e2;      /* 正文: 略暖白 = 灯箱旁的相纸, 不是纯白 */
-   --pencil:#82878f;     /* 次要文字。#7d828b 在顶栏底上是 4.42:1, 差一点不达标 */
-   --frame:#c9c9c9;      /* 图位占位色, 和后端烤的灰底同族 */
-   /* 语义色。这五个是**数据**不是装饰 —— 所以不另设品牌 accent。 */
-   --keep:#6fbf73; --drop:#e0703c; --kill:#d94a3d;
-   --solo:#58a8d8; --share:#b87fd0; --flag:#e8b84a;
-   --bg:var(--ink); --card:var(--stock); --line:var(--rule);
-   --fg:var(--paper); --dim:var(--pencil);
+   --paper:#efefed;   /* 纸: 中性灰白。刻意不用暖奶油色 */
+   --sheet:#ffffff;   /* 单元 */
+   --ink:#000000;     /* 正文: 真黑。瑞士排版不用 #111 那种调过的近黑 */
+   --rule:#bdbcb6;    /* 发丝线 = 网格本身, 只落在真实的单元边界上 */
+   --mute:#6b6a65;    /* 次要文字  白底 5.42:1 */
+   --edge:#8a8983;    /* 控件描边  白底 3.51:1 (WCAG 1.4.11 要 3:1) */
+   --field:#f4f4f2;   /* 未选控件的底 */
+   --red:#d0000e;     /* 唯一强调色, **只说"不"**。白底 5.69:1, 白字压它 5.69:1 */
+   --plate:#d2d2d2;   /* 抠图底, 后端定的 */
+   --yellow:#ffd400;  /* 召回的身份色(用户点名要黄)。只做底, 上面压黑字 14:1 */
+   /* 旧名字留着 —— 内联样式和 RC色() 还在读它们 */
+   --bg:var(--paper); --card:var(--sheet); --line:var(--rule);
+   --fg:var(--ink); --dim:var(--mute); --pencil:var(--mute);
+   --keep:var(--ink); --drop:var(--red); --kill:var(--red);
+   --solo:var(--ink); --share:var(--ink); --flag:var(--ink);
  }
  *{box-sizing:border-box}
- body{margin:0;background:var(--ink);color:var(--paper);
-      font:13px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,
-           "PingFang SC","Microsoft YaHei",sans-serif;
+ body{margin:0;background:var(--paper);color:var(--ink);
+      font:13px/1.5 "Helvetica Neue",Helvetica,Arial,"Liberation Sans","Nimbus Sans",
+           system-ui,"PingFang SC","Microsoft YaHei",sans-serif;
       -webkit-font-smoothing:antialiased}
- /* 等宽只给**需要竖着对齐的数字**。小标签用正文字体 —— 满页等宽是通用暗色面板的味道。 */
- .num,.path,.im em,.dim,.glyph,.rt td,.rt input,.sum .big,.rcrow .num{
-      font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}
+ /* ★ 全页没有等宽字体。数字靠同一个字族的 tabular-nums 竖着对齐 —— 这才是瑞士做法。
+    等宽只留给**可复制的 shell 命令**(那是代码, 不是数据), 见 .note code / .rcsum code。 */
+ .hd span,.im em,.dim,.glyph,.rt td,.rt input,.sum .big,.rcrow .num,.cand div,
+ #stat,.bg,.path{font-variant-numeric:tabular-nums}
 
  /* ---------------------------------------------------------------- 顶栏 */
- header{position:sticky;top:0;z-index:9;background:var(--raise);
-        border-bottom:1px solid var(--rule);
-        padding:9px 18px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
- header b{font-size:16px;font-weight:650;letter-spacing:-.012em}
- /* 决策文件路径: 只让文件名可读, 目录退到背景。hover 看全路径(title 里有)。 */
- /* 决策文件。★ 要紧的是**文件名**(05_review.json 和 05_review_afterrecall.json
-    是两道闸), 目录是常量。所以只渲染末三段, 全路径进 title —— 用 CSS 截断做不到
-    这件事: overflow 永远从头开始留, 留下的恰好是没信息的那一半。 */
- .path{color:var(--pencil);font-size:11px;white-space:nowrap}
- .path b{color:#aeb4bd;font-weight:500}
- /* 闸位/进度是**给人读的句子**, 不是路径 —— 不该继承 .path 的等宽和 RTL 截断 */
- .ghd{font-size:12.5px;letter-spacing:-.002em}
- .ghd.dimly{color:var(--pencil);font-size:11.5px}
- #gate{font-weight:560}
+ header{position:sticky;top:0;z-index:9;background:var(--sheet);
+        border-bottom:2px solid var(--ink);
+        padding:12px 20px 11px;display:flex;gap:20px;align-items:baseline;flex-wrap:wrap}
+ header b{font-size:18px;font-weight:700;letter-spacing:-.025em;line-height:1.1}
+ .ghd{font-size:13px;letter-spacing:-.005em}
+ #gate{font-weight:700}
+ .ghd.dimly{color:var(--mute);font-size:12px}
  .sp{flex:1}
+ .path{color:var(--mute);font-size:11.5px;white-space:nowrap}
+ .path b{color:var(--ink);font-weight:700;font-size:11.5px;letter-spacing:0}
 
- /* ---------------------------------------------------------------- 控件 */
- button{background:#1e2127;color:var(--paper);border:1px solid var(--rule);border-radius:4px;
-        padding:5px 11px;cursor:pointer;font-size:12px;font-family:inherit;
-        letter-spacing:.004em;transition:background .09s ease,border-color .09s ease}
- button:hover:not(:disabled){background:#282c34;border-color:#363b44}
- /* 选中态。两个坑一起解:
-    1) **权重**: 必须写 button.on:not(:disabled), 否则上面那条 hover 的 (0,2,1)
-       压过裸 .on 的 (0,1,1) —— 光标一压到 shared 上它就退回未选中的样子,
-       而那正是人要下手点的时刻。
-    2) **对比**: 暗底上靠灰阶区分选中/未选中最多做到 1.39:1(实测), 远低于
-       WCAG 1.4.11 对状态指示要求的 3:1。灰阶拉不动就别拉 —— 改成**下缘一条
-       亮色标记**, 用的就是那五个语义色: keep 绿 / solo 蓝 / shared 紫 / drop 橙。
-       实测 3.15~8.67:1, 而且 shared 和 solo 一眼是两个颜色, 不用读字。 */
- button.on,button.on:not(:disabled),button.on:hover:not(:disabled){
-        background:#2b303a;border-color:#454d5a;color:#fff;
-        box-shadow:inset 0 -2px 0 var(--mark,#c9d2de)}
- button.on[data-yn="keep"],button.on[data-io="keep"],button.on[data-rio="keep"]{--mark:var(--keep)}
- button.on[data-mode="solo"]{--mark:var(--solo)}
- button.on[data-mode="shared"]{--mark:var(--share)}
- button.on[data-yn="drop-word"]{--mark:var(--kill)}
- button.on[data-io="drop"],button.on[data-rio="drop"]{--mark:var(--drop)}
- /* ★ 别用 opacity 表达禁用: 它和父级的 opacity 相乘, Save 最后落到 1.53:1,
-    读起来像"这里什么都没有"。给真实底色, 3.5:1 —— 看得出是控件, 看得出按不了。 */
- button:disabled{background:#16181c;border-color:#22252b;color:#6a6f77;cursor:not-allowed}
- button:focus-visible{outline:2px solid #6f9fd0;outline-offset:1px}
- #save{background:#26602f;border-color:#37853f;padding:6px 18px;font-weight:600;
-       border-radius:4px}
- #save:hover:not(:disabled){background:#2d7038}
- #save:disabled{background:#16181c;border-color:#22252b;color:#6a6f77}
- .gsw{display:flex;border:1px solid var(--rule);border-radius:4px;overflow:hidden}
- .gsw button{border:0;border-radius:0;font-size:11.5px;padding:4px 13px;background:transparent}
- .gsw button.on{background:#333944;color:#fff}
- .rcb{border-color:#6d5a18;color:var(--flag);background:#1d1a10}
- .rcb:hover:not(:disabled){background:#262112;border-color:#8a731f}
+ /* ---------------------------------------------------------------- 控件
+    默认: 白底 + 3.51:1 描边。选中: 实心黑(见文末, 必须放在所有容器规则之后)。 */
+ button{background:var(--sheet);color:var(--ink);border:1px solid var(--edge);border-radius:0;
+        padding:5px 10px;cursor:pointer;font:inherit;font-size:12px;line-height:1.3;
+        letter-spacing:0;transition:background .08s linear}
+ button:hover:not(:disabled){background:var(--field)}
+ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+ /* 禁用: 真实底色, 不用 opacity(会和父级相乘) */
+ button:disabled{background:var(--field);border-color:#d6d5d0;color:#85847f;cursor:not-allowed}
+ #save{padding:6px 20px;font-weight:700;border-color:var(--ink)}
+ #save:not(:disabled){background:var(--ink);color:#fff}
+ #save:hover:not(:disabled){background:#2a2a28}
+ #save:disabled{background:var(--field);border-color:#d6d5d0;color:#85847f}
+ /* 闸切换: 一组分段控件, 描边用墨色 —— 它是这一屏的"总开关" */
+ .gsw{display:flex;border:1px solid var(--ink)}
+ .gsw button{border:0;padding:4px 14px;font-size:12px;background:var(--sheet)}
+ .gsw button+button{border-left:1px solid var(--ink)}
+ /* 召回钮: 黄底黑字。黄是用户点名的召回身份色, 不和"红=否"混 */
+ /* ★ #rcw 也挂着 .gsw, 所以 .gsw button (0,1,1) 会压过裸 .rcb (0,1,0) —— 黄底上不去。
+    写成 .gsw button.rcb (0,2,1)。另外闸 3 上 #rcw 是空的, 带着 1px 框就是顶栏一个小黑点。 */
+ #rcw{border:0}
+ #rcw:empty{display:none}
+ .gsw button.rcb,.gsw button.rcb:hover:not(:disabled){background:var(--yellow);
+      border:1px solid var(--ink);color:var(--ink);font-weight:700}
 
- /* ---------------------------------------------------------------- 接触印相栅格
-    卡与卡之间只有 3px 缝, 无圆角无阴影 —— 一卷底片摊开的样子, 不是一叠卡片。 */
- #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(196px,1fr));
-       gap:3px;padding:14px}
- .sec{grid-column:1/-1;margin:12px 0 1px;padding:0 1px 7px;
-      border-bottom:1px solid var(--rule);font-size:12.5px;font-weight:600;
-      letter-spacing:-.005em;display:flex;align-items:baseline;gap:10px}
- .sec:first-child{margin-top:0}
- .sec span{font-weight:400;color:var(--pencil);font-size:11px;letter-spacing:0}
+ /* ---------------------------------------------------------------- 网格
+    ★ 不用 "gap:1px + 底色当线" 的做法: 最后一排没填满时, 空格子会露出一大块底色。
+      用经典的**边框折叠**: 每个单元自带 1px 框, 负边距把相邻两条压成一条。
+      空格子露出的是纸, 不是灰块。 */
+ #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:0;
+       padding:6px 21px 36px 20px}
+ .sec{grid-column:1/-1;display:flex;align-items:baseline;gap:12px;
+      padding:22px 0 8px;margin-bottom:-1px;position:relative;z-index:1;
+      border-bottom:1px solid var(--ink);font-size:13px;font-weight:700;letter-spacing:-.01em}
+ .sec:first-child{padding-top:10px}
+ .sec span{font-weight:400;color:var(--mute);font-size:12px;letter-spacing:0}
 
  /* ---- 词卡 ---- */
- .wcard{background:var(--stock);border:0;border-left:3px solid var(--rule);
-        border-radius:0;overflow:hidden;display:flex;flex-direction:column}
- /* 整词作废用透明度通道, 但只压**图**不压字 —— 压字等于把复核所需的数字关掉,
-    而复核一个 drop 正是判掉之后唯一还要做的事。 */
+ .wcard{background:var(--sheet);border:1px solid var(--rule);margin:0 -1px -1px 0;
+        display:flex;flex-direction:column;min-width:0}
+ /* 图版: 缩进 10px 白边, 图和下面的字共用同一条左边线 */
+ .wcard img{display:block;width:calc(100% - 20px);margin:10px 10px 0;aspect-ratio:1;
+            background:var(--plate);object-fit:cover}
+ /* 整词作废: 图压淡 + 单元顶上一道红。**字不压** —— 复核要读得出来 */
+ .wcard.dead{box-shadow:inset 0 3px 0 var(--red)}
  .wcard.dead img{opacity:.3}
- .wcard.dead .hd b{color:var(--pencil)}
- .wcard img{width:100%;aspect-ratio:1;display:block;background:var(--frame);object-fit:cover}
- /* ★ 一排卡片的按钮必须横向对齐 —— 这一屏的动作是"横扫一排连着敲 drop",
-    某张卡的按钮跳 12px 就会点错实例。min-height 治不了: street lamp 的标题
-    加徽章占满一行后, margin-left:auto 的 "#0 f268" 被挤到第二行, 那张卡就高一截。
-    所以**让它永远自己一行**: flex-basis:100% 强制换行, 每张卡都是两行, 一律齐。 */
- .hd{padding:7px 9px 4px;display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}
- .hd b{font-size:13px;font-weight:620;letter-spacing:-.008em}
- .hd span{color:var(--pencil);font:11px ui-monospace,monospace;
-          flex:0 0 100%;text-align:right;margin-top:1px;
-          font-variant-numeric:tabular-nums}
- .wcard .row{display:flex;align-items:center;gap:2px;padding:0 7px 5px}
- .wcard .row button{flex:1 1 0;padding:4px 3px;font-size:11px;min-width:0}
- .wcard .row button.dgr.on{background:#4d1f1c;border-color:#7d332c;color:#ffb8ad}
- .more{padding:0 7px 8px;margin-top:auto}
- .more button{width:100%;font-size:11px;background:transparent;color:var(--pencil)}
- .more button:hover:not(:disabled){color:var(--paper);background:#1e2127}
- .warn{margin:0 7px 6px;padding:6px 8px;border-radius:3px;background:#2e1a15;
-       border-left:2px solid var(--drop);color:#ffbda6;font-size:10.5px;line-height:1.45}
+ .wcard.dead .hd b{color:var(--mute)}
+ /* ★ 标题块用 grid 定死两行: 第一行 词 | 数量, 第二行 #id f帧。
+    用 flex-wrap 的话, 词长的卡(street lamp)第一行会折, 那张卡就高一截,
+    一排的按钮对不齐 —— 这一屏的动作是横扫一排连着敲 drop, 偏了就点错。 */
+ .hd{display:grid;grid-template-columns:minmax(0,1fr) auto;column-gap:8px;row-gap:1px;
+     align-items:baseline;padding:10px 10px 8px}
+ .hd b{font-size:13.5px;font-weight:700;letter-spacing:-.015em;min-width:0;
+       white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ .hd span{grid-column:1/-1;color:var(--mute);font-size:11px}
+ /* 两个按钮一组, 共用中间那条边 —— 分段控件 */
+ .wcard .row{display:grid;grid-template-columns:1fr 1fr;padding:0 10px 6px}
+ .wcard .row button{padding:5px 4px;font-size:12px;min-width:0}
+ .wcard .row button+button{margin-left:-1px}
+ .more{margin-top:auto;border-top:1px solid var(--rule);display:flex;flex-direction:column}
+ .more button{border:0;background:transparent;text-align:left;padding:8px 10px;
+              font-size:12px;color:var(--ink)}
+ .more button+button{border-top:1px solid var(--rule)}
+ .more button:hover:not(:disabled){background:var(--field)}
+ .more button:disabled{background:transparent;color:#85847f}
+ .warn{margin:0 10px 8px;padding:6px 8px;border-left:2px solid var(--red);
+       background:#fdf2f2;color:var(--ink);font-size:11px;line-height:1.45}
 
- /* ---- 徽章。位置即类别: 左上=警告, 右上=身份。实线=人定的, 虚线=系统猜的。 ---- */
- .bg{font-style:normal;font-size:10px;padding:1px 6px;border-radius:2px;white-space:nowrap;
-     font-variant-numeric:tabular-nums}
- .bg.cls{background:#2b2416;color:#d9ad63;border:1px solid #443722}
- .bg.cls.big{background:#33221a;color:#e59468;border-color:#553629}
- .bg.rec{background:#332a0c;color:var(--flag);border:1px solid #5f4f16}
+ /* ---- 徽章。位置即类别; 实线 = 人定的, 虚线 = 系统猜的 ---- */
+ .bg{font-style:normal;font-size:11px;white-space:nowrap}
+ /* 对象数: 不做药丸 —— 就是一个数。多到该考虑 shared 时加粗 */
+ .bg.cls{color:var(--mute)}
+ .bg.cls.big{color:var(--ink);font-weight:700}
+ .bg.rec{background:var(--yellow);color:var(--ink);padding:0 5px;font-weight:700;font-size:10.5px}
 
- /* ---------------------------------------------------------------- 展开面板 */
- .panel{grid-column:1/-1;background:var(--stock);border:1px solid var(--rule);padding:13px}
- .panel h3{margin:0 0 11px;font-size:13px;font-weight:620;letter-spacing:-.008em}
- .panel h3 span{color:var(--pencil);font-weight:400;margin-left:9px;font-size:11px;
-                letter-spacing:0}
- .insts{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:3px}
- .inst{position:relative;background:var(--stock);border:1px solid transparent;overflow:hidden;
-       display:flex;flex-direction:column}
- .inst img{width:100%;aspect-ratio:1;display:block;background:var(--frame);object-fit:cover}
- /* 质量可疑 = 材质通道(降饱和)。和形状差异的几何通道分开。hover 必须能撤销 ——
-    否则它妨碍人真的去看那张图, 而看图正是这一屏的全部意义。 */
- .inst.bad img{filter:saturate(.32)}
+ /* ---------------------------------------------------------------- 实例面板 */
+ .panel{grid-column:1/-1;background:var(--sheet);padding:14px}
+ .panel h3{margin:0 0 12px;font-size:13px;font-weight:700;letter-spacing:-.01em}
+ .panel h3 span{color:var(--mute);font-weight:400;margin-left:10px;font-size:12px;letter-spacing:0}
+ .insts{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:0;padding-right:1px}
+ .inst{position:relative;background:var(--sheet);border:1px solid var(--rule);
+       margin:0 -1px -1px 0;display:flex;flex-direction:column;min-width:0}
+ .inst img{display:block;width:calc(100% - 16px);margin:8px 8px 0;aspect-ratio:1;
+           background:var(--plate);object-fit:cover}
+ /* 质量可疑 = 材质通道(降饱和), hover 撤销 —— 不然妨碍人真去看那张图 */
+ .inst.bad img{filter:saturate(.3)}
  .inst.bad:hover img{filter:none}
- /* 判掉 = 蜡笔划掉。灰白+红框是定下来的语义, 这里只是把它做成"人划的"那种样子:
-    斜线压在图上, 而且灰白程度收轻 —— 人得看得见自己划掉的是什么。 */
- .inst.dropped{border-color:var(--kill);box-shadow:0 0 0 1px var(--kill) inset}
- .inst.dropped img{filter:grayscale(1) brightness(.66)}
- .inst.dropped:hover img{filter:grayscale(.22) brightness(.92)}
- /* ★ 滤镜必须挂在 img 上, 不能挂在 .inst 上:
-      1) 挂 .inst 会把这道红线一起变灰 —— filter 作用于整棵子树, ::after 也算;
-      2) 这道线更不能画成 img 的 background-image, 图片本身不透明, 会把它整个盖住。
-    所以: 图变灰白(人一眼看出判掉了), 线保持红(那是人自己划的那一笔)。 */
- .inst.dropped::after{content:'';position:absolute;left:0;top:0;right:0;aspect-ratio:1;
+ /* 判掉 = 灰白 + 红框 + 一道划掉的红线(用户定的语义, 这里只换材质)。
+    滤镜挂 img 不挂 .inst: 挂在 .inst 上 filter 会连 ::after 的红线一起变灰。 */
+ .inst.dropped{box-shadow:inset 0 0 0 2px var(--red);z-index:1}
+ .inst.dropped img{filter:grayscale(1) contrast(.85) brightness(1.08)}
+ .inst.dropped:hover img{filter:grayscale(.2)}
+ .inst.dropped::after{content:'';position:absolute;left:8px;top:8px;right:8px;aspect-ratio:1;
      pointer-events:none;background:linear-gradient(to top right,
-       transparent 47.7%,rgba(217,74,61,.82) 47.7%,
-       rgba(217,74,61,.82) 52.3%,transparent 52.3%)}
- .inst.dropped .im b::after{content:' · dropped';color:#e58a7c;font-weight:400;font-size:10px}
- .inst.rep{border-color:var(--keep);box-shadow:0 0 0 1px var(--keep) inset}
- .alarm{position:absolute;top:4px;left:4px;background:#2c2410;border:1px solid #55461a;
-        color:var(--flag);font-style:normal;font-size:9px;padding:1px 5px;border-radius:2px}
- .repbadge{position:absolute;top:4px;right:4px;background:#14301b;border:1px solid #2f6c3c;
-           color:#93dda4;font-style:normal;font-size:9px;padding:1px 5px;border-radius:2px}
- .repbadge.guess{background:#1a2620;border-color:#38614a;color:#89b79a;border-style:dashed}
- .im{padding:6px 8px 2px;font-size:11px}
- .im b{font-size:12px;font-weight:620}
- .im em{float:right;font-style:normal;color:var(--pencil);font-size:11px}
- /* 减一件: 面积条从 3px 圆角蓝条降成 1px 细线 —— 留信号, 去响度。
-    这一行已经排过序、右边就写着百分比, 条子只需要提示"和上一个差多少"。 */
- .bar{height:1px;background:#22262c;margin:5px 0 4px}
- .bar s{display:block;height:100%;background:#5f7d9c;text-decoration:none}
- /* AR 画成矩形字形 —— 横扫一眼分堆, 比逐个读数字快 */
- .glyph{display:flex;align-items:center;gap:6px;color:var(--pencil);font-size:10px;margin:3px 0}
- .glyph u{display:inline-block;border:1px solid #7a97b8;background:#7a97b81c;
-          text-decoration:none;flex:none}
- .dim{color:var(--pencil);font-size:10px;line-height:1.4}
- .dim.verdict{color:#b09070}   /* 结论, 不是第四个字段 */
- /* ★ 同上: 第三个按钮是短的 frame▾ 还是长的 use as source▾, 决定它换不换行,
-    于是同一排里总有一张的 keep/drop 偏 21px。定成两列, 第三个整行占满, 一律齐。 */
- .iops{display:grid;grid-template-columns:1fr 1fr;gap:2px;padding:5px 7px 7px;margin-top:auto}
- .iops button{padding:3px 5px;font-size:10px;min-width:0}
- .iops button:nth-child(3){grid-column:1/-1}
+       transparent 48.2%,var(--red) 48.2%,var(--red) 51.8%,transparent 51.8%)}
+ /* 代表 = 实心黑框(正片), 和"判掉"的红框同一个位置、不同的颜色 */
+ .inst.rep{box-shadow:inset 0 0 0 2px var(--ink);z-index:1}
+ .alarm{position:absolute;top:12px;left:12px;background:var(--sheet);border:1px solid var(--ink);
+        color:var(--ink);font-style:normal;font-size:10px;padding:0 4px;line-height:1.5}
+ .repbadge{position:absolute;top:12px;right:12px;background:var(--ink);color:#fff;
+           font-style:normal;font-size:10px;padding:0 5px;line-height:1.5}
+ .repbadge.guess{background:var(--sheet);color:var(--ink);border:1px dashed var(--ink)}
+ .im{padding:8px 8px 2px;font-size:11px}
+ .im b{font-size:12.5px;font-weight:700;letter-spacing:-.01em}
+ .im em{float:right;font-style:normal;color:var(--ink);font-size:11.5px}
+ /* 面积条: 一根细黑条就是一张最小的柱状图 */
+ .bar{height:2px;background:#e9e8e4;margin:6px 0 5px}
+ .bar s{display:block;height:100%;background:var(--ink);text-decoration:none}
+ /* AR 画成矩形字形 —— 横扫一眼就能分堆 */
+ .glyph{display:flex;align-items:center;gap:6px;color:var(--mute);font-size:10.5px;margin:3px 0}
+ .glyph u{display:inline-block;border:1px solid var(--ink);text-decoration:none;flex:none}
+ .dim{color:var(--mute);font-size:10.5px;line-height:1.45}
+ .dim.verdict{color:var(--ink)}      /* 结论, 不是第四个字段 */
+ /* 两列定死, 第三个按钮整行 —— 否则同一排里 keep/drop 会错开 21px */
+ .iops{display:grid;grid-template-columns:1fr 1fr;padding:6px 8px 8px;margin-top:auto}
+ .iops button{padding:4px 4px;font-size:11px;min-width:0}
+ .iops button:nth-child(2){margin-left:-1px}
+ .iops button:nth-child(3){grid-column:1/-1;margin-top:-1px}
 
  /* ---------------------------------------------------------------- 帧抽屉 */
- .tray{grid-column:1/-1;background:var(--stock);border:1px solid var(--rule);padding:13px}
- .tray h3{margin:0 0 11px;font-size:13px;font-weight:620;letter-spacing:-.008em}
- .tray h3 span{color:var(--pencil);font-weight:400;margin-left:9px;font-size:11px}
- .cands{display:grid;grid-template-columns:repeat(auto-fill,minmax(126px,1fr));gap:3px}
- /* .cand 已改成 <button>(为了键盘可达), 所以要把按钮的默认外观全收掉 ——
-    padding、字体、文字对齐都得显式写回, 否则它会带着 button 的默认样式出场。 */
- .cand{position:relative;background:var(--stock);border:2px solid transparent;
-       cursor:pointer;overflow:hidden;padding:0;margin:0;display:block;width:100%;
-       font:inherit;color:inherit;text-align:left;border-radius:0}
- .cand:hover:not(:disabled){background:var(--stock)}
- .cand:focus-visible{outline:2px solid #6f9fd0;outline-offset:2px}
- .cand:hover{border-color:#8b95a3}
- .cand.cur,.cand.cur:hover{border-color:var(--keep)}
- .cand.orig .ohome{position:absolute;top:4px;left:4px;background:#14243a;
-        border:1px solid #2f4f78;color:#93c1e8;font-style:normal;font-size:9px;
-        padding:1px 5px;border-radius:2px}
- .cand img{width:100%;aspect-ratio:1;display:block;background:var(--frame)}
- .cand div{padding:4px 6px;font:10px ui-monospace,monospace;color:var(--pencil);
-           font-variant-numeric:tabular-nums}
- .empty{padding:56px 24px;text-align:center;color:var(--pencil);line-height:1.7}
+ .tray{grid-column:1/-1;background:var(--sheet);padding:14px}
+ .tray h3{margin:0 0 12px;font-size:13px;font-weight:700;letter-spacing:-.01em}
+ .tray h3 span{color:var(--mute);font-weight:400;margin-left:10px;font-size:12px}
+ .cands{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:0;padding-right:1px}
+ /* .cand 是 <button>(为了键盘可达) —— 把按钮的默认外观全收掉 */
+ .cand{position:relative;display:block;width:auto;margin:0 -1px -1px 0;padding:0;
+       background:var(--sheet);border:1px solid var(--rule);color:inherit;font:inherit;
+       text-align:left;cursor:pointer;min-width:0}
+ .cand:hover:not(:disabled){background:var(--sheet);box-shadow:inset 0 0 0 1px var(--ink);z-index:1}
+ .cand.cur,.cand.cur:hover:not(:disabled){box-shadow:inset 0 0 0 3px var(--ink);z-index:2}
+ .cand:focus-visible{outline:2px solid var(--ink);outline-offset:2px;z-index:3}
+ .cand img{display:block;width:calc(100% - 12px);margin:6px 6px 0;aspect-ratio:1;background:var(--plate)}
+ .cand .ohome{position:absolute;top:10px;left:10px;background:var(--sheet);
+        border:1px dashed var(--ink);color:var(--ink);font-style:normal;font-size:10px;padding:0 4px}
+ .cand div{padding:5px 7px 7px;font-size:10.5px;color:var(--mute);line-height:1.45}
+ .empty{padding:56px 0;color:var(--mute);line-height:1.7;max-width:60ch}
 
  /* ---------------------------------------------------------------- 召回信息表 */
- .rcsum{color:var(--pencil);font-size:12px;margin-bottom:12px;line-height:1.65;max-width:78ch}
- .rcsum b{color:var(--paper);font-weight:600}
- .rcsum code{background:#0f1114;border:1px solid var(--rule);border-radius:3px;
-             padding:1px 5px;font-family:ui-monospace,monospace;font-size:11px;color:#cbd6e2}
- .rcrow{display:flex;gap:14px;align-items:flex-start;padding:12px 0;
-        border-bottom:1px solid var(--rule)}
- .rcrow:last-child{border-bottom:0}
- .rcrow img{background:var(--frame);flex:none}
+ .rcsum{color:var(--mute);font-size:12.5px;margin-bottom:14px;line-height:1.6;max-width:78ch}
+ .rcsum b{color:var(--ink);font-weight:700}
+ .rcrow{display:flex;gap:18px;align-items:flex-start;padding:14px 0;border-top:1px solid var(--rule)}
+ .rcrow img{background:var(--plate);flex:none}
  .rcrow .t{flex:1;min-width:0}
- .rcrow .t b{font-size:13.5px;font-weight:620;letter-spacing:-.008em}
- .rcrow .why{font-size:12px;margin-top:5px;max-width:72ch}
- .rcrow .num{color:var(--pencil);font-size:11px;margin-top:4px}
- .rcv{font-style:normal;font-size:10px;padding:1px 7px;border-radius:2px;
-      white-space:nowrap;margin-left:7px}
- .rcedge{border:1px dashed var(--flag);color:var(--flag);font-size:10px;
-         padding:1px 7px;border-radius:2px;margin-left:6px;font-style:normal}
+ .rcrow .t b{font-size:15px;font-weight:700;letter-spacing:-.02em}
+ .rcrow .why{font-size:12.5px;margin-top:6px;max-width:70ch;color:var(--ink)}
+ .rcrow .num{color:var(--mute);font-size:11.5px;margin-top:4px}
+ .rcv{font-style:normal;font-size:10.5px;padding:0 5px;margin-left:8px;white-space:nowrap;
+      background:var(--sheet)}
+ .rcedge{border:1px dashed var(--ink);color:var(--ink);font-size:10.5px;padding:0 5px;
+         margin-left:6px;font-style:normal}
+ .rcsum .src{color:var(--mute);font-size:11px;margin-top:8px;word-break:break-all;user-select:all}
 
  /* ---------------------------------------------------------------- 闸 3 尺子表 */
- .sum{display:flex;gap:26px;flex-wrap:wrap;align-items:baseline;padding:13px 16px;
-      margin:0 0 12px;background:var(--stock);border:0;border-left:3px solid var(--keep)}
- .sum .big{font-size:24px;font-weight:600;letter-spacing:-.02em;line-height:1.15}
- .sum .lb{color:var(--pencil);font-size:10.5px;display:block;margin-bottom:2px}
- /* 提示条: 从"框套框"降成左侧一道色边 —— 它是注解, 不该比它注解的表还重。 */
- .note{padding:9px 0 9px 12px;font-size:11.5px;line-height:1.6;margin-bottom:11px;
-       border-left:2px solid var(--rule);background:none;max-width:96ch}
- .note.warn{border-left-color:var(--drop);color:#f0b9a3}
- .note.info{border-left-color:#3d5a7a;color:#a8c2dc}
- /* ★ inline-block 而不是 block: 句子中间提到一个文件名时(「writes 01_vlm_sizes.json —
-    that is ...」)块级会把这句话劈成三段。inline-block 既能跟在文字里, 又能给长命令
-    自己的滚动区。命令折在路径中间会让人复制出半行, 所以 pre + 横向滚, 配 user-select:all
-    保证点一下选中整条。 */
- .note code{background:#0f1114;border:1px solid var(--rule);border-radius:3px;padding:2px 7px;
-            font-family:ui-monospace,monospace;color:#cbd6e2;display:inline-block;
-            font-size:11px;white-space:pre;max-width:100%;overflow-x:auto;
+ /* 这一屏的主角是 k。大号数字、左齐, 左边一道粗条: 黑 = 采用, 红 = 被拒 */
+ .sum{display:flex;gap:40px;flex-wrap:wrap;align-items:flex-end;padding:18px 0 18px 18px;
+      margin:4px 0 18px;background:transparent;border:0;border-left:6px solid var(--ink)}
+ .sum .big{font-size:30px;font-weight:700;letter-spacing:-.03em;line-height:1}
+ .sum .lb{color:var(--mute);font-size:11.5px;display:block;margin-bottom:6px;letter-spacing:0}
+ /* 注解: 左边一道线, 不套框 —— 它不该比它注解的表还重 */
+ .note{padding:2px 0 2px 14px;font-size:12px;line-height:1.6;margin:0 0 14px;max-width:96ch;
+       border-left:2px solid var(--ink);background:none;color:var(--ink)}
+ .note.warn{border-left-color:var(--red)}
+ .note.info{border-left-color:var(--ink)}
+ .note code,.rcsum code{font-family:ui-monospace,SFMono-Regular,Menlo,"Liberation Mono",monospace;
+            background:var(--field);border:0;padding:1px 5px;font-size:11px;color:var(--ink);
+            display:inline-block;white-space:pre;max-width:100%;overflow-x:auto;
             vertical-align:bottom;user-select:all}
- /* ★ 命令块的样式必须两个容器都挂到 —— .note(闸 3) 和 .rcsum(召回表) 是两个不同的
-    父类, 只写 .note code.cmd 的话召回表那条命令会退化成一段贴着上下文的行内文字,
-    连"点一下选中整条"都没了。 */
- .rcsum code,.note code{background:#0f1114;border:1px solid var(--rule);border-radius:3px;
-            padding:2px 7px;font-family:ui-monospace,monospace;color:#cbd6e2;
-            display:inline-block;font-size:11px;white-space:pre;max-width:100%;
-            overflow-x:auto;vertical-align:bottom;user-select:all}
- /* ★ 命令**按空格软换行**, 不用 pre + 横向滚: .note 的 96ch 量度会把它裁掉 23%
-    而且不给滚动条, 人连 --run r2 都读不到 —— 这是这道闸唯一的逃生出口。
-    user-select:all 仍在, 点一下照样整条选中。 */
- .rcsum code.cmd,.note code.cmd{display:block;margin:7px 0;padding:7px 9px;
-            white-space:pre-wrap;overflow-wrap:break-word;overflow-x:visible;
-            max-width:none;line-height:1.7}
- .rcsum .src{color:var(--pencil);font-size:10.5px;margin-top:7px;
-             word-break:break-all;user-select:all}
- .rt{width:100%;border-collapse:collapse;font-size:12px}
- .rt th{text-align:right;color:var(--pencil);font-weight:400;font-size:10.5px;
-        padding:0 9px 7px;border-bottom:1px solid var(--rule)}
+ /* 可复制的命令: 按空格软换行 —— 裁掉一截的话人读不到 --run r2 就不敢跑 */
+ .note code.cmd,.rcsum code.cmd{display:block;margin:8px 0;padding:8px 10px;
+            white-space:pre-wrap;overflow-wrap:break-word;overflow-x:visible;max-width:none;
+            line-height:1.7}
+ .rtwrap{overflow-x:auto}
+ .rt{width:100%;border-collapse:collapse;font-size:12.5px}
+ .rt th{text-align:right;color:var(--mute);font-weight:400;font-size:11px;padding:0 10px 7px;
+        border-bottom:1px solid var(--ink)}
  .rt th:first-child,.rt th:nth-child(2){text-align:left}
- .rt td{padding:6px 9px;border-bottom:1px solid #1a1d22;text-align:right}
- .rt td:nth-child(2){text-align:left;font-family:inherit;font-weight:560}
- .rt tbody tr:hover td{background:#15181d}
- .rt tr.off{filter:saturate(.28);color:var(--pencil)}   /* 当不了尺子: 材质通道 */
- .rt tr.out td:nth-child(2){color:var(--flag)}          /* 离群不采用 */
- .rt tr.kline td{border:0;padding:3px 9px;color:var(--keep);font-size:10px;
-                 border-top:1px dashed #356240}
- .rt img{width:34px;height:34px;background:var(--frame);object-fit:cover;display:block}
- .rt input{width:64px;background:#0f1114;border:1px solid var(--rule);border-radius:3px;
-           color:var(--paper);padding:4px 6px;font-size:12px;text-align:right}
- .rt input:focus{outline:0;border-color:#6f9fd0;background:#12161b}
- .rt tr.edited input{border-color:var(--share);color:#e9c2e9}
- .bar2{display:inline-block;height:6px;background:#5f7d9c;vertical-align:middle}
- .why{color:var(--pencil);font-size:10px;font-family:inherit}
+ .rt td{padding:7px 10px;border-bottom:1px solid var(--rule);text-align:right}
+ .rt td:nth-child(2){text-align:left;font-weight:700;letter-spacing:-.01em}
+ .rt tbody tr:hover td{background:#f7f7f5}
+ .rt tr.off td{color:var(--mute)}
+ .rt tr.off td:nth-child(2){font-weight:400}
+ .rt tr.off img{filter:grayscale(1);opacity:.55}
+ .rt tr.out td:nth-child(2){color:var(--red)}          /* 离群, 不采用 = "不" */
+ .rt tr.kline td{border:0;border-top:1px solid var(--ink);padding:4px 10px;
+                 color:var(--ink);font-size:11px;font-weight:700}
+ .rt img{width:34px;height:34px;background:var(--plate);object-fit:cover;display:block}
+ .rt input{width:66px;background:var(--sheet);border:1px solid var(--edge);border-radius:0;
+           color:var(--ink);padding:4px 6px;font:inherit;font-size:12.5px;text-align:right}
+ .rt input:focus{outline:2px solid var(--ink);outline-offset:0;border-color:var(--ink)}
+ .rt tr.edited input{border-color:var(--ink);font-weight:700;box-shadow:inset 0 -2px 0 var(--ink)}
+ .bar2{display:inline-block;height:6px;background:var(--ink);vertical-align:middle}
+ .why{color:var(--mute);font-size:11px;font-weight:400}
 
- /* ---------------------------------------------------------------- 沉浸式弹层 */
- .scrim{position:fixed;inset:0;z-index:50;background:rgba(6,7,9,.72);
-        backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
-        display:flex;align-items:flex-start;justify-content:center;padding:26px 20px;
-        overflow:auto;animation:fade .12s ease-out}
+ /* ---------------------------------------------------------------- 弹层 */
+ .scrim{position:fixed;inset:0;z-index:50;background:rgba(20,20,18,.3);
+        backdrop-filter:blur(5px);-webkit-backdrop-filter:blur(5px);
+        display:flex;align-items:flex-start;justify-content:center;padding:28px 20px;
+        overflow:auto;animation:fade .12s linear}
  @keyframes fade{from{opacity:0}to{opacity:1}}
- .modal{background:var(--ink);border:1px solid #2d3138;border-radius:6px;width:100%;
-        max-width:1240px;box-shadow:0 30px 90px rgba(0,0,0,.7);animation:rise .14s ease-out}
- @keyframes rise{from{transform:translateY(6px);opacity:.7}to{transform:none;opacity:1}}
- .mhd{position:sticky;top:0;z-index:2;background:var(--raise);
-      border-bottom:1px solid var(--rule);border-radius:6px 6px 0 0;
-      padding:11px 15px;display:flex;gap:11px;align-items:baseline}
- .mhd b{font-size:15px;font-weight:650;letter-spacing:-.012em}
- .mhd .sp{flex:1} .mhd .sub{color:var(--pencil);font-size:11.5px}
- .mbody{padding:15px}
+ .modal{background:var(--sheet);border:1px solid var(--ink);border-radius:0;width:100%;
+        max-width:1240px;box-shadow:none;animation:rise .14s ease-out}
+ @keyframes rise{from{transform:translateY(6px)}to{transform:none}}
+ .mhd{position:sticky;top:0;z-index:2;background:var(--sheet);border-bottom:2px solid var(--ink);
+      padding:13px 16px 11px;display:flex;gap:14px;align-items:baseline}
+ .mhd b{font-size:18px;font-weight:700;letter-spacing:-.025em}
+ .mhd .sp{flex:1} .mhd .sub{color:var(--mute);font-size:12px}
+ .mbody{padding:16px}
  .mbody .panel,.mbody .tray{background:none;border:0;padding:0}
- .mclose{font-size:14px;line-height:1;padding:4px 10px;align-self:center}
- /* 动效只回应人的动作(开/关/展开), 不做自动入场 —— 满页 fade-slide 是生成味。 */
+ .mclose{font-size:14px;line-height:1;padding:5px 10px;align-self:center}
+
+ /* ---------------------------------------------------------------- 选中态
+    ★ 这一块必须放在**所有**容器按钮规则之后:
+      .more button / .wcard .row button 这些 (0,1,1)~(0,2,1) 的规则一旦写了背景,
+      就会和 button.on 打平甚至压过它, 于是选中的按钮看起来没选中。
+      :not(:disabled) 版本 (0,2,1) 和 hover 版本 (0,3,1) 都得写, 否则光标一压上去
+      就退回未选中 —— 那正是人要下手点的时刻(上一版审出来过)。
+    ★ 中性选中(keep / shared / solo)**不做实心**: 这三个几乎永远处在选中态
+      (keep 是默认, 模式有配置默认), 一张卡两个黑块, 八张卡就是十六个黑方块,
+      比图还抢眼 —— 而这一屏的主角是图。默认状态不该喊。
+      所以: 中性选中 = 2px 黑框 + 加粗(框对白底 21:1, 满足 WCAG 1.4.11 的 3:1),
+      **只有"否"才实心**(红)。全页实心的东西, 就是你判掉的东西。 */
+ button.on,button.on:not(:disabled),button.on:hover:not(:disabled){
+        background:var(--sheet);border-color:var(--ink);color:var(--ink);font-weight:700;
+        box-shadow:inset 0 0 0 1px var(--ink);position:relative;z-index:1}
+ .gsw button.on,.gsw button.on:hover:not(:disabled){background:var(--ink);color:#fff}
+ /* "不"是红的: drop / drop word 选中时实心红 */
+ button.on[data-yn="drop-word"],button.on[data-yn="drop-word"]:not(:disabled),
+ button.on[data-yn="drop-word"]:hover:not(:disabled),
+ button.on[data-io="drop"],button.on[data-io="drop"]:not(:disabled),
+ button.on[data-io="drop"]:hover:not(:disabled),
+ button.on[data-rio="drop"],button.on[data-rio="drop"]:not(:disabled),
+ button.on[data-rio="drop"]:hover:not(:disabled){
+        background:var(--red);border-color:var(--red);color:#fff}
+
  @media (prefers-reduced-motion:reduce){
    *,*::before,*::after{animation-duration:.001ms!important;transition-duration:.001ms!important}
  }
- /* 窄屏: 这工具偶尔在笔记本上开, 栅格自己会塌, 顶栏别把路径挤没 */
  @media (max-width:720px){
-   header{padding:8px 12px;gap:9px}
-   /* ★ .path 的 order 把它排到 #save 之后, 于是 #save 变成第二行的头一个,
-      文件路径反而排它右边。Save 是这台质检台的终点, 必须在最后。 */
+   header{padding:10px 14px;gap:10px}
    .path{order:9;flex:1 1 100%} #save{order:10}
-   #grid{padding:10px;gap:2px}
-   /* 表格比屏幕宽时让**它自己**滚, 别让整页横向滚 */
-   .rtwrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+   #grid{padding:4px 15px 28px 14px;grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}
+   .sum{gap:22px} .sum .big{font-size:24px}
  }
 </style>
 <header>
@@ -1213,10 +1206,11 @@ PAGE = r"""<!doctype html>
 </header>
 <div id="grid"><div class="empty">Loading…</div></div>
 <script>
-const COL = {keep:"#2f4a35",drop:"#e0703c","drop-word":"#d94a3d",solo:"#58a8d8",shared:"#b87fd0"};
-// ★ keep 压暗: 一屏全是 keep 时亮绿左栏会把页面围成绿栅栏, 而"保留"是**默认状态**,
-//   默认不该喊, 判掉才该喊。同一个语义, 出现频率不同, 响度就该不同 ——
-//   汇总条那种一页只有一个的绿仍然用亮的(见 scRender)。
+const COL = {keep:"#bdbcb6",drop:"#d0000e","drop-word":"#d0000e",solo:"#bdbcb6",shared:"#bdbcb6"};
+// ★ 卡片左边那条框线**只说一件事: 这一条被否了**(红)。其余一律和网格线同色。
+//   原来它按模式上色, 但它读的是 w.模式(人显式点过的)而不是 实际模式(含配置默认),
+//   于是会出现按钮亮着 solo、色条却是 keep 色 —— 两处打架。按钮就在下面写着模式,
+//   色条再说一遍本来就是冗余, 去掉比修对更干净。
 const MODES = ["shared","solo"];   // 只有两种结果: 共用一个 / 各造各的
 
 // S.行 是唯一真相(决策文件的「候选」原样)。S.词 是每次改动后重建的派生索引;
@@ -1481,14 +1475,14 @@ function scRender(){
   const 变 = scDirty() && c.k != null && 原.k != null && Math.abs(c.k-原.k) > 1e-9;
   const ok = c.一致率达标;
   wrap.innerHTML =
-    '<div class="sum" style="border-left-color:'+(ok?'#6fbf73':COL['drop-word'])+'">'+
+    '<div class="sum" style="border-left-color:'+(ok?'var(--ink)':'var(--red)')+'">'+
       '<div><span class="lb">scale factor k</span><span class="big">'+
         (c.k==null?'—':c.k)+'</span>'+
-        (变?' <span style="color:#c878c8;font-size:11px">was '+原.k+'</span>':'')+'</div>'+
+        (变?' <span style="color:var(--mute);font-size:11px">was '+原.k+'</span>':'')+'</div>'+
       '<div><span class="lb">agreement (gate '+c.闸门+')</span><span class="big" style="color:'+
-        (ok?'#8fe0a0':'#ff9060')+'">'+(c.一致率==null?'—':c.一致率)+'</span>'+
+        (ok?'var(--ink)':'var(--red)')+'">'+(c.一致率==null?'—':c.一致率)+'</span>'+
         (scDirty()&&原.一致率!=null&&c.一致率!=原.一致率?
-          ' <span style="color:#c878c8;font-size:11px">was '+原.一致率+'</span>':'')+'</div>'+
+          ' <span style="color:var(--mute);font-size:11px">was '+原.一致率+'</span>':'')+'</div>'+
       '<div><span class="lb">rulers used</span><span class="big">'+c.采用类数+'/'+c.候选类数+'</span></div>'+
       '<div><span class="lb">spread</span><span class="big">'+(c.离散==null?'—':c.离散)+'</span></div>'+
       '<span class="sp" style="flex:1"></span>'+
@@ -1531,7 +1525,7 @@ function scRender(){
     const v = ed ? SC.改动[r.词] : (r.真实 ?? r.参照 ?? '');
     return '<tr class="'+cls+'">'+
       '<td><img loading="lazy" src="/img/word?'+qs({word:r.词, size:80})+'"></td>'+
-      '<td><b>'+esc(r.词)+'</b>'+(ed?' <span style="color:#c878c8">✎</span>':'')+
+      '<td><b>'+esc(r.词)+'</b>'+(ed?' <span style="color:var(--ink);font-weight:700">✎</span>':'')+
         (r.用不了?'<br><span class="why">'+esc(r.用不了)+'</span>':'')+'</td>'+
       '<td>'+(r.量到!=null?r.量到.toFixed(2):'—')+'</td>'+
       '<td><input data-sc="'+esc(r.词)+'" value="'+(v===''?'':v)+'" placeholder="—"></td>'+
@@ -1559,7 +1553,7 @@ function scRender(){
     '<th>real (m)</th><th>ratio</th><th></th><th>inst</th><th></th></tr></thead>'+
     '<tbody>'+body+
     (不可用.length? '<tr class="kline"><td></td><td colspan="7" style="color:var(--dim);'+
-      'border-top:1px dashed #33373f">not usable as rulers — fix a height to bring one in</td></tr>'
+      'border-top:1px solid var(--rule)">not usable as rulers — fix a height to bring one in</td></tr>'
       + 不可用.map(r=>tr(r,true)).join('') : '')+
     '</tbody></table></div>';
   g.appendChild(wrap);
@@ -1768,7 +1762,7 @@ function 展开面板(w){
     return t;                       // 加载已在飞, 它自己会 render
   }
   if (st.状态 === 'err'){
-    t.innerHTML = '<h3>'+esc(w.词)+'<span style="color:#f0963c">cannot read instances: '+
+    t.innerHTML = '<h3>'+esc(w.词)+'<span style="color:var(--red)">cannot read instances: '+
       esc(st.说明||'')+'</span></h3>';
     return t;
   }
@@ -2302,7 +2296,7 @@ function tray(w, oid){
     });
    })
    .catch(e => {
-    t.innerHTML = '<h3>'+esc(w.词)+'<span style="color:#f0963c">cannot reach the server — '+
+    t.innerHTML = '<h3>'+esc(w.词)+'<span style="color:var(--red)">cannot reach the server — '+
       esc(e)+'. This page may be a stale copy from before the server stopped; '+
       'make sure it is running, then reload.</span></h3>';
    });
