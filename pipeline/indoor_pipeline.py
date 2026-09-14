@@ -504,13 +504,19 @@ def s_gen(c, dry):
     if dry and not os.path.exists(jobs):
         print("    (还没有 gen_jobs.txt, 干跑跳过)"); return
     names = open(jobs).read().split()
+    todo = []
     for i, n in enumerate(names, 1):
         if os.path.exists(f"{GEN}/outputs/{n}/{n}.glb"):
             print(f"    [{i}/{len(names)}] {n} 已有, 跳过"); continue
         print(f"    [{i}/{len(names)}] {n}", flush=True)
-        sh([PY["sam3d"], f"{GEN}/run.py", "--image", f"{GEN}/my_images/{n}/frame.png",
-            "--mask", f"{GEN}/my_images/{n}/mask.png", "--out", n, "--hq"],
-           f"{c.LOG}/09_gen.log", dry, cwd=GEN)
+        todo.append(f"{GEN}/my_images/{n}")
+    if not todo:
+        print("    没有要生成的, 跳过"); return
+    # ★ 一批一次交给 run.py: 一个物体一个进程等于每个都重装一遍模型(约 40 秒),
+    #   而生成一个才 30 秒。--dirs 模式模型只装一次, 输出按目录名命名。
+    print(f"    [批量] {len(todo)} 个一起生成, 模型只装一次", flush=True)
+    sh([PY["sam3d"], f"{GEN}/run.py", "--dirs", *todo, "--hq"],
+       f"{c.LOG}/09_gen.log", dry, cwd=GEN)
 
 def s_floor(c, dry):
     """地板。uniform 模式 = 去光照 -> 主材质投票 -> 补丁自清洁 -> 随机翻转平铺 ->
@@ -698,32 +704,51 @@ def _gen_dirs(c, dirs, log, dry):
                                       for d in dirs if d not in keep})), flush=True)
         dirs = keep
     dirs = review.filter_dirs(c.R1, dirs)      # 人在闸口逐个否掉的候选
-    _failed = []
-    for i, d in enumerate(dirs, 1):
+    def _fresh(d):
+        """这个目录的 mesh 还作数吗 —— 存在, 而且不比抠图旧。
+
+        ★ 只看"在不在"是不够的: 挑图那步 (verify) 会重写 my_images/<n>/frame.png,
+          mesh 却还是老的, 于是整条链跑在过期 mesh 上。实测踩过 —— bar stool 的抠图
+          已经换成金色高凳了, 场景里摆的还是一把餐椅。抠图比 mesh 新就必须重跑。
+        看 frame.png 和 mask.png 里较新的那个 —— 同帧换实例时只有 mask 会变。
+        """
         n = os.path.basename(d)
         g = f"{GEN}/outputs/{n}/{n}.glb"
-        # ★ 只看"在不在"是不够的: 挑图那步 (verify) 会重写 my_images/<n>/frame.png,
-        #   mesh 却还是老的, 于是整条链跑在过期 mesh 上。实测踩过 —— bar stool 的抠图
-        #   已经换成金色高凳了, 场景里摆的还是一把餐椅。抠图比 mesh 新就必须重跑。
-        # 看 frame.png 和 mask.png 里较新的那个 —— 同帧换实例时只有 mask 会变。
-        _newest = max((os.path.getmtime(f"{d}/{x}") for x in ("frame.png", "mask.png")
-                       if os.path.exists(f"{d}/{x}")), default=0)
-        if os.path.exists(g) and _newest <= os.path.getmtime(g) + 1:
+        if not os.path.exists(g): return False
+        newest = max((os.path.getmtime(f"{d}/{x}") for x in ("frame.png", "mask.png")
+                      if os.path.exists(f"{d}/{x}")), default=0)
+        return newest <= os.path.getmtime(g) + 1
+
+    todo = []
+    for i, d in enumerate(dirs, 1):
+        n = os.path.basename(d)
+        if _fresh(d):
             print(f"    [{i}/{len(dirs)}] {n} 已有且不过期, 跳过"); continue
-        if os.path.exists(g):
+        if os.path.exists(f"{GEN}/outputs/{n}/{n}.glb"):
             print(f"    [{i}/{len(dirs)}] {n} 抠图比 mesh 新, 重新生成")
-        print(f"    [{i}/{len(dirs)}] {n}", flush=True)
-        wait_gpu(21000, dry)
-        # 批量步骤不能一个失败就整批中断 —— HF 504 时后面的连试都没试。
-        # 室外 _gen 早就这么做了(它的注释里记着这个教训), 室内一直是裸的。
-        try:
-            sh(_envcmd(PY["sam3d"], f"{GEN}/run.py",
-                       dict(CONDA_PREFIX=os.path.dirname(os.path.dirname(PY["sam3d"])),
-                            HF_HUB_OFFLINE="1"),
-                       ["--image", f"my_images/{n}/frame.png", "--mask", f"my_images/{n}/mask.png",
-                        "--out", n, "--hq"]), log, dry, cwd=GEN)
-        except SystemExit as e:
-            _failed.append(n); print(f"       ↑ 这个失败了, 继续下一个 ({e})", flush=True)
+        else:
+            print(f"    [{i}/{len(dirs)}] {n}", flush=True)
+        todo.append(d)
+    if not todo:
+        print("    没有要生成的, 跳过"); return
+
+    # ★ 一批一次交给 run.py, 不再一个物体起一个进程 —— 那样每个都要重装一遍模型
+    #   (约 40 秒), 而真正生成一个才 30 秒。run.py 的 --dirs 模式模型只装一次。
+    #   不能改用 --image 传一串: 图全叫 frame.png, 输出名取自文件名会整批互相覆盖。
+    wait_gpu(21000, dry)
+    print(f"    [批量] {len(todo)} 个一起生成, 模型只装一次", flush=True)
+    # 批量步骤不能一个失败就整批中断 —— HF 504 时后面的连试都没试。
+    # run.py 内部逐个 try 住了, 这里接住它的非零码, 具体谁失败下面按产物点名。
+    try:
+        sh(_envcmd(PY["sam3d"], f"{GEN}/run.py",
+                   dict(CONDA_PREFIX=os.path.dirname(os.path.dirname(PY["sam3d"])),
+                        HF_HUB_OFFLINE="1"),
+                   ["--dirs", *todo, "--hq"]), log, dry, cwd=GEN)
+    except SystemExit as e:
+        print(f"    [提示] 这一批有失败的 ({e}), 下面按产物点名", flush=True)
+    if dry: return
+    # 按产物点名比按退出码准: 退 0 但没写出文件也算失败。
+    _failed = [os.path.basename(d) for d in todo if not _fresh(d)]
     if _failed:
         raise SystemExit(f"[失败] {len(_failed)} 个没生成出来: {', '.join(_failed)}\n"
                          f"       别的都好了。单独重跑这一步会只补这几个(已有的会跳过)。")

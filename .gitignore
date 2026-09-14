@@ -15,6 +15,12 @@
 tools/**/__pycache__/
 pipeline/**/__pycache__/
 **/*.pyc
+# docs 下的生成物不进仓库: 幻灯片资产 9M, pptx 3.7M, 都能由脚本重新生成
+docs/slides/assets/
+docs/slides/*.pptx
+# 改嵌套仓库(sam3 / sam-3d-objects)的补丁存这里 —— 那两个目录自带 .git,
+# 父仓库跟踪不到它们里面的文件, 只能把 diff 存成补丁跟着代码一起版本化。
+!patches/
 !data/
 data/*
 !data/outdoor/

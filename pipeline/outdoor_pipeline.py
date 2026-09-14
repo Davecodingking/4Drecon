@@ -541,41 +541,65 @@ def _gen(c, dirs, log, dry):
     # 人在闸口逐个否掉的候选。EXCLUDE 是词级的, 挡不住"这个词留着但这一个实例不要",
     # 而闸口最常见的判断恰好是后者。名单由 s_override 落盘。
     dirs = review.filter_dirs(c.R1, dirs)
-    failed = []
-    for i, d in enumerate(dirs, 1):
+    def _fresh(d):
+        """这个目录的 mesh 还作数吗 —— 存在, 而且不比抠图旧。
+
+        ★ 只看"在不在"是不够的 —— 这条正是"人在闸口换候选"一直不生效的原因:
+          s_override 会重写 my_images/<n>/frame.png, mesh 却还是上一轮那个,
+          于是 picks.json 改了、场景里摆的没变, 而且一声不吭。
+          抠图比 mesh 新就必须重跑。
+          +1 秒容差: 同一次跑里两个文件的 mtime 可能只差毫秒, 不留容差会每次都重生成。
+        ★ 要看 frame.png **和** mask.png 里较新的那个。只看 frame 是不够的:
+          frame.png 的内容只由帧号决定, "同一帧换一个实例"时它一个字节都不变,
+          真正的选择写在 mask.png 里 —— 于是"改用"在同帧换实例时静默变成空操作。
+        """
         n = os.path.basename(d)
         g = f"{GEN}/outputs/{n}/{n}.glb"
-        # ★ 只看"在不在"是不够的 —— 这条正是"人在闸口换候选"一直不生效的原因:
-        #   s_override 会重写 my_images/<n>/frame.png, mesh 却还是上一轮那个,
-        #   于是 picks.json 改了、场景里摆的没变, 而且一声不吭。
-        #   抠图比 mesh 新就必须重跑。室内(indoor_pipeline._gen_dirs)早就这么做了, 室外没跟上。
-        #   +1 秒容差: 同一次跑里两个文件的 mtime 可能只差毫秒, 不留容差会每次都重生成。
-        # ★ 要看 frame.png **和** mask.png 里较新的那个。只看 frame 是不够的:
-        #   frame.png 的内容只由帧号决定, "同一帧换一个实例"时它一个字节都不变,
-        #   真正的选择写在 mask.png 里 —— 于是"改用"在同帧换实例时静默变成空操作。
-        _newest = max((os.path.getmtime(f"{d}/{x}") for x in ("frame.png", "mask.png")
-                       if os.path.exists(f"{d}/{x}")), default=0)
-        if os.path.exists(g) and _newest <= os.path.getmtime(g) + 1:
+        if not os.path.exists(g): return False
+        newest = max((os.path.getmtime(f"{d}/{x}") for x in ("frame.png", "mask.png")
+                      if os.path.exists(f"{d}/{x}")), default=0)
+        return newest <= os.path.getmtime(g) + 1
+
+    todo = []
+    for i, d in enumerate(dirs, 1):
+        n = os.path.basename(d)
+        if _fresh(d):
             print(f"    [{i}/{len(dirs)}] {n} 已有且不过期, 跳过"); continue
-        if os.path.exists(g):
+        if os.path.exists(f"{GEN}/outputs/{n}/{n}.glb"):
             print(f"    [{i}/{len(dirs)}] {n} 抠图比 mesh 新, 重新生成", flush=True)
-        print(f"    [{i}/{len(dirs)}] {n}", flush=True)
-        # run.py 里 inference.py 直接读 os.environ["CONDA_PREFIX"], 没有就 KeyError。
-        # 那个变量只有 conda activate 才会设, 直接调环境里的 python 是没有的。
-        # (这个坑一直潜伏着: 之前每次 gen 都因为"已有, 跳过"没真正调过 run.py。)
-        try:
-            sh(envcmd(PY["sam3d"], f"{GEN}/run.py",
-                      dict(CONDA_PREFIX=os.path.dirname(os.path.dirname(PY["sam3d"])),
-                           # SAM3D 每次启动都去 HuggingFace 拉 DINO 主干, HF 一抽风就 504。
-                           # 权重本地已有缓存, 强制离线即可。这个坑随网络状况时好时坏。
-                           HF_HUB_OFFLINE="1"),
-                      ["--image", f"{d}/frame.png", "--mask", f"{d}/mask.png",
-                       "--out", n, "--hq"]), log, dry, cwd=GEN)
-        except SystemExit as e:
-            # 批量步骤不能一个失败就整批中断: 之前 HF 504 时 beach 卡在第 15 个,
-            # 后面 9 个连试都没试。单个失败记下来继续, 最后统一报。
-            failed.append(n); print(f"       ↑ 这个失败了, 继续下一个 ({e})", flush=True)
-    _gen_report(failed)
+        else:
+            print(f"    [{i}/{len(dirs)}] {n}", flush=True)
+        todo.append(d)
+    if not todo:
+        print("    没有要生成的, 跳过"); return
+
+    # ★ 一批一次交给 run.py, 不再一个物体起一个进程。
+    #   实测(pedestrian r2): 装一遍模型 40 秒, 真正生成一个物体才 30 秒 ——
+    #   一个一个喂的话一半 GPU 时间花在反复装同一个模型上。22 个物体白烧 14 分钟,
+    #   timesquare 召回那 43 个白烧 27 分钟。run.py 本来就支持一次吃一批(模型只装一次),
+    #   它的说明里写着, 只是这里从来没这么调过 —— 日志里每个物体都是 "[1/1]" 就是证据。
+    #   不能改用 --image 传一串: 那些图全叫 frame.png, --image 的输出名取自文件名,
+    #   一批会全写进 outputs/frame/ 互相覆盖。--dirs 按目录名命名, 就是为这个加的。
+    # run.py 里 inference.py 直接读 os.environ["CONDA_PREFIX"], 没有就 KeyError。
+    # 那个变量只有 conda activate 才会设, 直接调环境里的 python 是没有的。
+    print(f"    [批量] {len(todo)} 个一起生成, 模型只装一次", flush=True)
+    try:
+        sh(envcmd(PY["sam3d"], f"{GEN}/run.py",
+                  dict(CONDA_PREFIX=os.path.dirname(os.path.dirname(PY["sam3d"])),
+                       # SAM3D 每次启动都去 HuggingFace 拉 DINO 主干, HF 一抽风就 504。
+                       # 权重本地已有缓存, 强制离线即可。这个坑随网络状况时好时坏。
+                       HF_HUB_OFFLINE="1"),
+                  ["--dirs", *todo, "--hq"]), log, dry, cwd=GEN)
+    except SystemExit as e:
+        # 批量步骤不能一个失败就整批中断: 之前 HF 504 时 beach 卡在第 15 个,
+        # 后面 9 个连试都没试。run.py 内部逐个 try 住了, 这里只是接住它的非零码,
+        # 具体是哪几个失败的, 下面按产物点名 —— 比退出码准。
+        print(f"    [提示] 这一批有失败的 ({e}), 下面按产物点名", flush=True)
+    if dry: return
+    # ★ 按"产物在不在"点名, 不按退出码。退 0 但一个文件没写出来也算失败 ——
+    #   原来一个进程一个物体时靠退出码分得清谁失败, 批量之后这个信息没了, 而且
+    #   查产物本来就比查退出码严。
+    _gen_report([os.path.basename(d) for d in todo if not _fresh(d)])
 
 def is_solo(name):
     """ts_r1_<词>_<实例号> 是某个实例专属的; ts_r1_<词> 是这一类共用的。

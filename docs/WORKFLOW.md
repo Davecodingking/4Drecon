@@ -14,6 +14,47 @@ drive.py --scene <场景> --run <轮次> --reset  回到第一段(只重置进�
 室内走同一份驱动加 `--indoor`,分五段(没有 WildDet3D 对照那一支),
 物体链用的是同一批 `data/outdoor/scripts/` 脚本。
 
+流程图的学术图版本在 [`pipeline_figure.svg`](pipeline_figure.svg),由 `pipeline_figure.py` 生成。
+简化成一行的版本(放论文 / slide 用,只保留要人填的闸 2、闸 4 的完整逻辑)在
+[`pipeline_figure_simple.svg`](pipeline_figure_simple.svg),由 `pipeline_figure_simple.py` 生成。
+**改了流程要连这两张一起改** —— 它们和第一节的 mermaid 图讲的是同一件事。
+
+---
+
+## 零、技术链 —— 为什么是这几个模型、为什么按这个顺序
+
+一句话:**测量定位置,生成补形状,常识定尺寸。**
+没有哪个模型能单独做完这件事,每个只负责它最擅长的一环,它的短板由下一环或人来补。
+
+| 环 | 模型 | 做什么 | 交给下一环的 | 对应步骤 |
+|---|---|---|---|---|
+| 1 | Qwen3-VL | 看几帧,列出画面里有什么 | 词表 | `vlm` |
+| 2 | SAM3 | 按词在整段视频里跟踪,逐帧抠出每个实例 | 每帧的 mask | `track` |
+| 3 | Depth Anything 3 | 每帧深度 + 相机位姿,把 mask 反投影成三维 | 盒子:位置、朝向、相对大小 | `da3` `up` `boxes` |
+| 4 | SAM 3D Objects | 一张抠图生成完整 mesh,看不见的背面一起补 | mesh | `gen` `solo` |
+| 5 | Qwen3-VL | 回答"这类东西现实里一般多高" | 全局尺度 k | `vlm_sizes` `scale` |
+| 6 | WildDet3D | 靠先验在整幅画面再找一遍,捡回 SAM3 漏的 | 补漏的实例 | `detect` `recall` `recall_mask` |
+| 7 | 组装 + 物理 | 按盒子摆回、落地、推开穿模 | 场景 | `assemble` `phys` |
+
+**分工的依据:盒子是量出来的,mesh 是猜出来的。**
+盒子只量得到镜头看得见的那一面,所以偏小(只拍到侧后方的出租车,盒子 3.37 m,真车 4.9 m);
+mesh 是完整的,但它不知道自己该放在哪、该多大。所以三者各管一件,互不越界:
+
+- **mesh 管形状** —— 比例原样保留
+- **盒子管位置和朝向**,外加每类一个统一大小:取生成这个 mesh 的那个实例的盒子高度,只做等比缩放
+  (树这类本来就高矮不一的逐个定)。**不按盒子逐个缩放** —— 那会把车压扁
+- **尺子管绝对尺度** —— 前两者都活在 DA3"以为的米"里,只有常识知道车该多高
+
+**每一环的短板,和谁来补:**
+
+| 短板 | 后果 | 谁来补 |
+|---|---|---|
+| VLM 会列同义词(shop / storefront / restaurant) | 同一个东西抠几遍、生成几遍 | `dedup` 跨词去重,比照片不比三维 |
+| SAM3 漏掉被挡住的、小的 | 场景缺东西 | 第 4 段召回 + 闸 4 |
+| DA3 自称米制,视差小时判错(carpark 小了 6.4 倍) | 整个世界等比缩小,互相自洽,看渲染图发现不了 | `vlm_sizes` + `scale`;一致率不达标就拒绝校准 |
+| VLM 判得了"是不是桌子",判不了"抠得全不全" | 只有桌面没桌腿也拿去生成 | 闸 2 人工审;`verify` 只做第一道筛 |
+| 点云主轴只给轴,不给正反 | 朝向可能差 180° | **还没解** |
+
 ---
 
 ## 一、全貌
@@ -91,12 +132,15 @@ flowchart TD
 
 `环境` 是这一步用哪个 conda env;`GPU` 标记的吃显存,驱动用文件锁串行。
 
+★ 2026-09-10 起 trellis2 环境已删,VLM 三步(`vlm` / `verify` / `vlm_sizes`)改在 sam3d 环境跑
+(往里加装了 transformers 4.57.1)。步骤表里 `trellis2` 这个键还在,但指向 sam3d,见 `outdoor_pipeline.py` 的 `PY`。
+
 ### 第 1 段 · 地基 —— 这三样错了后面全废,而且这一段最便宜
 
 | 步骤 | 环境 | GPU | 干什么 | 产物 |
 |---|---|:-:|---|---|
 | `frames` | — | | 把视频按固定间隔抽成图,文件名补零成 `0000.jpg` | `frames/` |
-| `vlm` | trellis2 | ● | Qwen3-VL 看几帧,列出画面里有哪些东西 | `01_vlm_vocab.json` |
+| `vlm` | sam3d | ● | Qwen3-VL 看几帧,列出画面里有哪些东西 | `01_vlm_vocab.json` |
 | `da3` | spatiallm | ● | 一次算出每帧的深度图和相机位姿(它自称米制,但常常不准) | `02_da3/` |
 | `up` | sam3d | | 从点云主平面拟合出"天"朝哪,后面所有高度都沿它量 | `02_da3/world_up.json` |
 
@@ -108,7 +152,7 @@ flowchart TD
 | `dedup` | sam3d | | 不同的词圈到同一个东西就合并(shop / storefront / restaurant) | `03_dedup_words.json` |
 | `relabel` | sam3d | | 按你的决定把某几个实例从一个词搬到另一个词,mask 不动只换标签 | `03_masks/` |
 | `pick` | sam3d | | 每个词挑最完整的实例、最清楚的一帧,抠出来给生成用 | `04_picks/` |
-| `verify` | trellis2 | ● | 再让 VLM 看一眼抠图里到底是不是那个词,不是就换一张 | `04_picks/vlm_verify.json` |
+| `verify` | sam3d | ● | 再让 VLM 看一眼抠图里到底是不是那个词,不是就换一张。**逐实例生成的候选也逐个验** —— 以前只验每类代表,pedestrian 15 个"人"里 3 个不是人,没有任何机器环节看过 | `04_picks/vlm_verify.json` |
 | `override` | sam3d | | 把你点名的"用这个实例的这一帧"覆盖掉自动挑的 | `my_images/` |
 
 ### 第 3 段 · 尺度 —— 把 DA3 那层"它以为的米"校准成真米
@@ -119,7 +163,7 @@ flowchart TD
 | `ratio` | sam3d | | 量每个 mesh 自己的长宽高比例,后面对齐尺寸要用 | `05_mesh_ratio.json` |
 | `meshes` | sam3d | | 把生成出来的 mesh 排成一张一览图 | `05_meshes.jpg` |
 | `boxes` | sam3d | | mask 沿深度反投影成点云,PCA 出每个实例的三维盒子 | `06_all_boxes.json` |
-| `vlm_sizes` | trellis2 | ● | 问 VLM 每个词现实里大概多高,拿来当尺子 | `01_vlm_sizes.json` |
+| `vlm_sizes` | sam3d | ● | 问 VLM 每个词现实里大概多高,拿来当尺子 | `01_vlm_sizes.json` |
 | `scale` | sam3d | | 尺子 ÷ 量到的高度 = 全局倍数 k,就地乘进深度和相机 | `02_da3/world_scale.json` |
 
 ### 第 4 段 · 召回 —— SAM3 漏掉的东西,换一条路捡回来
@@ -172,9 +216,15 @@ flowchart TD
 
 1. 看**联络图** —— `05_review_sheet.jpg`,每格一个待生成候选,左上角是编号
 2. 看**复用表** —— `05_reuse_table.jpg`,同一个词该不该共用一个 mesh
-3. 在 `05_review.json` 里逐条填 `决定`,还能填 `复用组` / `改类别` / `改用`
+3. 在 `05_review.json` 里逐条填 `决定`,还能填 `复用组` / `改类别` / `改用`;
+   **也可以在决策台网页上点**(见第四节),写的是同一个文件
 4. 再跑一次**不加** `--go` → 两张图按新决定重出,回到第 1 步。不限次
 5. 满意了才 `--go`
+
+> **默认每个实例单独生成**(`SOLO="*"`,2026-09-10 起)。想让一个词共用一个 mesh,标 `shared`,
+> 或写进场景配置的 `SOLO_KEEP`。共用是特例:15 个行人共用一个模型就是满街同一件衬衫。
+> 默认 solo 还有一个好处:候选池一次挑定。旧默认下人在闸口把一个词改成 solo,候选会重挑一批,
+> 而新挑的那批不回闸口就直接去生成了。
 
 ### 闸 3 · 看尺度(只看)
 
@@ -190,12 +240,26 @@ flowchart TD
 **一次出四张图,`recall check` 只是第一张。**
 
 1. 看 **recall check** —— `95_recall_check_2d.jpg`,补抠回来的每个长什么样、和谁重叠
-2. 在 `05_review_afterrecall.json` 里,不要的填 `drop`,其余默认 `keep`
-3. 再跑一次**不加** `--go` → 重出召回后的两张图,回到第 1 步。不限次
-4. 看**召回后的联络图** —— `05_review_sheet_afterrecall.jpg`,召回的排在最后、黄框
-5. 看**召回后的复用表** —— `05_reuse_table_afterrecall.jpg`,并进来之后类内还整不整齐
-6. 顺带看两种出框方式差在哪 —— `92_compare_pca_vs_wd.jpg`
-7. 满意了才 `--go`
+2. 看**召回去向表** —— `14_recall_verdict.json`(决策台里有单独一栏):每个召回候选的结局,
+   进表 / 框太窄 / SAM3 没给 mask / 框对不上 / 抠出来太小,一个不落。
+   没进表的也要看得见 —— 召回专挑主线漏掉的,补抠失败率天生就高
+3. 在 `05_review_afterrecall.json` 里,不要的填 `drop`,其余默认 `keep`
+4. 再跑一次**不加** `--go` → 重出召回后的两张图,回到第 1 步。不限次
+5. 看**召回后的联络图** —— `05_review_sheet_afterrecall.jpg`,召回的排在最后、黄框。
+   只放**真会生成**的召回候选:词被排除的、同词只派一个代表去生成的,不摆给人判
+6. 看**召回后的复用表** —— `05_reuse_table_afterrecall.jpg`,并进来之后类内还整不整齐
+7. 顺带看两种出框方式差在哪 —— `92_compare_pca_vs_wd.jpg`
+8. 满意了才 `--go`
+
+**召回的物体归哪一类**(三条规则,出处是 `tools/review_gate.py` 的"类别继承规则"):
+
+1. 这个词之前有决定 → **继承**(共用的继续共用,单独的继续单独)。人改过这一行就以人为准
+2. 这个词之前没见过 → **默认 solo**,标黄等人判。包括"整个词被去重清空了"的情况 ——
+   不拿"当初和它重叠的那个词"的决定去顶:去重判的是那一个物体,不是说两个词同义
+3. 这个词之前被分过组(`词~1` / `词~2`)→ **硬停**,必须人给它填 `改类别`,指定进哪一组。
+   新来的实例属于哪组要看外观,机器猜错了它会长成别组的样子,而且不报错
+
+召回前那一版(`05_review.json` 和两张不带 `_afterrecall` 的图)原样保留,是回退的依据,见第七节。
 
 ### 闸 5 · 看场景(只看)
 
@@ -214,6 +278,18 @@ flowchart TD
 ## 四、闸口能填什么
 
 写在 `05_review.json`(召回前)或 `05_review_afterrecall.json`(召回后)的每一条候选上。
+
+两种填法,写的是同一个文件:直接改 JSON,或者起**决策台**在网页上点。
+
+```
+~/miniforge3/envs/sam3d/bin/python tools/gate_ui.py --scene <场景> --run <轮次>     # 默认端口 8765
+  --stage pre|post   闸 2 / 闸 4 那份, 不给就取盘上最新的
+  --gate scale       打开时停在闸 3 的尺子表(顶栏可随时切)
+  远程先 ssh -L 8765:localhost:8765 <host>, 本地浏览器开 http://localhost:8765
+```
+
+决策台**只编辑这一个文件**:不写 `05_review_applied.json`(那是 `--apply` 的活,带着一堆校验),
+不起流水线,不碰 GPU。点完保存,回终端敲 `drive.py --go`。
 
 | 字段 | 值 | 意思 | 落到哪 |
 |---|---|---|---|
@@ -306,7 +382,7 @@ relabel → pick → verify → override → gen → ratio → boxes → solo
 
 ## 八、这份文档的事实来源
 
-改流水线之后要同步改这里。每一节的权威位置:
+改流水线之后要同步改这里。最后一次对照代码核对:2026-09-11。每一节的权威位置:
 
 | 这份文档的哪一节 | 去哪核 |
 |---|---|
@@ -318,6 +394,12 @@ relabel → pick → verify → override → gen → ratio → boxes → solo
 | 哪些吃显存 | 同文件的 `GPU_STEPS` |
 | 闸口能填什么 | `tools/review_gate.py` 的 `--apply` 那一段;字段含义见 `data/outdoor/scripts/review_decisions.py` 的模块注释 |
 | 尺度的退出码和文件 | `data/outdoor/scripts/world_scale.py` |
+| 默认 solo、各场景的覆盖 | `pipeline/outdoor_pipeline.py` 的 `CFG` 和各场景配置 |
+| 召回候选归哪一类 | `tools/review_gate.py` 的"类别继承规则"注释 |
+| 召回去向表 | `data/outdoor/scripts/mask_recall.py` 的判词册 |
+| 决策台 | `tools/gate_ui.py` 的模块注释 |
+| 技术链里的数字 | `devLog/devlog_9.8.md` |
+| 学术图版流程图 | `docs/pipeline_figure.py` |
 
 **加一个新步骤要改五处**:`STEPS` / `ARTIFACTS` / `DEPS` / `GPU_STEPS` / `drive.py` 的 `SEGMENTS`。
 漏了第五处不会报错,只会静默不跑 —— 跨词去重就这么漏过一次。
