@@ -190,6 +190,13 @@ if (SERVED && D.页){
   document.querySelector('.eyebrow').textContent = D.页.eyebrow || '';
   const nt = document.getElementById('notice'); if (nt) nt.outerHTML = D.页.notice || '';
 }
+// Served mode: say so when a pipeline product is newer than this data (someone ran the pipeline
+// without drive.py). The next gate refreshes it; or rerun box_fit_view.py by hand.
+if (SERVED){ fetch('/3d/state' + location.search).then(r => r.json()).then(st => {
+  if (st && st.过时) document.querySelector('.eyebrow').insertAdjacentHTML('afterend',
+    '<p class="lede notice"><b>Stale 3D data.</b> <code>' + st.过时 + '</code> is newer than this data. ' +
+    'The next gate refreshes it, or run <code>tools/box_fit_view.py --r1 &lt;run&gt; --out off</code> and reload.</p>');
+}).catch(() => {}); }
 const RAMP = ['#8E44EC','#4F6EF0','#1F9FD0','#1FB5A8','#6CC24A','#C9C22E','#F2A02E','#E8603C'];
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 // Recalled instances have no masks of their own, so there is no spread to judge them by.
