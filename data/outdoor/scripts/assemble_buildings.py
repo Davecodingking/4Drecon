@@ -3,13 +3,13 @@
 和物体走同一条链, 只是每栋各是各的 mesh(每栋楼都独一无二, 不复用)。"""
 import sys, os, json, numpy as np, cv2, trimesh
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from world_frame import load_up, export_T, inverse_T
+from world_frame import load_up, export_T, inverse_T, usable_frames
 from pycocotools import mask as mask_util
 TAG=os.environ.get("TAG","ts_r1")
 R1=os.environ.get("R1","/home/jincheng/sam3d/data/outdoor/result/timesquare/r1")
 DA3=f"{R1}/02_da3"; OUTS=os.environ.get("GEN_OUT", os.path.expanduser("~/sam3d/sam-3d-objects/outputs"))
 cams=json.load(open(f"{DA3}/cameras.json"))["cameras"]
-HAVE={int(f[:4]) for f in os.listdir(f"{DA3}/depth") if f.endswith("_depth.npy")}
+HAVE=usable_frames(DA3, "建筑点云")      # 跳过位姿不可信的帧
 # 天方向以前写死 [0,-1,0], 而物体那条链早就按实际算了 —— 楼和物体拼进同一个 glb 时
 # 物体对、楼歪。现在两边同源。
 UP, _GH, _FB = load_up(DA3, "摆楼")

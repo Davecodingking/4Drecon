@@ -43,7 +43,6 @@ OUTJ = f"{R1}/05_reuse_table{_SFX}.json"
 TILE = int(os.environ.get("REUSE_TILE", "150"))
 MAXN = int(os.environ.get("REUSE_MAXN", "9"))      # 一行最多画几个成员, 多的用数字带过
 
-SOLO_TH  = float(os.environ.get("SOLO_TH", "0.5"))
 SOLO_CFG = os.environ.get("SOLO", "")
 KEEP     = {w.strip() for w in os.environ.get("SOLO_KEEP", "").split(",") if w.strip()}
 EXCL     = {w.strip() for w in os.environ.get("EXCLUDE", "").split(",") if w.strip()}

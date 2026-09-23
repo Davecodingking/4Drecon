@@ -10,7 +10,7 @@
 """
 import sys, os, json, numpy as np, cv2, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from world_frame import load_up, export_T, inverse_T
+from world_frame import load_up, export_T, inverse_T, usable_frames
 R1   = os.environ.get("R1","/home/jincheng/sam3d/data/outdoor/result/timesquare/r1")
 FR   = os.environ.get("FR","/home/jincheng/sam3d/data/outdoor/dataset/timesquare/frames")
 REPO = os.environ.get("WD3","/home/jincheng/sam3d/WildDet3D")
@@ -26,7 +26,7 @@ UP, _GH, _FB   = load_up(DA3, "WD检测")
 
 VOCAB = json.load(open(f"{R1}/01_vlm_vocab.json"))["vocab"]
 cams  = json.load(open(f"{DA3}/cameras.json"))["cameras"]
-FRAMES = sorted(int(f[:4]) for f in os.listdir(f"{DA3}/depth") if f.endswith("_depth.npy"))
+FRAMES = sorted(usable_frames(DA3, "召回检测"))   # 跳过位姿不可信的帧: 检测框要靠位姿抬进 3D
 FRAMES = FRAMES[::STRIDE]
 if LIMIT: FRAMES = FRAMES[:LIMIT]
 

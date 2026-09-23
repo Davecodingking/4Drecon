@@ -44,6 +44,14 @@ scripts/ 里有 6 个文件不在这条链上, 别照着它们改:
 """
 import os, sys, json, time, glob, argparse, subprocess, shlex
 
+# ★ 驱动层的公共件搬到 _common.py 了(见那个文件的文件头): GPU 锁、跑命令、配置解析、
+#   计时、帧号映射。留在本文件里的是室外真正独有的部分。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _common as _cm          # 设 CUR_STEP 用 —— 必须改模块上的属性, from-import 进来的是副本
+from _common import (LOCK, GpuLock, wait_gpu, sh, envcmd, stamp_path,
+                     timing as _timing, resolve_cfg as _resolve_cfg,
+                     write_frame_map, load_frame_map)
+
 HOME   = os.path.expanduser("~")
 SAM3D  = f"{HOME}/sam3d"
 SCRIPTS= f"{SAM3D}/data/outdoor/scripts"
@@ -72,8 +80,12 @@ PY = {
     "spatiallm": f"{HOME}/miniforge3/envs/spatiallm/bin/python",
     # WildDet3D 走 vis4d, 钉 pydantic<2 + numpy<2, 塞进上面任何一个都会打架, 必须独立
     "wilddet":   f"{HOME}/miniforge3/envs/wilddet/bin/python",
+    # VGGT-Ω 几何后端(GEOM != da3 时用), 环境和权重都在 nvme 上。它内部还会调
+    # /mnt/nvme/jincheng/envs/metricdepth 跑 Metric3D 定尺度, 那个路径写在脚本里
+    "vggt_omega": "/mnt/nvme/jincheng/envs/vggt_omega/bin/python",
 }
 WD3REPO = f"{SAM3D}/WildDet3D"
+VGGT_GEOM = f"{SAM3D}/vggt-omega/tools/vggt_omega_geom.py"
 
 # ------------------------------------------------------------------ 参数
 # 这些值都是调出来的, 改之前先看注释里写的"为什么是这个数"。
@@ -81,7 +93,30 @@ CFG = dict(
     NFR         = "8",      # VLM 扫几帧列词表。用户明确要求先用 8 帧
     MAX_FRAMES  = "180",    # DA3 用多少帧。深度帧越多, 每个实例可用的帧越多
     PROCESS_RES = "504",    # DA3 处理分辨率, 出来的深度图是 280x504
+    GEOM        = "vggt_l", # 位姿+深度用哪个后端(da3 这一步), 产物格式完全一样, 下游不用改:
+                            #   da3      Depth Anything 3 Nested(一直在用的)
+                            #   vggt_l   VGGT-Ω + Metric3D v2 Large 定米制尺度(ithor312 尺度误差 0.6%)
+                            #   vggt_g2  VGGT-Ω + Metric3D v2 Giant2(2.2%), 和 vggt_l 互为对照
+                            # 为什么试 VGGT-Ω: ithor312 上位姿最差一帧 3.1° vs DA3 36.3°(devlog_9.16 第 9、10 节)。
+                            # ★ 09-17 起默认 vggt_l。pedestrian 实测(对照 DA3 r2): 位姿朝向差 0.5°、位置差 2cm,
+                            #   两边都 0 坏帧; 尺度比常识尺寸小 18%(DA3 原始小 25%), world_scale 那步照常再校;
+                            #   显存峰值 21GB(DA3 24.8GB)。Large 和 Giant2 室外只差 1%, 取更快更省的 Large。
+                            #   要回到老结果: GEOM=da3 python outdoor_pipeline.py ...
+                            # ★ 置信度被换算成 DA3 刻度(vggt-omega/tools/build_conf_ref.py), CONF_MIN 可照用,
+                            #   但没按 VGGT-Ω 重新调过; PROCESS_RES 对它无效(固定 512)。
+    FX          = "",       # 已知焦距(原图宽度下的像素值); 空 = 让模型自己估。
+                            # ★ 只在 GEOM != da3 时起作用。VGGT-Ω 自己不收内参, 但它后面的
+                            #   Metric3D 是靠焦距把深度换成米的(深度 x fx x 系数), 焦距偏 10%
+                            #   整个场景就一起大/小 10% —— 这把尺子完全架在这个数上。不填就用
+                            #   VGGT-Ω 估的, 而 VGGT-Ω 本来就不做米制。
+                            # ★ 现在兜得住不代表没事: 后面 world_scale 会按物体常识尺寸再校一次
+                            #   (pedestrian 实测 k=1.21, 即 Metric3D 这轮给小了 21%), 但那要求
+                            #   画面里有认得出的参照物。空路 + 楼这种没尺子的场景就兜不住, 错到底。
+                            # ★ 室内 CFG 一直有这一项, 室外没有, 09-20 补齐。UE 那种已知镜头
+                            #   可以直接填(7mm/23.76 -> 565.66)。
     MIN_FRAMES  = "2",      # 挑生成样本的下限, 只防单帧误检
+    BAKE_WORKERS = "2",     # 生成 mesh 时另开几个进程烘焙贴图(run.py --bake-workers); 0 = 不拆。
+                            # 32G 卡实测(8 个物体): 0 -> 257s, 2 -> 165s, 3 -> 180s 且有一个显存不够要重烘
     MIN_AREA_PCT= "0.05",   # 候选实例的最小面积占比(%)
     TOPK        = "8",      # VLM 每类最多验几个候选
     MIN_POINTS  = "300",    # 盒子门槛: 反投影合并后点数。首轮用"活够8帧"是错的 ——
@@ -112,8 +147,10 @@ CFG = dict(
                             #   默认就是 "*" 的话候选池一次挑定, 不再重建, 人一次看全。
                             #   要共用的词写进 SOLO_KEEP。
     SOLO_KEEP   = "",       # 白名单: 这些类可以合并, 全类共用一个 mesh
-    SOLO_TH     = "0.5",    # 逐实例生成的面积下限(%), 太小生成必是垃圾
-                            # 俯视场景要大幅降低, 见 beach/carpark 的 per-scene 覆盖
+    SOLO_MIN_PX = "256",    # 逐实例生成的面积下限(像素): 挑中那帧里实例少于这么多像素就不单独生成。
+                            # 按像素不按画面百分比, 换分辨率不用再调; 为什么是 256 见 solo_gate.py。
+                            # ★ 2026-09-16 以前是 SOLO_TH="0.5"(%), 在 1280x720 的时代广场上调的,
+                            #   到 1920x1080 的 pedestrian 等于严了 2.25 倍, beach/carpark 只好各覆盖 0.03。
     PER_INSTANCE= "tree",   # 这些类不做类内统一尺度(树高矮差太多, 统一了全变矮)
     EXCLUDE     = "sign,billboard,pedestrian,manhole cover,bollard,awning,building",
                             # 排除: 前四个是贴在墙上/地上的平面, 当独立物体摆必然出错;
@@ -207,13 +244,12 @@ SCENES = {
                        # 点数门槛跟着降, 因为可用像素虽多但深度本身更糙。
                        CONF_MIN="1.0", MIN_POINTS="150",
                        # 用户要求"直接全跑实例"。俯视素材物体极小: chair 0.14%、
-                       # trash can 0.08%、bollard 0.05% 都已经是各自类里最大的那个,
-                       # 沿用 0.5% 等于 SOLO 根本不触发, 最后还是全类共用一个 mesh。
-                       # 降到 0.03% 覆盖绝大多数; 再往下生成出来必是垃圾, 留作下限。
-                       SOLO_TH="0.03",
+                       # trash can 0.08%、bollard 0.05% 都已经是各自类里最大的那个。
+                       # 以前在这里覆盖 SOLO_TH="0.03"(= 622 像素); 门槛改成像素之后默认 256 已经
+                       # 比它宽, 覆盖删掉了(2026-09-16)。
                        EXCLUDE="sign,billboard,awning,manhole cover,bollard,fence,railing,person,stair,building"),
     "carpark":    dict(MAX_FRAMES="132", MIN_AREA_PCT="0.02", SOLO="*", SOLO_KEEP="van",
-                       SOLO_TH="0.03",   # 同 beach: 俯视物体小, 0.5% 等于不触发
+                       # 以前覆盖 SOLO_TH="0.03", 同 beach, 门槛改像素后删掉
                        EXCLUDE="sign,billboard,awning,manhole cover,bollard,fence,fence post,scaffolding"),
 }
 # 生效顺序: CFG 默认值 <- 场景覆盖 <- 环境变量 (环境变量最大, 方便临时试一个值)
@@ -222,16 +258,9 @@ _spec = _ilu.spec_from_file_location("review_decisions", f"{SCRIPTS}/review_deci
 review = _ilu.module_from_spec(_spec); _spec.loader.exec_module(review)
 
 def resolve_cfg(scene, R1=None):
-    """生效顺序: CFG 默认值 <- 场景覆盖 <- 人工闸决策 <- 环境变量。
+    """本文件的 CFG/SCENES/闸决策接到共用实现上。生效顺序和为什么是这个顺序, 见 _common.py。"""
+    return _resolve_cfg(CFG, SCENES, scene, R1, review)
 
-    人工闸排在环境变量之前 —— 临时敲一个环境变量试值, 应该压得过闸的决定;
-    但闸的决定要压得过写死在 SCENES 里的默认, 否则人在闸口做的判断永远轮不上。"""
-    cfg = dict(CFG)
-    cfg.update(SCENES.get(scene, {}))
-    if R1:
-        review.apply_to_cfg(cfg, R1)
-    cfg.update({k: v for k, v in os.environ.items() if k in CFG})
-    return cfg
 
 # 生成样本的人工指定: VLM 验图只保证"是不是这个词", 不保证"抠得全不全"。
 # table 自动选中的候选只有一块光桌面没有腿, 用户看了候选图后指定第 6 个(实例8/第32帧),
@@ -256,48 +285,6 @@ class Ctx:
         self.R1  = f"{SAM3D}/data/outdoor/result/{scene}/{run}"
         self.LOG = f"{self.R1}/logs"
         self.cfg = resolve_cfg(scene, self.R1)   # R1 要先算出来: 人工闸的决策文件在它下面
-
-LOCK = "/tmp/outdoor_pipeline_gpu.lock"
-
-class GpuLock:
-    """吃显存的步骤串行执行。不是调参数能解决的问题: 单份 SAM3D 驻留 20GB 出头,
-    32G 卡装不下两份。之前 beach 和 carpark 并行跑 gen, 两边同时被 CUDA OOM 杀掉,
-    而且日志一停就再没有新内容, 靠"看日志有没有更新"的监控反而永远静默。"""
-    def __enter__(self):
-        import fcntl
-        self.f = open(LOCK, "w")
-        try:
-            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            print("    [等待] 另一个场景正在占用 GPU, 排队中...", flush=True)
-            fcntl.flock(self.f, fcntl.LOCK_EX)
-        return self
-    def __exit__(self, *a):
-        import fcntl
-        fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
-
-def stamp_path(c, key): return f"{c.LOG}/.stamp_{key}"
-
-def sh(cmd, log=None, dry=False, cwd=None, sep=None):
-    line = cmd if isinstance(cmd, str) else " ".join(shlex.quote(c) for c in cmd)
-    print(f"    $ {line}" + (f"   > {os.path.basename(log)}" if log else ""), flush=True)
-    if dry: return 0
-    if log:
-        os.makedirs(os.path.dirname(log), exist_ok=True)
-        if sep:                                   # 每次跑打一条带时间的分隔线
-            with open(log, "a") as f: f.write(sep)
-    with (open(log, "a") if log else open(os.devnull, "w")) as f:
-        out = f if log else None
-        r = subprocess.run(cmd, shell=isinstance(cmd, str), cwd=cwd,
-                           stdout=out or None, stderr=subprocess.STDOUT if out else None)
-    if r.returncode: raise SystemExit(f"[失败] 退出码 {r.returncode}: {line}")
-    return r.returncode
-
-def envcmd(py, script, env, args=()):
-    """把环境变量写在命令行前面, 这样 --dry-run 打印出来的就是能直接粘去跑的命令"""
-    pre = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items())
-    return f"{pre} {shlex.quote(py)} {shlex.quote(script)} " + " ".join(map(shlex.quote, args))
-
 
 # ------------------------------------------------------------------ 各步骤
 def s_frames(c, dry):
@@ -328,11 +315,37 @@ def s_vlm(c, dry):
 
 def s_da3(c, dry):
     """Depth Anything 3 出米制深度 + 相机位姿。只有 spatiallm 环境装了它。
-    世界系 = 第一帧的相机系, OpenCV 约定(y 朝下), 所以后面所有脚本里 UP = [0,-1,0]。"""
+    世界系 = 第一帧的相机系, OpenCV 约定(y 朝下), 所以后面所有脚本里 UP = [0,-1,0]。
+    GEOM 不是 da3 时换成 VGGT-Ω 后端(见 CFG 里 GEOM 的注释), 输出目录和格式不变。
+    室外要开天空分割: DA3 自带天空头, VGGT-Ω 没有, 不遮的话天空会变成一层假的"远处的墙"。"""
+    if c.cfg["GEOM"] != "da3":
+        scale = {"vggt_l": "metric3d_l", "vggt_g2": "metric3d_g2"}[c.cfg["GEOM"]]
+        cmd = [PY["vggt_omega"], VGGT_GEOM, "--images", c.FR, "--out", f"{c.R1}/02_da3",
+               "--max-frames", c.cfg["MAX_FRAMES"], "--scale", scale]
+        # 焦距交给 Metric3D 定尺度用, 见 CFG 里 FX 的注释。VGGT-Ω 本身不收内参, 所以不传给它。
+        if c.cfg["FX"]:
+            cmd += ["--fx", c.cfg["FX"]]
+        else:
+            print("    [提示] 没给 FX, 米制尺度建立在 VGGT-Ω 估的焦距上, 只能靠后面 world_scale "
+                  "按常识尺寸兜; 画面里没有认得出的参照物时这一兜会落空", flush=True)
+        # PROCESS_RES 这一轮是死的: VGGT-Ω 固定 512。人调了却不生效最容易白白浪费一轮, 所以要说一声。
+        if c.cfg["PROCESS_RES"] != CFG["PROCESS_RES"]:
+            print(f"    [提示] PROCESS_RES={c.cfg['PROCESS_RES']} 这一轮不生效: "
+                  f"VGGT-Ω 分辨率固定 512(只有 GEOM=da3 才读这个值)", flush=True)
+        sh(cmd, f"{c.LOG}/02_da3.log", dry)
+        _frame_map(c, dry); return
     sh(f'{shlex.quote(PY["spatiallm"])} {shlex.quote(f"{DA3REPO}/da3_to_ply.py")} '
        f'--images {shlex.quote(c.FR)} --out {shlex.quote(f"{c.R1}/02_da3")} '
        f'--max-frames {c.cfg["MAX_FRAMES"]} --process-res {c.cfg["PROCESS_RES"]} --use-ray-pose',
        f"{c.LOG}/02_da3.log", dry)
+    _frame_map(c, dry)
+
+def _frame_map(c, dry):
+    """在 cameras.json 旁边写一份"帧 -> 原视频帧号 + fps"。两条链同一个路径、同一份格式,
+    下游一律查它, 谁也不准自己从键名解析。为什么需要它见 _common.py 里 FRAME_MAP 那段。
+    室外的帧是逐帧抽的, 键本来就是原帧号, 所以这里落下来是恒等映射 —— 但**照样要写**,
+    下游才不用管自己面对的是哪条链。"""
+    write_frame_map(f"{c.R1}/02_da3", c.FR, c.VID, dry)
 
 def s_up(c, dry):
     """定出场景真正的"天"。老代码写死"首帧相机的 -y 就是天", 街头平视成立(时代广场偏
@@ -469,7 +482,7 @@ def s_pick(c, dry):
                    # 挑图这步靠它们判断"这个词会不会走逐实例", 走的话就不写类目录
                    # (不然同一张 mask 被写两遍, 生成两个一样的 mesh)。两边判据一旦不一致,
                    # 会出现两边都以为对方会写 -> 那个词整个从场景里消失。
-                   SOLO=c.cfg["SOLO"], SOLO_KEEP=c.cfg["SOLO_KEEP"], SOLO_TH=c.cfg["SOLO_TH"],
+                   SOLO=c.cfg["SOLO"], SOLO_KEEP=c.cfg["SOLO_KEEP"], SOLO_MIN_PX=c.cfg["SOLO_MIN_PX"],
                    )), f"{c.LOG}/04_pick.log", dry)
 
 def s_verify(c, dry):
@@ -478,7 +491,13 @@ def s_verify(c, dry):
     从不校验内容 —— 测量交给几何, 判断交给 VLM。
     提问要放宽("可能只是物体的一部分/可能糊"), 严格问法会把正常抠图也否掉。"""
     sh(envcmd(PY["trellis2"], f"{SCRIPTS}/verify_picks.py",
-              dict(R1=c.R1, FR=c.FR, TAG=c.tag, TOPK=c.cfg["TOPK"], MIN_AREA_PCT=c.cfg["MIN_AREA_PCT"])),
+              dict(R1=c.R1, FR=c.FR, TAG=c.tag, TOPK=c.cfg["TOPK"], MIN_AREA_PCT=c.cfg["MIN_AREA_PCT"],
+                   # 整类样本的候选规则和 s_pick 同一份(class_sample.py), 帧数下限也得同一个值
+                   MIN_FRAMES=c.cfg["MIN_FRAMES"],
+                   # ★ 不传 SOLO 的话 verify_picks 的逐实例校验整段跳过(它靠 SOLO 知道要验谁),
+                   #   以前只有 shell 里碰巧 export 了 SOLO 才会跑。和 s_pick / s_solo 传同一套。
+                   SOLO=c.cfg["SOLO"], SOLO_KEEP=c.cfg["SOLO_KEEP"], EXCLUDE=_gen_excl(c),
+                   SOLO_MIN_PX=c.cfg["SOLO_MIN_PX"])),
        f"{c.LOG}/07_verify.log", dry)
 
 def _overrides(c):
@@ -589,7 +608,7 @@ def _gen(c, dirs, log, dry):
                        # SAM3D 每次启动都去 HuggingFace 拉 DINO 主干, HF 一抽风就 504。
                        # 权重本地已有缓存, 强制离线即可。这个坑随网络状况时好时坏。
                        HF_HUB_OFFLINE="1"),
-                  ["--dirs", *todo, "--hq"]), log, dry, cwd=GEN)
+                  ["--dirs", *todo, "--hq", "--bake-workers", c.cfg["BAKE_WORKERS"]]), log, dry, cwd=GEN)
     except SystemExit as e:
         # 批量步骤不能一个失败就整批中断: 之前 HF 504 时 beach 卡在第 15 个,
         # 后面 9 个连试都没试。run.py 内部逐个 try 住了, 这里只是接住它的非零码,
@@ -703,11 +722,11 @@ def s_scale(c, dry):
 
 def s_solo(c, dry):
     """SOLO 里的类逐实例各生成一个 mesh。街上的车型号各不相同, 复用一个 mesh
-    会变成满街同款。太小的实例(<SOLO_TH%)不单独生成 —— 那么小生成出来必是垃圾, 继续复用。
+    会变成满街同款。太小的实例(< SOLO_MIN_PX 像素)不单独生成 —— 那么小生成出来必是垃圾, 继续复用。
     注意: gen_per_instance.py 里的 R1/FR 是写死的, 换场景要改那个文件。"""
     sh(envcmd(PY["sam3d"], f"{SCRIPTS}/gen_per_instance.py",
               dict(R1=c.R1, FR=c.FR, TAG=c.tag, EXCLUDE=_gen_excl(c),
-                   SOLO=c.cfg["SOLO"], SOLO_KEEP=c.cfg["SOLO_KEEP"], TH=c.cfg["SOLO_TH"])),
+                   SOLO=c.cfg["SOLO"], SOLO_KEEP=c.cfg["SOLO_KEEP"], SOLO_MIN_PX=c.cfg["SOLO_MIN_PX"])),
        f"{c.LOG}/06_solo_pick.log", dry)
     jobs = f"{c.LOG}/solo_jobs.txt"
     names = open(jobs).read().split() if os.path.exists(jobs) else []
@@ -1112,7 +1131,10 @@ def main():
     keys = [s[0] for s in STEPS]
     if g.dump_cfg:
         _c = Ctx(g.scene, g.run)
-        print(_c.tag if g.tag_only else json.dumps(_c.cfg, ensure_ascii=False))
+        # 源码里写死的换候选(PICK_OVERRIDE_BY_SCENE)也吐出去: s_override 每次都会套它,
+        # 闸口不知道的话, 界面上说"自动挑的是 #3", 实际用的却是这张表里的那张。
+        _dump = dict(_c.cfg, 配置指定样本={w: list(v) for w, v in PICK_OVERRIDE_BY_SCENE.get(g.scene, {}).items()})
+        print(_c.tag if g.tag_only else json.dumps(_dump, ensure_ascii=False))
         return
     if g.list:
         print(f"步骤 (默认跑到 {DEFAULT_END} 为止; buildings/merge 不在任何分段里, 要显式 --only):\n")
@@ -1142,15 +1164,22 @@ def main():
         t = time.time()
         for lg in glob.glob(f"{c.LOG}/*.log"): pass
         c._sep = f"\n{'='*70}\n== {k}  {time.strftime('%F %T')}\n{'='*70}\n"
+        _cm.CUR_STEP = k               # sh() 靠它往步骤日志打 "== <步骤> <时间戳>" 分隔线
         print(f"== {k}  [{e}]  {d}", flush=True)
         _o = globals()["sh"]
         globals()["sh"] = lambda *a, **kw: _o(*a, **{**kw, "sep": kw.get("sep", c._sep)})
+        t_run, ok = t, "失败"
         try:
             if k in GPU_STEPS and not g.dry_run:
-                with GpuLock(): fn(c, g.dry_run)
+                with GpuLock():
+                    t_run = time.time()          # 等 GPU 锁的时间单独记, 不算进这一步的耗时
+                    fn(c, g.dry_run)
             else:
                 fn(c, g.dry_run)
-        finally: globals()["sh"] = _o
+            ok = "ok"
+        finally:
+            globals()["sh"] = _o
+            if not g.dry_run: _timing(c, k, e, t, t_run, ok)
         if not g.dry_run: open(stamp_path(c, k), "w").write(time.strftime("%F %T"))
         print(f"   {time.time()-t:.1f}s\n", flush=True)
     print("[全部完成]")

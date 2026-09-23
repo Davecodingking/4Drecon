@@ -108,3 +108,36 @@ if __name__ == "__main__":
     assert np.allclose(inverse_T(UP)[:3, :3] @ R, np.eye(3), atol=1e-9), "inverse_T 不是 export_R 的逆"
     assert np.allclose(np.linalg.det(R), 1.0, atol=1e-9), "export_R 不是纯旋转"
     print("[自检通过] export_R 把天转到 +Y, inverse_T 是它的逆, 行列式为 1")
+
+
+# ---------------------------------------------------------------- 可用帧
+# ★ DA3 有时会把个别帧的位姿估错(ithor312: 11 帧偏 10–36°), 深度却是准的 —— 这种帧的像素
+#   放进 3D 会落在错的位置: 重影墙、斜墙、盒子拉长、定天不稳。da3_to_ply.py 推理完用
+#   pose_check.py 把它们挑出来写进 bad_frames.json; 凡是"把像素放进 3D"的步骤
+#   (定天 / 量盒子 / 召回检测 / 建筑点云)都从这里拿帧, 不要自己 listdir。
+#   只挑图、只看 2D 的步骤(pick / verify)不用管 —— 位姿错不影响抠图本身。
+def depth_frames(da3):
+    """有深度文件的帧号(int)。"""
+    return {int(f[:4]) for f in os.listdir(os.path.join(da3, "depth")) if f.endswith("_depth.npy")}
+
+
+def bad_frames(da3, who=None):
+    """位姿不可信的帧号(int)。没有 bad_frames.json = 这一轮 DA3 没做过筛选, 当作一帧都不跳,
+    但要说一声 —— 否则"没筛"和"筛了没有坏帧"看起来一模一样。"""
+    p = os.path.join(da3, "bad_frames.json")
+    tag = f"[坏位姿]{' ' + who if who else ''}"
+    if not os.path.exists(p):
+        print(f"{tag}: 没有 {p} —— 这一轮 DA3 没做坏帧筛选, 全部帧都用。"
+              f"补一份: python pose_check.py {da3} --write", flush=True)
+        return set()
+    with open(p) as f:
+        d = json.load(f)
+    bad = {int(os.path.splitext(x)[0]) for x in d.get("坏帧", [])}
+    if bad:
+        print(f"{tag}: 跳过 {len(bad)} 帧位姿不可信的帧 {sorted(bad)}", flush=True)
+    return bad
+
+
+def usable_frames(da3, who=None):
+    """有深度、位姿也可信的帧号(int)。"""
+    return depth_frames(da3) - bad_frames(da3, who)

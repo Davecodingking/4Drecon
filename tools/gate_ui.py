@@ -33,16 +33,39 @@ cutout_rgb() 是 tools/review_gate.py 里 cutout() 的逐行搬运(灰底 210 / 
   $PY tools/gate_ui.py --scene cyberpunk --indoor
   远程: ssh -L 8765:localhost:8765 <host>, 然后本地浏览器开 http://localhost:8765
 """
-import os, sys, json, argparse, urllib.parse, threading
+import os, sys, json, time, argparse, urllib.parse, threading
 from collections import OrderedDict
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 import numpy as np, cv2
+
+
+def _is_empty(v):
+    """"这个字段算没填吗"。
+
+    ★ 不能写 `v in (None, "", [], False)` —— Python 里 `0 == False`, 于是 `0 in (..., False)`
+      是 True, 值为 0 的字段会被悄悄丢掉。实测 office r1 因此崩过: 界面追加的三行
+      (computer_monitor_0 / desk_chair_0 / door_0) 全是**实例 0**, 写盘时 实例 字段没了,
+      下一轮 review_gate 在 `_wmap[...] = (r["词"], r["实例"])` 上 KeyError, 决策落不了地。
+      判空必须按类型判, 不能靠真值。
+
+    False 仍然算"没填": 只有 VLM放行 这类开关字段是布尔, 它的 False 本来就表示没勾。
+    """
+    return (v is None or v is False
+            or (isinstance(v, (str, list, dict, tuple)) and len(v) == 0))
 from pycocotools import mask as mask_util
 
 HOME  = os.path.expanduser("~")
 SAM3D = f"{HOME}/sam3d"
 MYIMG = f"{SAM3D}/sam-3d-objects/my_images"
+GEN_OUT = f"{SAM3D}/sam-3d-objects/outputs"     # assemble_scene.py 的 OUTS, 生成好的 glb 在这
+# 组装的绝对尺寸守卫, 抄 assemble_scene.py:28-29(流水线不传, 用的就是这两个默认值)。
+# 界面只拿它预告"这个会被组装扔掉", 不参与写入。
+ASM_MIN_H = float(os.environ.get("MIN_H", "0.15"))
+ASM_MAX_D = float(os.environ.get("MAX_D", "15"))
+sys.path.insert(0, f"{SAM3D}/data/outdoor/scripts")
+from solo_gate import DEFAULT_MIN_PX          # noqa: E402  逐实例门槛(像素)的唯一定义
+import class_sample                            # noqa: E402  整类样本候选规则的唯一定义
 
 # 决定的五种取值 + 颜色。★ 和 review_gate.py 的 BORDER 表同源(那边是 BGR, 这里是 CSS)。
 DECISIONS = ["keep", "drop", "drop-word", "solo", "shared"]
@@ -85,12 +108,10 @@ def cutout_rgb(img, m, size):
 class Store:
     """管一个场景一轮次的全部读写。所有磁盘访问都走这里, handler 只做 HTTP。"""
 
-    def __init__(self, scene, run, indoor=False, stage=None, solo_th=None):
+    def __init__(self, scene, run, indoor=False, stage=None, solo_min_px=None):
         self.scene, self.run, self.indoor = scene, run, indoor
-        # 逐实例生成的面积下限(%)。只用来在面板上标"这个实例低于门槛, 不会被逐实例枚举",
-        # 不参与任何写入。默认取 pipeline CFG 的默认值; 场景覆盖了的话由 --solo-th 传进来。
-        self.solo_th = float(solo_th if solo_th is not None
-                             else os.environ.get("SOLO_TH", "0.5"))
+        self.solo_min_px_arg = solo_min_px      # 换轮次时照原样传给新的 Store
+        self._solo_min_px = solo_min_px   # 逐实例门槛(像素), None = 问 pipeline, 见 solo_min_px()
         if indoor:
             self.R1 = f"{SAM3D}/data/indoorOutput/{scene}/{run}"
             self.FR = self._indoor_frames()
@@ -102,14 +123,13 @@ class Store:
         # ★ 显式 > 猜。review_gate.py 的注释记着这个坑: 靠"盘上有没有 14_recall_ready.json"
         #   猜阶段, 会在重跑「生成前」那一段时把召回后的结果覆盖掉。这里默认取**已存在的
         #   最新那份**, 并且把读的是哪个文件明明白白显示在页面顶栏上, 让人自己看得见。
-        self.stage = stage or ("post" if os.path.exists(f"{self.R1}/05_review_afterrecall.json")
-                               else "pre")
-        sfx = "_afterrecall" if self.stage == "post" else ""
-        self.DEC = f"{self.R1}/05_review{sfx}.json"
-        self._mk = {}                 # word -> (meta, counts, H, W)  npz 解出来就缓存
-        self._insts = {}              # word -> [实例元]  按词缓存, 一轮之内 npz 不会变
+        self.stage_arg = stage          # 人显式指定的(--stage), 有就一直听它的
+        self.refresh_stage()
+        self._mk = {}                 # word -> (npz mtime, (meta, counts, H, W))  npz 变了就重读
+        self._insts = {}              # (word, 门槛, 源文件 mtime...) -> [实例元]
         self._dedup = None            # 03_dedup_words.json 的 淘汰实例, 懒加载
         self._vrej = None             # 04_picks/vlm_verify_inst.json 的 否决, 懒加载
+        self._disk_samples = None     # 04_picks/picks.json, 懒加载
         # 帧 LRU: 展开一个类要抠 15 张图, 常常是 15 个不同的帧, 瓶颈是 cv2.imread 一张
         # 1080p JPEG。命中之后一张缩略图只剩 decode+resize。1080p BGR 约 6MB/张,
         # 24 张 ≈ 150MB。★ 必须加锁 —— ThreadingHTTPServer 是多线程的。
@@ -141,6 +161,85 @@ class Store:
         except Exception:
             self._cfg = {}
         return self._cfg
+
+    def refresh_stage(self):
+        """现在是闸 2 还是闸 4, 每次请求都按盘上的文件重判一次。
+
+        ★ 为什么不能只在启服务时判一次: 服务常常是在闸 2 打开的, 人审完往下跑, 召回那段跑完
+          盘上才出现 05_review_afterrecall.json。定死的话页面刷新多少次都还是闸 2 那份候选,
+          而且它是**静默**的 —— 人以为自己在审召回后的结果, 其实在审召回前的。实测踩过。
+        """
+        self.stage = self.stage_arg or ("post" if os.path.exists(f"{self.R1}/05_review_afterrecall.json")
+                                        else "pre")
+        sfx = "_afterrecall" if self.stage == "post" else ""
+        self.DEC = f"{self.R1}/05_review{sfx}.json"
+
+    def solo_min_px(self):
+        """逐实例生成的面积门槛(像素)。只用来在面板上标"低于门槛, 不会单独生成", 不参与写入。
+        ★ 问 pipeline 要, 不自己抄 —— 以前这里读 SOLO_TH 环境变量、没有就用 0.5,
+          而 beach/carpark 在 pipeline 里配的是 0.03, 界面不带参数启动就标错一大片。"""
+        if self._solo_min_px is None:
+            self._solo_min_px = int(self.pipeline_cfg().get("SOLO_MIN_PX", DEFAULT_MIN_PX))
+        return self._solo_min_px
+
+    def boxes(self):
+        """组装会读的那份盒子: {词: {实例号: 尺寸}}, 以及文件名。还没量过盒子就是 (None, None)。
+        选哪份照抄 outdoor_pipeline._boxes_arg: 合并版在且不比基础版旧就用合并版。"""
+        m, b = f"{self.R1}/06_all_boxes_merged.json", f"{self.R1}/06_all_boxes.json"
+        p = m if (os.path.exists(m) and not (os.path.exists(b)
+                                             and os.path.getmtime(m) < os.path.getmtime(b))) else b
+        if not os.path.exists(p):
+            return None, None
+        with open(p) as f:
+            d = json.load(f)
+        return ({w: {int(x["obj_id"]): x["尺寸"] for x in v} for w, v in d.items()},
+                os.path.basename(p))
+
+    def disk_samples(self):
+        """盘上每个共用词**实际在用**的样本: picks.json(挑图 + VLM 复核 + 人工指定之后的结果)。
+
+        ★ 前端不能拿"挑图分最高"当成"机器选的": verify_picks 会让 VLM 在前几名里重选
+          (timesquare r1 的 bollard/planter/traffic light 都不是第一名), 源码表还会强行指定(table)。
+          盘上是谁就是谁; 只有人改了会影响挑图的决定(排除 与 挑的时候不同)时, 才轮到前端去预告。
+        """
+        p = f"{self.R1}/04_picks/picks.json"
+        def parse(d):
+            return {w: dict(oid=int(v["obj_id"]), fr=int(v["frame"]),
+                            排除=v.get(class_sample.BANNED_KEY), 人工=bool(v.get("人工指定")))
+                    for w, v in d.items() if isinstance(v, dict) and "obj_id" in v and "frame" in v}
+        return self._json_by_mtime("_disk_samples", p, parse) or {}
+
+    def mesh_facts(self, words):
+        """每个词"组装时会拿哪个 mesh"要用到的盘上事实。规则本身在前端(选网格), 因为它要跟着
+        人没保存的点选实时变; 这里只给前端自己看不到的东西。
+
+        ★ 为什么要有: 以前一个实例没过逐实例门槛 / 被 VLM 否掉, 组装会按名字排序借同词第一个
+          mesh(assemble_scene.pick_mesh), 界面上只有一行灰字 "below solo threshold",
+          不说后果 —— pedestrian r2 的 car #2/#6/#10 全借了 car_0, 场景里 4 辆一模一样的车,
+          人在闸口完全看不出来。
+        """
+        tag = self.tag or ""
+        try:
+            avail = {d for d in os.listdir(GEN_OUT)
+                     if d.startswith(tag + "_") and os.path.exists(f"{GEN_OUT}/{d}/{d}.glb")}
+        except OSError:
+            avail = set()
+        bx, bname = self.boxes()
+        out = {}
+        for w in words:
+            base = f"{tag}_{w.replace(' ', '_')}"
+            mine = sorted(int(d[len(base) + 1:]) for d in avail
+                          if d.startswith(base + "_") and d[len(base) + 1:].isdigit())
+            ins = self.insts(w, self.solo_min_px())
+            out[w] = dict(
+                类网格=base in avail,
+                盘上实例=mine,
+                盒子=None if bx is None else {str(o): e for o, e in (bx.get(w) or {}).items()},
+                实例=[dict(oid=r["oid"], 低于门槛=r["低于门槛"], VLM否决=r["VLM否决"],
+                          去重淘汰=r["去重淘汰"], 挑图分=r["挑图分"], 挑图帧=r["挑图帧"])
+                      for r in ins],
+            )
+        return out, bname
 
     def solo_words(self):
         """(SOLO 原样, SOLO_KEEP 集合) —— 判"这个词不点的话默认逐个造还是共用"。"""
@@ -207,8 +306,8 @@ class Store:
                 r["决定"] = n.get("决定", "keep")
                 # 三个可选字段: 给了就写, 给空就删 —— 留一个空值在文件里,
                 # review_gate --apply 会把它当"填了"来解析。
-                for k in ("改用", "改类别", "复用组"):
-                    if n.get(k) in (None, "", []):
+                for k in ("改用", "改类别", "复用组", "VLM放行"):
+                    if _is_empty(n.get(k)):
                         r.pop(k, None)
                     else:
                         r[k] = n[k]
@@ -235,8 +334,8 @@ class Store:
                                      f"「母词~N」, drop 查的还是老名字, 那个物体照样摆出来。"
                                      f"先只填分组跑一轮。")
                 row = {k: r[k] for k in ("生成名", "词", "来源", "实例", "帧",
-                                         "面积占比", "决定", "改用", "复用组", "改类别")
-                       if r.get(k) not in (None, "", [])}
+                                         "面积占比", "决定", "改用", "复用组", "改类别", "VLM放行")
+                       if not _is_empty(r.get(k))}
                 row["由界面追加"] = True
                 added.append(row)
             if added:
@@ -263,15 +362,16 @@ class Store:
     # ---------- mask ----------
     def _npz(self, word):
         k = word.replace(" ", "_")
-        if k not in self._mk:
-            p = f"{self.MASKS}/{k}.npz"
-            if not os.path.exists(p):
-                self._mk[k] = None
+        p = f"{self.MASKS}/{k}.npz"
+        mt = self._mt(p)
+        if k not in self._mk or self._mk[k][0] != mt:
+            if mt is None:
+                self._mk[k] = (None, None)
             else:
                 z = np.load(p, allow_pickle=True)
                 H, W = z["hw"]
-                self._mk[k] = (z["meta"], z["counts"], int(H), int(W))
-        return self._mk[k]
+                self._mk[k] = (mt, (z["meta"], z["counts"], int(H), int(W)))
+        return self._mk[k][1]
 
     def n_instances(self, word):
         """这个词**会进场景**的实例数。
@@ -313,18 +413,46 @@ class Store:
                 self._frames.popitem(last=False)
         return im
 
+    # ★ 缓存必须跟着文件变。服务一开就是一整天, 中间流水线会重跑(verify 重验、track 重跟) ——
+    #   按"启动时读一次"缓存, 界面就拿旧的否决名单预告, 说 trash can #2 "会生成自己的 mesh",
+    #   而新一轮 verify 已经否掉它、场景里借的是 trash_can_0。所以键里带上文件的 mtime。
+    @staticmethod
+    def _mt(p):
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return None
+
+    def _have(self):
+        """有深度的帧 —— pick_from_masks 只在这些帧里挑样本(HAVE)。"""
+        d = f"{self.R1}/02_da3/depth"
+        mt = self._mt(d)
+        if getattr(self, "_havec", None) is None or self._havec[0] != mt:
+            try:
+                s = {int(f[:4]) for f in os.listdir(d) if f.endswith("_depth.npy")}
+            except OSError:
+                s = set()
+            self._havec = (mt, s)
+        return self._havec[1]
+
+    def _json_by_mtime(self, attr, p, parse):
+        mt = self._mt(p)
+        hit = getattr(self, attr)
+        if hit is None or hit[0] != mt:
+            try:
+                d = json.load(open(p)) if mt is not None else {}
+                val = parse(d)
+            except Exception:
+                val = {}
+            setattr(self, attr, (mt, val))
+        return getattr(self, attr)[1]
+
     def _dead_insts(self):
         """跨词去重淘汰掉的实例 {词: {oid,...}}。这些实例下游根本不出盒子,
         摆在面板上要标出来, 否则人会对着一个永远不会进场景的东西做决定。"""
-        if self._dedup is None:
-            p = f"{self.R1}/03_dedup_words.json"
-            try:
-                d = json.load(open(p)) if os.path.exists(p) else {}
-                self._dedup = {w: {int(x) for x in v}
-                               for w, v in (d.get("淘汰实例") or {}).items()}
-            except Exception:
-                self._dedup = {}
-        return self._dedup
+        return self._json_by_mtime(
+            "_dedup", f"{self.R1}/03_dedup_words.json",
+            lambda d: {w: {int(x) for x in v} for w, v in (d.get("淘汰实例") or {}).items()})
 
     def _vlm_rej(self):
         """verify_picks.py 逐实例那一遍否掉的实例 {词: {oid,...}}。
@@ -334,15 +462,9 @@ class Store:
             VLM否决  -> gen_per_instance.py 直接 continue, 这份 mesh 根本不造
           后者摆在面板上必须标出来, 否则人会对着一个不会存在的东西按 keep。
         """
-        if self._vrej is None:
-            p = f"{self.R1}/04_picks/vlm_verify_inst.json"
-            try:
-                d = json.load(open(p)) if os.path.exists(p) else {}
-                self._vrej = {w: {int(x) for x in v}
-                              for w, v in (d.get("否决") or {}).items()}
-            except Exception:
-                self._vrej = {}
-        return self._vrej
+        return self._json_by_mtime(
+            "_vrej", f"{self.R1}/04_picks/vlm_verify_inst.json",
+            lambda d: {w: {int(x) for x in v} for w, v in (d.get("否决") or {}).items()})
 
     # ---------- 召回这一支 ----------
     def recall_info(self):
@@ -407,7 +529,7 @@ class Store:
             return cv2.resize(out, (max(1, int(out.shape[1] * sc)), int(size)))
         return None
 
-    def insts(self, word, solo_th=0.5):
+    def insts(self, word, solo_min_px=DEFAULT_MIN_PX):
         """一个词的全部实例 + 每个实例的量。**这是展开面板的数据源。**
 
         ------------------------------------------------------------------ 量的选取
@@ -431,7 +553,11 @@ class Store:
           * ar 离群 + fill 低    -> mask 坏了, 该换候选或 drop
           * ar 分成几族 fill 正常 -> 真的形状多样, 该 solo
         """
-        key = (word, round(float(solo_th), 4))
+        key = (word, int(solo_min_px),
+               self._mt(f"{self.MASKS}/{word.replace(' ', '_')}.npz"),
+               self._mt(f"{self.R1}/03_dedup_words.json"),
+               self._mt(f"{self.R1}/04_picks/vlm_verify_inst.json"),
+               self._mt(f"{self.R1}/02_da3/depth"))
         if key in self._insts:
             return self._insts[key]
         z = self._npz(word)
@@ -448,7 +574,17 @@ class Store:
             by.setdefault(int(r["oid"]), []).append(
                 (i, int(r["frame"]), int(r["area"]), float(r["edge"])))
         out = []
+        have = self._have()
+        cfg = self.pipeline_cfg()
+        min_fr = int(cfg.get("MIN_FRAMES", 2))
+        sat = float(cfg.get("FRAME_SAT", 10))
+        # 挑图分: 和 pick / verify 同一份规则(class_sample.ranked) —— 只看有深度的帧, 活不满
+        # MIN_FRAMES 不参选, 分 = 面积 x (1 - 贴边惩罚) x min(帧数/FRAME_SAT, 1)。
+        # 这里不传 banned/dead: 挡谁要跟着人没保存的点选实时变, 前端 自动样本 自己挡。
+        pk = {c[1]: (c[0], c[3]) for c in
+              class_sample.ranked(meta, have, word, min_frames=min_fr, frame_sat=sat)[0]}
         for oid, rows in by.items():
+            pscore, pf = pk.get(oid, (0.0, None))
             areas = sorted(a for _, _, a, _ in rows)
             med_a = float(areas[len(areas) // 2])
             max_a = float(areas[-1])
@@ -473,9 +609,13 @@ class Store:
                 # 样本分: 抄 dedup_words.py:196-198, 归一化所以跨词可比
                 样本分=round(100.0 * med_a / px * (1 - min(med_e * 4, 0.9))
                              * min(nf / 10.0, 1.0), 4),
-                低于门槛=(100.0 * max_a / px) < float(solo_th),
+                # 比代表帧(= gen_per_instance 真正拿去生成的那帧)的像素, 不比最大面积 ——
+                # 比的量不一样, 面板说"会生成"而那边其实不生成, 就又是一处对不上。
+                低于门槛=ba < int(solo_min_px),
                 去重淘汰=(oid in dead),
                 VLM否决=(oid in rej),
+                挑图分=round(float(pscore), 1),
+                挑图帧=pf,
             ))
         out.sort(key=lambda r: -r["中位面积pct"])
         self._insts[key] = out
@@ -495,7 +635,7 @@ class Store:
     def candidates(self, word, per_inst=6, must=None, only_oid=None):
         """一个词的全部可选候选 (实例 x 帧), 每个实例采样 per_inst 帧。
 
-        must = (oid, frame) 是"现在正用着的那张", **保证入选**, 见下面条 0。
+        must = [(oid, frame), ...] 是"现在正用着的那张"(和这个实例分最高的那张), **保证入选**, 见下面条 0。
 
         ---------------------------------------------------------------- 采样策略
         为什么要采样: taxi 的 mask 里有 117 条 (实例,帧) 记录, 全铺开既慢又没用 ——
@@ -552,13 +692,12 @@ class Store:
                     if r["frame"] not in seen:
                         seen.add(r["frame"])
                         picked.append(r)
-            # 条 0: 当前那张不在采样结果里就补进来, 标记出来让前端能说明它为什么在
-            if must and int(must[0]) == oid and \
-               not any(r["frame"] == int(must[1]) for r in picked):
-                cur = next((r for r in rows if r["frame"] == int(must[1])), None)
-                if cur:
-                    cur = dict(cur, 当前=True)
-                    picked.append(cur)
+            # 条 0: 当前那张(和这个实例分最高的那张)不在采样结果里就补进来, 标记出来让前端能说明它为什么在
+            for mo, mf in (must or []):
+                if int(mo) == oid and not any(r["frame"] == int(mf) for r in picked):
+                    cur = next((r for r in rows if r["frame"] == int(mf)), None)
+                    if cur:
+                        picked.append(dict(cur, 当前=True))
             picked.sort(key=lambda r: r["frame"])
             for r in picked:
                 r["nframes"] = len(rows)
@@ -775,7 +914,133 @@ class Store:
         return self.cutout(word, oid, frame, size)
 
 
-# ------------------------------------------------------------------ HTTP
+# ------------------------------------------------------------------ 轮次目录
+# ★ 为什么要有: 服务起来的时候 --scene/--run 就定死了, 换一个轮次必须重启, 而一台机器上
+#   常常同时有好几轮(pedestrian r2 / r2sim / r2sim_vggt ...)。现在地址里带 s/r/i 就能换,
+#   /runs 是选择页。每个轮次一个 Store, 缓存起来 —— Store 里有 mask、缩略图那些缓存,
+#   每次请求新建一个等于每翻一页重读一遍 npz。
+_STORES = {}
+_SLOCK = threading.Lock()
+
+
+def run_dirs():
+    """盘上有哪些轮次。判据是"有决策文件或者驱动状态" —— 只有这种目录才有东西可看。"""
+    out = []
+    for indoor, root in ((False, f"{SAM3D}/data/outdoor/result"), (True, f"{SAM3D}/data/indoorOutput")):
+        for scene in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+            sd = f"{root}/{scene}"
+            for run in sorted(os.listdir(sd)) if os.path.isdir(sd) else []:
+                R1 = f"{sd}/{run}"
+                if not os.path.isdir(R1):
+                    continue
+                decs = [f for f in ("05_review_afterrecall.json", "05_review.json") if os.path.exists(f"{R1}/{f}")]
+                state = f"{R1}/logs/.drive_state.json"
+                if not decs and not os.path.exists(state):
+                    continue
+                info = dict(scene=scene, run=run, indoor=indoor, R1=R1, 候选=None, 闸=None, 几何=geom_of(R1),
+                            阶段=("post" if decs and decs[0].endswith("afterrecall.json") else "pre" if decs else None),
+                            决策文件=decs[0] if decs else None, 改过=None, 段=None, 停在闸口=None)
+                if decs:
+                    p = f"{R1}/{decs[0]}"
+                    info["改过"] = time.strftime("%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
+                    try:
+                        info["候选"] = len(json.load(open(p)).get("候选") or [])
+                    except Exception:
+                        info["候选"] = -1
+                    info["闸"] = 2 if info["阶段"] == "pre" else 4
+                try:
+                    st = json.load(open(state))
+                    info["段"], info["停在闸口"] = st.get("段"), st.get("停在闸口")
+                except Exception:
+                    pass
+                out.append(info)
+    return out
+
+
+def geom_of(R1):
+    """这一轮的深度和位姿是谁出的。写在 02_da3/summary.txt 里(VGGT 那条链会打 backend: 一行),
+    没有那一行就是一直在用的 DA3 —— 光看轮次名字分不出来, 而这正是两轮唯一的区别。"""
+    for d in ("02_da3", "02_DA3点云"):
+        p = f"{R1}/{d}/summary.txt"
+        if not os.path.exists(p):
+            continue
+        for ln in open(p, errors="ignore"):
+            if ln.startswith("backend:"):
+                t = ln.split(":", 1)[1].strip()
+                if "VGGT" in t:
+                    sc = "Metric3D L" if "metric3d_l" in t else "Metric3D G2" if "metric3d_g2" in t else "Metric3D"
+                    return f"VGGT-Ω + {sc}"
+                return t.split(";")[0].strip()
+        return "DA3"
+    return None
+
+
+def get_store(scene, run, indoor, solo_min_px=None):
+    k = (scene, run, bool(indoor))
+    with _SLOCK:
+        if k not in _STORES:
+            _STORES[k] = Store(scene, run, indoor, None, solo_min_px)
+        return _STORES[k]
+
+
+RUNS_PAGE = """<!doctype html><meta charset=utf-8><title>Gate runs</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+ :root{--bg:#faf9f5;--panel:#fff;--ink:#141413;--dim:#6b6a65;--line:#e3e1da;--hi:#1a6acb;--red:#d0000e}
+ @media (prefers-color-scheme:dark){:root{--bg:#1b1b19;--panel:#232320;--ink:#eceae4;--dim:#9a988f;--line:#36352f;--hi:#7fb2f0}}
+ body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 ui-sans-serif,system-ui,sans-serif;padding:24px 16px 40px}
+ .wrap{max-width:860px;margin:0 auto}
+ h1{font-size:19px;margin:0 0 4px} p.note{color:var(--dim);margin:0 0 18px}
+ h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:22px 0 8px;font-weight:600}
+ .rows{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--panel)}
+ a.row{display:grid;grid-template-columns:1fr auto;gap:2px 14px;padding:11px 14px;border-top:1px solid var(--line);
+       text-decoration:none;color:inherit}
+ a.row:first-child{border-top:0} a.row:hover{background:color-mix(in srgb,var(--hi) 8%,transparent)}
+ .nm{font-weight:600} .nm em{font-style:normal;color:var(--dim);font-weight:400}
+ .meta{color:var(--dim);font-size:12.5px;font-variant-numeric:tabular-nums}
+ .right{text-align:right;font-size:12.5px;color:var(--dim);font-variant-numeric:tabular-nums}
+ .cur{color:var(--hi);font-weight:600}
+ .geom{font-variant-numeric:normal}
+ a.row{grid-template-areas:"nm when" "meta geom"}
+ a.row .nm{grid-area:nm} a.row .right:not(.geom){grid-area:when}
+ a.row .meta{grid-area:meta} a.row .geom{grid-area:geom}
+ .none{color:var(--dim);padding:12px 14px}
+</style>
+<div class=wrap>
+<h1>Pick a run</h1>
+<p class=note>Every run on disk that has a decision file or driver state. Opening one only changes what this page shows —
+nothing on disk is touched, and each browser tab keeps its own run.</p>
+<!--ROWS-->
+</div>"""
+
+
+def runs_html(cur):
+    rows = run_dirs()
+    out = []
+    for indoor, head in ((False, "Outdoor"), (True, "Indoor")):
+        rs = [r for r in rows if r["indoor"] == indoor]
+        out.append(f"<h2>{head}</h2>")
+        if not rs:
+            out.append('<div class="rows"><div class="none">none</div></div>')
+            continue
+        out.append('<div class="rows">')
+        for r in rs:
+            q = urllib.parse.urlencode(dict(s=r["scene"], r=r["run"], **({"i": 1} if r["indoor"] else {})))
+            is_cur = (r["scene"], r["run"], r["indoor"]) == cur
+            gate = f'gate {r["闸"]}' if r["闸"] else "no decision file yet"
+            seg = "" if r["段"] is None else f' · driver at segment {r["段"] + 1}{" (waiting)" if r["停在闸口"] else ""}'
+            cand = "" if r["候选"] is None else f'{r["候选"]} candidates · '
+            out.append(f'<a class="row" href="/?{q}">'
+                       f'<span class="nm">{r["scene"]} <em>/</em> {r["run"]}'
+                       f'{" <span class=cur>· open now</span>" if is_cur else ""}</span>'
+                       f'<span class="right">{r["改过"] or ""}</span>'
+                       f'<span class="meta">{cand}{gate}{seg}</span>'
+                       f'<span class="right geom">{r["几何"] or ""}</span></a>')
+        out.append("</div>")
+    # 用替换不用 % 格式化: 这页的 CSS 里有 color-mix(... 8%) 这种百分号, % 格式化会当成占位符炸掉
+    return RUNS_PAGE.replace("<!--ROWS-->", "\n".join(out))
+
+
 def make_handler(store):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -804,6 +1069,13 @@ def make_handler(store):
             ok, buf = cv2.imencode(".png", arr)
             self._send(200, "image/png", buf.tobytes(), cache=True)
 
+        def _store(self, q):
+            """这个请求看的是哪个轮次: 地址里带 s/r/i 就按它, 否则就是启动时那个。"""
+            st = (store if not q.get("s") or not q.get("r")
+                  else get_store(q["s"], q["r"], q.get("i") in ("1", "true"), store.solo_min_px_arg))
+            st.refresh_stage()          # 跑完一段盘上会多出召回后那份, 每次请求重判一次
+            return st
+
         # ---- 路由 ----
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
@@ -811,63 +1083,85 @@ def make_handler(store):
             try:
                 if u.path == "/":
                     return self._send(200, "text/html; charset=utf-8", PAGE.encode())
+                if u.path == "/runs":
+                    cur = (store.scene, store.run, store.indoor)   # 启动时那个, 标 open now
+                    return self._send(200, "text/html; charset=utf-8", runs_html(cur).encode())
+                if u.path == "/api/runs":
+                    return self._json(run_dirs())
+                st = self._store(q)              # 下面每一条都用这个轮次
                 if u.path == "/api/state":
-                    d = store.load()
+                    d = st.load()
                     rows = d["候选"]
                     # 每条补上"这个词有几个实例" —— 类卡靠它显示分量, 前端不该自己再去数
                     for r in rows:
-                        r["实例数"] = store.n_instances(r["词"])
+                        r["实例数"] = st.n_instances(r["词"])
+                    facts, bname = st.mesh_facts(sorted({r["词"] for r in rows
+                                                            if int(r.get("实例") or 0) < 10000}))
                     return self._json(dict(
-                        场景=d.get("场景"), TAG=store.tag,
+                        场景=d.get("场景"), TAG=st.tag,
                         # ★ 「场景」那个字段其实是 TAG(ped_r2)。命令行要的是
                         #   --scene pedestrian --run r2, 拿 TAG 去拼会拼出个不存在的场景。
-                        场景名=store.scene, 轮次=store.run,
-                        闸=2 if store.stage == "pre" else 4,
-                        阶段=store.stage, 决策文件=store.DEC, R1=store.R1,
-                        solo门槛=store.solo_th, 可追加行=store.tag_ok,
-                        SOLO=store.solo_words()[0],
-                        SOLO_KEEP=sorted(store.solo_words()[1]),
+                        场景名=st.scene, 轮次=st.run,
+                        闸=2 if st.stage == "pre" else 4,
+                        阶段=st.stage, 决策文件=st.DEC, R1=st.R1,
+                        solo门槛px=st.solo_min_px(), 可追加行=st.tag_ok,
+                        SOLO=st.solo_words()[0],
+                        SOLO_KEEP=sorted(st.solo_words()[1]),
                         历史决定=d.get("历史决定") or {},
+                        网格事实=facts, 盒子文件=bname,
+                        盘上样本=st.disk_samples(),
+                        配置指定样本=st.pipeline_cfg().get("配置指定样本") or {},
+                        组装守卫=dict(MIN_H=ASM_MIN_H, MAX_D=ASM_MAX_D),
                         候选=rows))
                 if u.path == "/img/word":
                     # 只给词, 服务端自己挑"最有代表性的那个实例的代表帧" ——
                     # 尺子表只有词名, 拿不到 oid/frame; 硬拼 oid=0/frame=0 有一半的词
                     # 根本没有那个组合, 整列缩略图是空的(实测 beach 23 个词空了 6 个)。
-                    ins = store.insts(q["word"], store.solo_th)
+                    ins = st.insts(q["word"], st.solo_min_px())
                     if not ins:
                         return self._png(None)
-                    hit = ins[0]          # insts() 已按中位面积降序
-                    return self._png(store.cutout(
+                    # 和前端 自动样本 同一路: 去重淘汰的、VLM 否掉的不当缩略图, 剩下挑图分最高
+                    ok = [r for r in ins if not r["去重淘汰"] and not r["VLM否决"] and r["挑图帧"] is not None]
+                    hit = max(ok, key=lambda r: r["挑图分"]) if ok else ins[0]
+                    if ok:
+                        return self._png(st.cutout(
+                            q["word"], hit["oid"], hit["挑图帧"], int(q.get("size", "80"))))
+                    return self._png(st.cutout(
                         q["word"], hit["oid"], hit["代表帧"], int(q.get("size", "80"))))
                 if u.path == "/api/recall":
-                    return self._json(store.recall_info())
+                    return self._json(st.recall_info())
                 if u.path == "/img/recall":
-                    return self._png(store.recall_shot(
+                    return self._png(st.recall_shot(
                         int(q["oid"]), int(q.get("size", "260"))))
                 if u.path == "/api/scale":
-                    return self._json(store.scale_state())
+                    return self._json(st.scale_state())
                 if u.path == "/api/insts":
-                    return self._json(store.insts(q["word"], store.solo_th))
+                    return self._json(st.insts(q["word"], st.solo_min_px()))
                 if u.path == "/img/inst":
                     # 服务端自己挑代表帧, 前端不用先等 /api/insts 回来
-                    ins = store.insts(q["word"], store.solo_th)
+                    ins = st.insts(q["word"], st.solo_min_px())
                     hit = next((r for r in ins if r["oid"] == int(q["oid"])), None)
                     if not hit:
                         return self._png(None)
-                    return self._png(store.cutout(
-                        q["word"], hit["oid"], hit["代表帧"], int(q.get("size", "120"))))
+                    # 人换过帧就给那一帧(前端带 frame 来), 否则代表帧
+                    fr = int(q["frame"]) if q.get("frame") else hit["代表帧"]
+                    return self._png(st.cutout(
+                        q["word"], hit["oid"], fr, int(q.get("size", "120"))))
                 if u.path == "/api/cands":
-                    must = ((int(q["oid"]), int(q["frame"]))
-                            if "oid" in q and "frame" in q else None)
-                    return self._json(store.candidates(
+                    must = ([(int(q["oid"]), int(q["frame"]))]
+                            if "oid" in q and "frame" in q else [])
+                    # 这个实例分最高的那帧也保证入选 —— 抽屉上要标出 best, 采样把它漏了就标不出来
+                    if q.get("best") and q.get("only_oid"):
+                        must.append((int(q["only_oid"]), int(q["best"])))
+                    return self._json(st.candidates(
                         q["word"], int(q.get("n", "6")), must,
                         q.get("only_oid")))          # 逐实例卡传它, 类卡不传
                 if u.path == "/img/pick":
-                    return self._png(store.cutout_pick(
+                    return self._png(st.cutout_pick(
                         q["gen"], q["word"], int(q["oid"]), int(q["frame"]),
                         int(q.get("size", "200")), q.get("disk", "1") != "0"))
                 if u.path == "/img/cand":
-                    return self._png(store.cutout(
+                    return self._png(st.cutout(
                         q["word"], int(q["oid"]), int(q["frame"]),
                         int(q.get("size", "200"))))
                 return self._json(dict(error="no such route: " + u.path), 404)
@@ -878,19 +1172,23 @@ def make_handler(store):
 
         def do_POST(self):
             u = urllib.parse.urlparse(self.path)
+            q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
             try:
+                st = self._store(q)
                 n = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(n) or b"{}")
                 if u.path == "/api/scale/preview":
-                    return self._json(store.scale_preview(body.get("尺子") or {}))
+                    return self._json(st.scale_preview(body.get("尺子") or {}))
+                # ★ 返回值别再叫 st —— 这里的 st 是这一轮的 Store, 覆盖掉之后下面取 st.DEC
+                #   就成了在字典上取属性(AttributeError, 保存直接失败)。踩过一次。
                 if u.path == "/api/scale/save":
-                    st = store.scale_save(body.get("改动") or {})
-                    print(f"[保存尺子] {st} ", flush=True)
-                    return self._json(dict(ok=True, **st))
+                    res = st.scale_save(body.get("改动") or {})
+                    print(f"[保存尺子] {res} ", flush=True)
+                    return self._json(dict(ok=True, **res))
                 if u.path == "/api/save":
-                    st = store.save_rows(body.get("候选", []), body.get("删除", []))
-                    print(f"[保存] {st} -> {store.DEC}", flush=True)
-                    return self._json(dict(ok=True, **st, 文件=store.DEC))
+                    res = st.save_rows(body.get("候选", []), body.get("删除", []))
+                    print(f"[保存] {res} -> {st.DEC}", flush=True)
+                    return self._json(dict(ok=True, **res, 文件=st.DEC))
                 return self._json(dict(error="no such route: " + u.path), 404)
             except Exception as e:
                 import traceback
@@ -938,6 +1236,9 @@ PAGE = r"""<!doctype html>
  .hd span,.im em,.dim,.glyph,.rt td,.rt input,.sum .big,.rcrow .num,.cand div,
  #stat,.bg,.path{font-variant-numeric:tabular-nums}
 
+ #runs{font-size:12px;color:var(--mute);text-decoration:none;border:1px solid var(--rule);
+        border-radius:5px;padding:3px 7px;white-space:nowrap}
+ #runs:hover{color:var(--ink);border-color:var(--ink)}
  /* ---------------------------------------------------------------- 顶栏 */
  header{position:sticky;top:0;z-index:9;background:var(--sheet);
         border-bottom:2px solid var(--ink);
@@ -1034,9 +1335,9 @@ PAGE = r"""<!doctype html>
        margin:0 -1px -1px 0;display:flex;flex-direction:column;min-width:0}
  .inst img{display:block;width:calc(100% - 16px);margin:8px 8px 0;aspect-ratio:1;
            background:var(--plate);object-fit:cover}
- /* 质量可疑 = 材质通道(降饱和), hover 撤销 —— 不然妨碍人真去看那张图 */
- .inst.bad img{filter:saturate(.3)}
- .inst.bad:hover img{filter:none}
+ /* 质量可疑只挂黄徽章, 图保持彩色。★ 原来还降饱和, 但警报是自动规则会误报
+    (pedestrian r2 的 car #0 镜头走近面积涨 5 倍, 好图也被变灰), 而且和"被判掉"的灰叉
+    撞了同一个视觉通道 —— 人分不清"可疑"和"不进场景"。灰色只留给判掉的。 */
  /* 判掉 = 灰白 + 红框 + 一道划掉的红线(用户定的语义, 这里只换材质)。
     滤镜挂 img 不挂 .inst: 挂在 .inst 上 filter 会连 ::after 的红线一起变灰。 */
  .inst.dropped{box-shadow:inset 0 0 0 2px var(--red);z-index:1}
@@ -1063,6 +1364,11 @@ PAGE = r"""<!doctype html>
  .glyph u{display:inline-block;border:1px solid var(--ink);text-decoration:none;flex:none}
  .dim{color:var(--mute);font-size:10.5px;line-height:1.45}
  .dim.verdict{color:var(--ink)}      /* 结论, 不是第四个字段 */
+ /* 组装预告里"出问题"的那几句: 不进场景 / 没有自己的 mesh。红字, 不是灰字 ——
+    灰字等于没说, pedestrian r2 三辆车借 car_0 就是在灰字里漏掉的。 */
+ .dim b.picked{color:var(--ink);font-weight:700}
+ .red,.panel h3 span.red{color:var(--red);font-weight:600;margin-left:0;font-size:inherit}
+ .meshsum{margin:0 10px 8px;font-size:11.5px;line-height:1.45;color:var(--mute)}
  /* 两列定死, 第三个按钮整行 —— 否则同一排里 keep/drop 会错开 21px */
  .iops{display:grid;grid-template-columns:1fr 1fr;padding:6px 8px 8px;margin-top:auto}
  .iops button{padding:4px 4px;font-size:11px;min-width:0}
@@ -1195,6 +1501,7 @@ PAGE = r"""<!doctype html>
  }
 </style>
 <header>
+  <a id="runs" href="/runs" title="Every run on disk: pick another one (this page stays on the run in its address)">runs ▾</a>
   <b id="scene">…</b>
   <span class="gsw" id="gsw"></span>
   <span id="gate" class="ghd"></span>
@@ -1227,6 +1534,11 @@ let RC弹过 = false;   // 闸 4 首次打开自动弹一次, 之后靠顶栏那
 
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const qs  = o => new URLSearchParams(o).toString();
+// ★ 看哪个轮次写在地址里(s=场景 r=轮次 i=室内), 不在服务端记 —— 这样两个标签页可以各看各的,
+//   /runs 那一页点进来就是换轮次, 服务不用重启。所有请求都得带上, 漏一个就会去读启动时那个轮次。
+const RUN = (() => { const p = new URLSearchParams(location.search), o = {};
+  for (const k of ['s','r','i']) if (p.get(k)) o[k] = p.get(k); return o; })();
+const U = (path, o) => path + '?' + qs({...RUN, ...(o || {})});
 const isInst = r => r.来源 === "逐实例";
 const isRecall = r => (r.实例 ?? 0) >= 10000;
 
@@ -1257,6 +1569,223 @@ function 配置默认(词){
 }
 const 实际模式 = w => w.模式 || 配置默认(w.词);
 
+// ★ 被 drop 的行会被 review_gate 从「候选」里删掉(review_gate.py:271), 决定只留在「历史决定」。
+//   只看表的话, 这些实例在面板上显示成 keep、没有红叉 —— 人回头核对决策时以为没 drop 过,
+//   而组装那边照历史决定真的把它们去掉了, 两边打架。所以表里没有这一行时要回退查历史。
+function 历史drop(词){
+  return Object.values(S.历史 || {})
+    .filter(h => h.词 === 词 && h.决定 === 'drop' && h.实例 != null)
+    .map(h => +h.实例);
+}
+
+// ★ VLM 否决只是提醒, 人说了算。VLM放行 = 人看过、VLM 说不是也照样要(写在这个实例的行上)。
+//   没放行的否决实例: 不生成、不摆、不借别人的 mesh(以前会按名字借, car #2 就成了 8 米的 car_0)。
+function VLM否(词, oid){
+  const F = (S.网格事实 || {})[词];
+  const r = F && F.实例.find(x => x.oid === oid);
+  return !!(r && r.VLM否决);
+}
+function 放行了(词, oid){
+  const w = S.词.get(词);
+  const i = w && w.实例行.has(oid) ? w.实例行.get(oid) : null;
+  return i != null && !!S.行[i].VLM放行;
+}
+
+// ---- 整类样本(共用词): 这一类共用的那个 mesh, 照着谁的哪一帧建 ----
+// 来源四种, 优先级从高到低:
+//   人      行上的「改用」(有类行写类行; 没类行写被选实例自己的行, --apply 塌成裸词)
+//   配置    pipeline 源码里写死的 PICK_OVERRIDE_BY_SCENE, s_override 每次都会套
+//   机器    盘上 picks.json —— 挑图分排名 + VLM 选择题复核之后的结果, 不一定是分数第一
+//   预测    盘上那张用不了了(它被挡掉了 / 挑它时挡掉的实例和现在不一样 / 这个词原来不是共用的),
+//           保存后流水线会重挑。这里只能给分数第一的, VLM 复核可能换人 —— 要确定就点 set as rep 钉住
+// ★ 以前前端把"分数第一"当成"机器选的", 而 timesquare r1 有 4 个词盘上用的根本不是分数第一。
+
+// 能不能当整类样本 —— 和 class_sample.py 同一条: 去重判给别的词的、人 drop 的、VLM 否决没放行的不能
+function 可当样本(词, oid){
+  const F = (S.网格事实 || {})[词];
+  const r = F && F.实例.find(x => x.oid === oid);
+  if (r && r.去重淘汰) return false;
+  if (人决(词, oid) === 'drop') return false;
+  return !(VLM否(词, oid) && !放行了(词, oid));
+}
+// 这个实例分最高的那帧(set as rep 用它)。没资格参选(有深度的帧不够)就退回它的代表帧。
+function 最佳帧(词, oid){
+  const F = (S.网格事实 || {})[词];
+  const r = F && F.实例.find(x => x.oid === oid);
+  if (r && r.挑图帧 != null) return r.挑图帧;
+  const m = ((S.实例.get(词) || {}).数据 || []).find(x => x.oid === oid);
+  return m ? m.代表帧 : null;
+}
+// 分数第一的(只算现在能当样本的)
+function 自动样本(词){
+  const F = (S.网格事实 || {})[词];
+  if (!F) return null;
+  const ok = F.实例.filter(r => r.挑图分 > 0 && r.挑图帧 != null && 可当样本(词, r.oid));
+  if (!ok.length) return null;
+  const b = ok.reduce((a, r) => r.挑图分 > a.挑图分 ? r : a);
+  return {oid: b.oid, fr: b.挑图帧};
+}
+function 配置钉(词){ const v = (S.配置指定样本 || {})[词]; return v ? [+v[0], +v[1]] : null; }
+// 不钉的话流水线会用谁
+function 机选(w){
+  const 词 = w.词, 盘 = (S.盘上样本 || {})[词];
+  if (盘 && !盘.人工 && 可当样本(词, 盘.oid)){
+    // 挑它的时候挡掉了谁 —— 和现在一样, 重跑也还是它(drive.py 用同一个比法决定要不要重挑)
+    const F = (S.网格事实 || {})[词];
+    const 今 = F ? F.实例.filter(r => !r.去重淘汰 && !可当样本(词, r.oid)).map(r => r.oid) : [];
+    const 同 = a => a.slice().sort((x, y) => x - y).join();
+    if (盘.排除 == null || 同(盘.排除) === 同(今)) return {oid: 盘.oid, fr: 盘.fr, 预测: false};
+  }
+  const a = 自动样本(词);
+  return a ? {oid: a.oid, fr: a.fr, 预测: true} : null;
+}
+// 现在这一类用的是谁。solo 下没有整类样本, 返回 null。
+function 当前样本(w){
+  if (实际模式(w) === 'solo') return null;
+  if (w.钉) return {oid: w.钉[0], fr: w.钉[1], 来源: '人'};
+  const c = 配置钉(w.词);
+  if (c) return {oid: c[0], fr: c[1], 来源: '配置'};
+  const m = 机选(w);
+  return m ? {oid: m.oid, fr: m.fr, 来源: m.预测 ? '预测' : '机器'} : null;
+}
+// 词卡封面: 共用词就是整类样本; solo 词给分数第一的实例; 都没有 -> 面积最大的一行
+function 封面(w){
+  const 词 = w.词;
+  const cur = 当前样本(w);
+  if (cur) return {oid: cur.oid, fr: cur.fr, gen: genName(词),
+                   disk: cur.来源 === '机器', 改: cur.来源 === '人'};
+  const a = 实际模式(w) === 'solo' ? 自动样本(词) : null;
+  if (a) return {oid: a.oid, fr: a.fr, gen: genName(词, a.oid), disk: false, 改: false};
+  const r = w.全部.map(i => S.行[i]).filter(x => !isRecall(x))
+             .sort((x, y) => (y.面积占比 || 0) - (x.面积占比 || 0))[0] || S.行[w.全部[0]];
+  return {oid: r.实例, fr: r.帧, gen: r.生成名, disk: !r.改用, 改: !!r.改用};
+}
+
+// 人给这个实例换到的帧(没换 = null)。逐实例看它自己的行; 共用词看类行的「改用」是不是指它。
+// ★ 实例卡片的图必须跟着它变 —— 以前卡片永远画机器挑的代表帧, 人在抽屉里点完没有任何变化,
+//   分不清选上没选上。
+function 人选帧(w, oid){
+  const i = w.实例行.has(oid) ? w.实例行.get(oid) : null;
+  const a = i != null ? S.行[i].改用 : null;
+  if (a && a[0] === oid) return a[1];
+  const c = w.类行 != null ? S.行[w.类行].改用 : null;
+  if (c && c[0] === oid) return c[1];
+  return null;
+}
+
+// 这个实例人判的是什么: 表里有行看行, 没行(drop 之后被 review_gate 删掉了)看历史。
+function 人决(词, oid){
+  const w = S.词.get(词);
+  const i = w && w.实例行.has(oid) ? w.实例行.get(oid) : null;
+  if (i != null) return S.行[i].决定;
+  return 历史drop(词).includes(oid) ? 'drop' : 'keep';
+}
+
+// ---- 组装预告: 每个实例进不进场景、用谁的 mesh ----
+// ★ 照抄 assemble_scene.py 的摆放循环(:273-300)和 pick_mesh(:69-80):
+//     共用词且有类 mesh -> 类 mesh;  有自己的 -> 自己的;  有类 mesh -> 类 mesh;
+//     否则借同词 mesh 里**生成名字符串排序**的第一个(car_10 排在 car_4 前面);
+//     借到的是被 drop 的那个 -> 这个也不摆;  盒子过薄/过大 -> 不摆。
+//   "自己的"= 盘上已有, 或这一轮会生成(gen_per_instance.py 的条件: 逐实例词 + 有盒子 +
+//   VLM 没否 + 过像素门槛 + 没被 drop)。
+//   规则放前端是因为它要跟着人还没保存的点选实时变; 盘上事实由后端 mesh_facts 给。
+//   两边任何一处改了规则, 这里要跟着改 —— 不然界面说的和场景里的又是两回事。
+// 返回 Map(oid -> {摆, 因, 网格:{来源, 名, 号, 待生成, 现借}, 没自有因})
+function 网格去向(词){
+  const F = (S.网格事实 || {})[词];
+  if (!F) return null;
+  const w = S.词.get(词);
+  const 模式 = w ? 实际模式(w) : 配置默认(词);
+  const 有盒 = oid => !F.盒子 || (String(oid) in F.盒子);
+  const 盘上 = new Set(F.盘上实例);
+  const 会生成 = new Set(F.实例.filter(r => 模式 === 'solo' && !r.去重淘汰
+      && (!r.VLM否决 || 放行了(词, r.oid))
+      && !r.低于门槛 && 有盒(r.oid) && 人决(词, r.oid) !== 'drop').map(r => r.oid));
+  // 类 mesh: 盘上有, 或这一轮 pick 会写类目录(共用词 / 逐实例词但一个实例都没过门槛)
+  const 类有 = F.类网格 || (模式 === 'shared')
+             || (模式 === 'solo' && !F.实例.some(r => !r.去重淘汰 && !r.低于门槛));
+  const 号表 = new Map([...盘上, ...会生成].map(o => [genName(词, o), o]));
+  const 池 = [...号表.keys()].sort();
+  // 不生成、现在就组装的话会用谁 —— 给"自己的还没生成"那句话配后半句
+  const 盘池 = [...盘上].map(o => genName(词, o)).sort();
+  const 现借 = F.类网格 ? 'the class mesh' : (盘池[0] || null);
+  const out = new Map();
+  for (const r of F.实例){
+    const o = r.oid, e = F.盒子 ? F.盒子[String(o)] : null;
+    let v;
+    // 先判跟人的决定无关的(点 keep/drop 都改变不了), 再判人的, 最后判 mesh
+    if (r.去重淘汰)              v = {摆:false, 因:'dedup'};
+    else if (模式 === 'dropped') v = {摆:false, 因:'word'};
+    else if (!有盒(o))           v = {摆:false, 因:'nobox'};
+    else if (e && (e[2] < S.守卫.MIN_H || Math.max(...e) > S.守卫.MAX_D))
+                                 v = {摆:false, 因:'size', 尺寸:e};
+    else if (人决(词, o) === 'drop') v = {摆:false, 因:'drop'};
+    else if (r.VLM否决 && !放行了(词, o)) v = {摆:false, 因:'vlm'};
+    else {
+      let g = null;
+      if (模式 === 'shared' && 类有) g = {来源:'class'};
+      else if (盘上.has(o) || 会生成.has(o))
+        g = {来源:'own', 待生成: !盘上.has(o), 现借: 盘上.has(o) ? null : 现借};
+      else if (类有) g = {来源:'class'};
+      else if (池.length) g = {来源:'borrow', 名: 池[0], 号: 号表.get(池[0])};
+      if (!g) v = {摆:false, 因:'nomesh'};
+      // 放行了的否决实例只许用自己的 mesh(共用词用类 mesh 是人判的, 可以)
+      else if (r.VLM否决 && g.来源 !== 'own' && !(模式 === 'shared' && g.来源 === 'class'))
+        v = {摆:false, 因:'vlmnomesh'};
+      else if (g.来源 === 'borrow' && 人决(词, g.号) === 'drop')
+        v = {摆:false, 因:'borrowdropped', 网格:g};
+      else v = {摆:true, 网格:g};
+    }
+    if (v.网格 && v.网格.来源 !== 'own')
+      v.没自有因 = 模式 === 'shared' ? 'shared' : r.VLM否决 ? 'vlm' : r.低于门槛 ? 'small' : 'other';
+    if (人决(词, o) === 'drop') v.人drop = true;
+    v.词 = 词;
+    v.放行 = r.VLM否决 && 放行了(词, o);
+    out.set(o, v);
+  }
+  return out;
+}
+const 短名 = n => String(n).startsWith(S.meta.TAG + '_') ? n.slice(S.meta.TAG.length + 1) : n;
+
+// 一个实例的去向写成人话。返回 [html, 是不是问题]。问题一律红字。
+function 去向文(v){
+  const R = t => '<span class="red">'+esc(t)+'</span>';
+  const 因文 = {vlm: ' (VLM rejected it)', small: ' (below '+S.meta.solo门槛px+' px)', other: ''};
+  if (!v.摆){
+    const 也 = v.人drop && v.因 !== 'drop' ? ' — you also dropped it' : '';
+    switch (v.因){
+      case 'dedup': return [R('NOT PLACED — dedup: another word represents it'), true];
+      case 'word':  return [R('NOT PLACED — the whole word is dropped'), true];
+      case 'nobox': return [R('NOT PLACED — no 3D box (too few depth points)'+也), true];
+      case 'size': {
+        const e = v.尺寸, big = Math.max(...e);
+        return [R('NOT PLACED — box '+(big > S.守卫.MAX_D ? big.toFixed(1)+' m long, over the '+S.守卫.MAX_D+' m limit'
+                                     : 'only '+e[2].toFixed(2)+' m tall, under '+S.守卫.MIN_H+' m')+也), true];
+      }
+      case 'drop':  return [R('NOT PLACED — you dropped it'), true];
+      case 'nomesh': return [R('NOT PLACED — no mesh at all for this word'), true];
+      case 'vlm':  return [R('NOT PLACED — VLM says this is not a '+v.词+
+                             '. Your call: keep it, or pick another frame'), true];
+      case 'vlmnomesh': return [R('NOT PLACED — you kept it past the VLM, but it is too small '+
+                                  'to get its own mesh (it will not borrow one)'), true];
+      case 'borrowdropped':
+        return [R('NOT PLACED — it has no own mesh and would borrow '+短名(v.网格.名)+', which you dropped'), true];
+    }
+  }
+  const g = v.网格;
+  const 放 = v.放行 ? ' (you overrode the VLM)' : '';
+  if (g.来源 === 'own')
+    return g.待生成
+      ? ['<span>own mesh'+放+' — not generated yet</span>'+
+         (g.现借 ? R('; until then it uses '+短名(g.现借)) : ''), !!g.现借]
+      : ['<span>own mesh'+放+'</span>', false];
+  if (g.来源 === 'class')
+    return v.没自有因 === 'shared'
+      ? ['<span>shared class mesh</span>', false]
+      : [R('NO OWN MESH — uses the class mesh'+因文[v.没自有因]), true];
+  return [R('NO OWN MESH — uses '+短名(g.名)+'\'s mesh'+因文[v.没自有因]), true];
+}
+
 // 每次 mutate 之后重建派生索引
 function 重建索引(){
   const m = new Map();
@@ -1273,29 +1802,56 @@ function 重建索引(){
     // ★ 卡片上那个数字要跟着人的决定走。后端给的 实例数 已经减掉了跨词去重淘汰的
     //   (那是既定事实), 这里再减掉**人自己 drop 的**实例行 —— 否则你 drop 了三个,
     //   卡片还写着原来那个数, 界面在说一件已经不成立的事。
-    w.已drop = [...w.实例行.values()].filter(i => S.行[i].决定 === 'drop').length;
+    w.已drop = [...w.实例行.values()].filter(i => S.行[i].决定 === 'drop').length
+             + 历史drop(w.词).filter(oid => !w.实例行.has(oid)).length;
     w.实例数 = Math.max((w.实例数 || 1) - w.已drop, 0);
     w.模式 = 推模式(w.全部.map(i => S.行[i]));
     // 冲突: 同一个词既有 solo 行又有 shared 行 -> 下游同时进 SOLO 和 SOLO_KEEP
     const ds = new Set(w.全部.map(i => S.行[i].决定));
     w.冲突 = ds.has('solo') && ds.has('shared');
-    // 「代表」= 这一类的 mesh 照着谁建。落点分两种, 取决于这个词有没有类行:
-    //   有类行(person/tree...) -> 写类行的 改用, overrides() 键就是词
-    //   没类行(car 这种全是逐实例行的) -> 写**任意一个实例行**的 改用;
-    //     词在 shared 里时 review_gate 的 _ov_key 会把 词#实例 塌成裸词(:386,393-394),
-    //     于是它就是类级代表。所以"没有类行 = 不能设代表"是错的, 第一版就错在这。
-    //   ★ 塌成同一个键意味着**全词只许一个**实例带 改用, 多填后者静默压掉前者。
-    const c = w.类行 != null ? S.行[w.类行] : null;
-    if (c) {
-      w.代表 = c.改用 || [c.实例, c.帧];
-      w.代表源 = w.类行;
-    } else {
-      const 带 = [...w.实例行.values()].filter(i => S.行[i].改用);
-      w.代表 = 带.length ? S.行[带[0]].改用 : null;   // 没人带 = 没钉死, 由流水线自己挑
-      w.代表源 = 带.length ? 带[0] : null;
+    // 人钉的整类样本。落点两种, 取决于这个词有没有类行:
+    //   有类行(person...) -> 类行的 改用, overrides() 键就是词
+    //   没类行(car/tree 这种全是逐实例行的) -> 被选实例自己行上的 改用;
+    //     词在 shared 里时 review_gate 的 _ov_key 把 词#实例 塌成裸词, 于是它就是类级样本。
+    //   ★ 塌成同一个键意味着共用词**只许一个**改用。不止一个且值不同 = 冲突,
+    //     review_gate --apply 会硬停; 这里标出来, 点一次 set as rep 就清干净。
+    //   solo 下 改用 是各实例自己的换帧, 不是整类样本, 不算。
+    w.钉 = null; w.钉冲突 = false;
+    if (实际模式(w) !== 'solo'){
+      const 带 = [w.类行, ...w.实例行.values()].filter(i => i != null && S.行[i].改用);
+      if (带.length){
+        w.钉 = S.行[带[0]].改用;
+        w.钉冲突 = new Set(带.map(i => String(S.行[i].改用))).size > 1;
+      }
     }
   }
   S.词 = m;
+  // ★ 卡片数字和汇总用组装预告算 —— 它要读 S.词(人决), 所以必须在 S.词 换成新索引之后。
+  for (const w of m.values()){
+    const 去向 = 网格去向(w.词);
+    w.去向 = 去向;
+    if (!去向) continue;
+    const 摆 = [...去向.values()].filter(v => v.摆);
+    w.实例数 = 摆.length;
+    const 借 = new Map();
+    let 类兜 = 0, 待 = 0;
+    const 挡 = {};                      // 因 -> 个数, 只数和人的决定无关的那几种
+    for (const v of 摆){
+      if (v.网格.来源 === 'borrow') 借.set(v.网格.名, (借.get(v.网格.名) || 0) + 1);
+      else if (v.网格.来源 === 'class' && v.没自有因 !== 'shared') 类兜++;
+      else if (v.网格.来源 === 'own' && v.网格.待生成) 待++;
+    }
+    let 丢 = 0;
+    for (const v of 去向.values()){
+      if (v.摆) continue;
+      if (v.因 === 'drop') 丢++;
+      else if (['vlm', 'nobox', 'size', 'nomesh', 'borrowdropped', 'vlmnomesh'].includes(v.因))
+        挡[v.因] = (挡[v.因] || 0) + 1;
+    }
+    // ★ 丢 只数"因为你 drop 才不摆"的。没盒子的那几个即使你也 drop 过, 记在 挡 里 ——
+    //   不管 drop 不 drop 都摆不进去, 两边都数就是同一辆车数两次(car #9/#11/#12)。
+    w.网格账 = {借, 类兜, 待, 挡, 丢};
+  }
 }
 
 // ---- 变更器: 改 S.行 的唯一入口 ----
@@ -1311,11 +1867,49 @@ function 设词模式(词, m){
   });
   // 再点一次已经选中的 = 取消这条决定, 退回"跟配置走"。
   // 不留一个和配置同值的决定在文件里 —— --apply 会把它当成人明确做过判断来处理。
+  const 旧实际 = 实际模式(w);
   if (m !== 旧){
     const i = w.类行 != null ? w.类行 : w.全部[0];
     if (i != null) S.行[i].决定 = m;
   }
+  重建索引();
+  const 新实际 = 实际模式(S.词.get(词));
+  if (新实际 !== 旧实际) 换模式收改用(词, 旧实际, 新实际);
   dirty = true; 重建索引(); render();
+}
+
+// ★ 「改用」在两种模式下是两回事: solo 下是"各实例自己用哪帧"(每行各一个), 共用下是
+//   "整类样本"(全词只许一个, 写在哪行都塌成同一个键)。切到共用时, solo 留下的几个换帧会
+//   撞成一个键, review_gate 硬停; 切到 solo 时, 整类样本会变成那个实例自己的换帧 —— 都不是人的意思。
+//   所以切模式时把旧模式的 改用 收起来, 切回去再放出来(只在这次打开的页面里记着)。
+function 换模式收改用(词, 旧, 新){
+  S.暂存改用 = S.暂存改用 || {};
+  const 存 = (S.暂存改用[词] = S.暂存改用[词] || {});
+  const 收 = [];
+  S.行.forEach(r => {
+    if (r.词 === 词 && r.改用 && !isRecall(r)){
+      收.push({g: r.生成名, oid: isInst(r) ? r.实例 : null, v: r.改用}); delete r.改用;
+    }
+  });
+  const 放 = 存[新] || [];
+  存[旧] = 收; delete 存[新];
+  重建索引();
+  for (const x of 放){
+    let i = S.行.findIndex(r => r.生成名 === x.g);
+    if (i < 0 && x.oid != null) i = 确保行(词, x.oid);   // 界面建的空行被收尾拿掉了, 重建
+    if (i >= 0) S.行[i].改用 = x.v;
+  }
+  收尾全部(词);
+}
+
+// 界面建的行退回"什么决定都没有"的, 一次清掉(收尾 会删行, 倒着走下标才不乱)
+function 收尾全部(词){
+  for (let i = S.行.length - 1; i >= 0; i--) if (i < S.行.length && S.行[i].词 === 词) 收尾(i);
+}
+
+// 清掉这个词的整类样本(类行和所有实例行上的 改用)。只在共用模式下调。
+function 清钉(词){
+  S.行.forEach(r => { if (r.词 === 词 && !isRecall(r)) delete r.改用; });
 }
 
 function 设词要不要(词, v){        // v: 'keep' | 'drop-word'
@@ -1351,6 +1945,11 @@ function 确保行(词, oid){
 function 收尾(i){
   const r = S.行[i];
   if (!r.由界面追加) return;
+  // ★ 历史里 drop 过的, 这行 keep 就是"撤销 drop"本身, 不是噪声 —— 删了它, 显示回退查历史
+  //   又是 drop, 人点了 keep 叉还在。存下去之后 review_gate 见表里有这个键就以表为准、
+  //   把历史那条 drop 删掉(review_gate.py:243-249), 撤销才真正落地。
+  if (历史drop(r.词).includes(+r.实例)) return;
+  if (r.VLM放行) return;            // 放行本身就是一个决定, 不是噪声
   if (r.决定==='keep' && !r.改用 && !r.复用组 && !r.改类别){
     S.待删.add(r.生成名);
     S.行.splice(i, 1);
@@ -1361,26 +1960,40 @@ function 收尾(i){
 function 设实例决定(词, oid, v){
   const i = 确保行(词, oid);
   S.行[i].决定 = v;
-  if (v === 'keep') 收尾(i);
+  // VLM 否掉的: 点 keep = "我看过了, 照样要" -> 放行; 点 drop = 不要 -> 撤掉放行
+  if (VLM否(词, oid)){
+    if (v === 'keep') S.行[i].VLM放行 = true; else delete S.行[i].VLM放行;
+  }
+  // drop 掉的实例不许当整类样本(class_sample 同一条) —— 它正是人钉的那个就一起撤掉,
+  // 否则保存后 --apply 照样拿它的抠图建整类 mesh
+  const w = S.词.get(词);
+  if (v === 'drop' && w && w.钉 && w.钉[0] === oid) 清钉(词);
+  if (v === 'keep') 收尾(i); else 收尾全部(词);
   dirty = true; 重建索引(); render();
 }
 
-// 设本类代表: 写类行的「改用」。★ 只在 shared/默认 下有意义 ——
-//   solo 的词没有类 mesh, overrides() 那条根本不会被读。
-function 设代表(词, oid, 帧){
-  const w = S.词.get(词); if(!w) return;
-  if (w.类行 != null){
-    const r = S.行[w.类行];
-    // 点回 pick 原本选的那张 = 撤销「改用」(删字段), 不是写一个等值的进去 ——
-    // 留一个和原选相同的值在文件里, --apply 会当成人做过决定来处理。
-    if (oid===r.实例 && 帧===r.帧) delete r.改用; else r.改用 = [oid, 帧];
-  } else {
-    // 无类行: 写到被选中那个实例自己的行上, 并**清掉同词其它行的改用** ——
-    // shared 下它们塌成同一个键, 留两个等于让 --apply 按插入顺序随机挑一个。
-    const 已 = w.代表 && w.代表[0]===oid && w.代表[1]===帧;
-    w.实例行.forEach(i => { delete S.行[i].改用; });
-    if (!已){ const i = 确保行(词, oid); S.行[i].改用 = [oid, 帧]; }
+// 设整类样本(共用词)。所有入口(set as rep / 帧抽屉)都走这里。
+//   * 先清掉这个词所有 改用 —— 共用词只许一个
+//   * 选的正是盘上机器那张(而且没有配置钉) -> 就停在"不钉", 不写一个和原选等值的进去:
+//     留着它, --apply 会当成人做过决定来处理
+//   * 选的是预测出来的那张 -> 照样钉住: 不钉的话重挑时 VLM 复核可能换人
+//   * 选了 VLM 否掉的实例 = 人看过了, 放行(drop 过的翻回 keep)
+function 设样本(词, oid, 帧){
+  if (!S.词.get(词) || 帧 == null) return;
+  清钉(词);
+  if (VLM否(词, oid) && !放行了(词, oid)){
+    const i = 确保行(词, oid);
+    S.行[i].VLM放行 = true;
+    if (S.行[i].决定 === 'drop') S.行[i].决定 = 'keep';
   }
+  重建索引();
+  const w = S.词.get(词), m = 机选(w);
+  const 等机 = !配置钉(词) && m && !m.预测 && m.oid === oid && m.fr === 帧;
+  if (!等机){
+    const i = w.类行 != null ? w.类行 : 确保行(词, oid);
+    S.行[i].改用 = [oid, 帧];
+  }
+  收尾全部(词);
   dirty = true; 重建索引(); render();
 }
 
@@ -1388,6 +2001,14 @@ function 设代表(词, oid, 帧){
 //   **虚化背景后面**的按钮上 —— 焦点环画在 blur 底下, 人看不见自己在哪。
 //   开的时候移进弹层(见 挂弹层 末尾), 关的时候还回它是从哪儿开的。
 function 开弹层(v){ M = v; render(); }
+// ✕ / Esc / 点背景: 从实例面板里点开的帧抽屉, 退回实例面板; 别的一律关掉。
+// ★ 以前 ✕ 直接关整个弹层, 人从 person 面板 -> #10 的帧抽屉 -> ✕, 一下回到最外层, 面板要重新点开。
+function 退一层(){
+  if (M && M.view === 'src' && M.从 === 'insts'){
+    openTray = null; 开弹层({view:'insts', 词:M.词, oid:null});
+  } else if (M) 关弹层();
+  else render();
+}
 function 关弹层(){
   // ★ 存节点没用: render() 会把整棵 DOM 重建, 原来那颗按钮已经不在文档里,
   //   document.contains() 一律 false, 焦点就掉回 body。所以存的是**怎么找回它**。
@@ -1399,14 +2020,14 @@ function 关弹层(){
     el = [...document.querySelectorAll('[data-exp]')].find(b => b.dataset.exp === 从.词);
   if (el) { try { el.focus(); } catch(e){} }
 }
-document.addEventListener("keydown", e => { if (e.key === "Escape" && M) 关弹层(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && M) 退一层(); });
 
 async function 取实例(词){
   if (S.实例.has(词)) return S.实例.get(词);
   const st = {状态:'loading', 数据:[]};
   S.实例.set(词, st);
   try {
-    const d = await (await fetch("/api/insts?"+qs({word:词}))).json();
+    const d = await (await fetch(U("/api/insts",{word:词}))).json();
     if (d.error) { st.状态='err'; st.说明=d.error; }
     else { st.状态='ok'; st.数据=d; }
   } catch(e){ st.状态='err'; st.说明=String(e); }
@@ -1419,7 +2040,7 @@ let SC = {state:null, 改动:{}, 预览:null, 忙:false};
 const scDirty = () => Object.keys(SC.改动).length > 0;
 
 async function scLoad(){
-  try { SC.state = await (await fetch("/api/scale")).json(); }
+  try { SC.state = await (await fetch(U("/api/scale"))).json(); }
   catch(e){ SC.state = {error:String(e)}; }
   SC.改动 = {}; SC.预览 = null; render();
 }
@@ -1447,7 +2068,7 @@ async function scPreview(){
   for (const [w,v] of Object.entries(SC.改动)){ if (v==null) delete 尺子[w]; else 尺子[w]=v; }
   SC.忙 = true; render();
   try {
-    SC.预览 = await (await fetch("/api/scale/preview",
+    SC.预览 = await (await fetch(U("/api/scale/preview"),
       {method:"POST", headers:{"Content-Type":"application/json"},
        body: JSON.stringify({尺子})})).json();
   } catch(e){ SC.预览 = {error:String(e)}; }
@@ -1524,7 +2145,7 @@ function scRender(){
     const cls = [off?'off':'', r.倍数!=null&&!r.采用?'out':'', ed?'edited':''].filter(Boolean).join(' ');
     const v = ed ? SC.改动[r.词] : (r.真实 ?? r.参照 ?? '');
     return '<tr class="'+cls+'">'+
-      '<td><img loading="lazy" src="/img/word?'+qs({word:r.词, size:80})+'"></td>'+
+      '<td><img loading="lazy" src="'+U('/img/word',{word:r.词, size:80})+'"></td>'+
       '<td><b>'+esc(r.词)+'</b>'+(ed?' <span style="color:var(--ink);font-weight:700">✎</span>':'')+
         (r.用不了?'<br><span class="why">'+esc(r.用不了)+'</span>':'')+'</td>'+
       '<td>'+(r.量到!=null?r.量到.toFixed(2):'—')+'</td>'+
@@ -1587,7 +2208,7 @@ function scStat(){
 async function scSave(){
   const b = document.getElementById("save");
   b.disabled = true; b.textContent = "Saving…";
-  const r = await (await fetch("/api/scale/save", {method:"POST",
+  const r = await (await fetch(U("/api/scale/save"), {method:"POST",
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({改动: SC.改动})})).json();
   if (r.error){ alert("Save failed: "+r.error); scStat(); return; }
@@ -1599,7 +2220,7 @@ async function scSave(){
 async function boot(){
   let d;
   try {
-    d = await (await fetch("/api/state")).json();
+    d = await (await fetch(U("/api/state"))).json();
   } catch(e) {
     document.getElementById("grid").innerHTML =
       '<div class="empty">Cannot reach the server — '+esc(e)+'<br><br>'+
@@ -1611,9 +2232,15 @@ async function boot(){
     '<div class="empty">'+esc(d.error)+'</div>'; return; }
   S.meta = {TAG:d.TAG, 场景:d.场景, 场景名:d.场景名, 轮次:d.轮次,
             闸:d.闸, 阶段:d.阶段, 决策文件:d.决策文件,
-            solo门槛:d.solo门槛, 可追加行:d.可追加行,
+            solo门槛px:d.solo门槛px, 可追加行:d.可追加行,
             SOLO:d.SOLO, SOLO_KEEP:d.SOLO_KEEP};   // 配置默认要靠它俩推
   S.行 = d.候选; S.待删 = new Set();
+  S.历史 = d.历史决定 || {};
+  S.网格事实 = d.网格事实 || {};       // 盘上哪些 glb / 盒子在, 见后端 mesh_facts
+  S.盘上样本 = d.盘上样本 || {};       // picks.json: 共用词盘上实际在用的样本, 见后端 disk_samples
+  S.配置指定样本 = d.配置指定样本 || {}; // pipeline 源码里写死的换候选
+  S.暂存改用 = {};                     // 切模式时收起来的另一种模式的 改用(重新加载就清空)
+  S.守卫 = d.组装守卫 || {MIN_H: 0.15, MAX_D: 15};
   document.getElementById("scene").textContent = d.场景;
   // 阶段名(pre/post)对人没意义, 它说的是"召回之前还是之后" —— 直接说那句话。
   document.getElementById("gate").textContent =
@@ -1664,10 +2291,10 @@ function stat(){
 function 词卡(w){
   const 作废 = w.模式 === 'dropped';
   const n = w.实例数;
-  const c = w.类行 != null ? S.行[w.类行] : S.行[w.全部[0]];
-  const [oid, fr] = w.代表 || [c.实例, c.帧];
-  // 换过就别再用盘上那张 —— 它是 pick 当初选的, 和你刚挑的不是一回事
-  const 有代表改 = !!(w.代表源 != null && S.行[w.代表源] && S.行[w.代表源].改用);
+  const 丢数 = w.网格账 ? w.网格账.丢 : w.已drop;
+  // 封面只从 封面() 拿, 规则见那里(和面板的 class rep、pipeline 的挑图同一条)
+  const 封 = 封面(w);
+  const oid = 封.oid, fr = 封.fr, 有代表改 = 封.改;
 
   const d = document.createElement("div");
   d.className = "wcard" + (作废 ? " dead" : "");
@@ -1688,14 +2315,17 @@ function 词卡(w){
       模式文[m]+'</button>').join('');
 
   d.innerHTML =
-    '<img loading="lazy" src="/img/pick?'+
-      qs({gen:c.生成名,word:w.词,oid:oid,frame:fr,disk:有代表改?0:1})+'">'+
+    '<img loading="lazy" src="'+U('/img/pick',
+      {gen:封.gen,word:w.词,oid:oid,frame:fr,disk:封.disk?1:0})+'">'+
     '<div class="hd"><b>'+esc(w.词)+'</b>'+
       '<i class="bg cls'+(n>=5?' big':'')+'" title="Instances of this word that will '+
         'actually be placed. Cross-word duplicates are already excluded'+
-        (w.已drop ? ', and '+w.已drop+' you dropped' : '')+'.">'+
-        n+' object'+(n===1?'':'s')+(w.已drop?' (−'+w.已drop+')':'')+'</i>'+
+        (丢数 ? ', and '+丢数+' you dropped' : '')+'.">'+
+        n+' object'+(n===1?'':'s')+(w.网格账 ? '' : (丢数?' (−'+丢数+')':''))+'</i>'+
       '<span>#'+oid+' f'+fr+(有代表改?' ✎':'')+'</span></div>'+
+    网格汇总(w)+
+    (w.钉冲突 ? '<div class="warn">Different class sources are set on several rows — '+
+               'open the instances and click set as rep on the one you want.</div>' : '')+
     (w.冲突 ? '<div class="warn">This word has both a solo row and a shared row — '+
               'it would land in SOLO and SOLO_KEEP at once, which is undefined downstream. '+
               'Click a mode button to clear it.</div>' : '')+
@@ -1707,19 +2337,30 @@ function 词卡(w){
     '<div class="more">'+
       '<button data-exp="'+esc(w.词)+'"'+(作废?' disabled':'')+'>'+
         'show '+n+' instance'+(n===1?'':'s')+' ▾</button>'+
-      // ★ 类级选帧的入口。v2 第一版把它漏了 —— 词卡上没有任何按钮能打开换帧抽屉,
-      //   而唯一能打开的那个(换帧钮)只在 solo 模式下出现, 于是"给这一类换一张抠图"
-      //   在 默认/shared 模式下**完全没有入口**。这是从 v1 退化的, 不是设计。
-      //   展开面板里的「设为代表」只给得出每个实例的代表帧; 要挑任意一帧就得靠这个抽屉
-      //   —— overrides() 收的是 {词: (实例号, 帧号)}, 任意 (实例,帧) 组合都合法。
-      (作废 || 实际模式(w)==='solo' || w.类行==null ? '' :
-        '<button data-tray="'+esc(w.词)+'" title="Pick the cutout that builds '+
-        'the mesh for this whole class. This cutout is what gets fed to SAM3D — '+
-        'not a thumbnail. Any frame of any instance works.">'+
-        (openTray && openTray.词===w.词 && openTray.oid==null
-           ? 'close ▴' : 'mesh source ▾')+'</button>')+
+      // 换整类样本的入口只在展开面板里(set as rep / 样本上的 frame ▾)。以前词卡上还有个
+      // mesh source ▾, 铺开全词所有实例的帧 —— 连去重删掉的、人 drop 掉的都在里面, 和样本规则对不上。
     '</div>';
   return d;
+}
+
+// 词卡上那一行: 这个词里有几个没有自己的 mesh、借了谁的; 几个被组装挡掉。问题红字。
+function 网格汇总(w){
+  const a = w.网格账;
+  if (!a) return '';
+  const 句 = [];
+  const 挡文 = {vlm: k => k+' rejected by VLM — review',
+               nobox: k => k+(k === 1 ? ' has' : ' have')+' no 3D box',
+               size: k => k+' with an impossible box size',
+               nomesh: k => k+' with no mesh at all',
+               borrowdropped: k => k+' would borrow a mesh you dropped',
+               vlmnomesh: k => k+' kept past the VLM but too small for an own mesh'};
+  for (const [因, k] of Object.entries(a.挡)) 句.push('<span class="red">'+挡文[因](k)+'</span>');
+  if (a.丢) 句.push(a.丢+' you dropped');      // 人的决定, 不算问题, 不标红
+  for (const [名, k] of a.借)
+    句.push('<span class="red">'+k+(k === 1 ? ' borrows ' : ' borrow ')+esc(短名(名))+'\'s mesh</span>');
+  if (a.类兜) 句.push('<span class="red">'+a.类兜+(a.类兜 === 1 ? ' falls' : ' fall')+' back to the class mesh</span>');
+  if (a.待) 句.push(a.待+' own mesh'+(a.待 > 1 ? 'es' : '')+' not generated yet');
+  return 句.length ? '<div class="meshsum">'+句.join(' · ')+'</div>' : '';
 }
 
 // 召回卡。比词卡简单得多: 没有模式、没有代表、没有实例层, 只有 keep / drop。
@@ -1728,8 +2369,8 @@ function 召回卡(r, i){
   d.className = "wcard" + (r.决定==='drop' ? " dead" : "");
   d.style.borderLeftColor = COL[r.决定] || COL.keep;
   d.innerHTML =
-    '<img loading="lazy" src="/img/pick?'+
-      qs({gen:r.生成名, word:r.词, oid:r.实例, frame:r.帧})+'">'+
+    '<img loading="lazy" src="'+U('/img/pick',
+      {gen:r.生成名, word:r.词, oid:r.实例, frame:r.帧})+'">'+
     '<div class="hd"><b>'+esc(r.词)+'</b>'+
       '<i class="bg rec" title="'+RECALL_WHY+'">recalled</i>'+
       '<span>#'+r.实例+' f'+r.帧+'</span></div>'+
@@ -1788,37 +2429,70 @@ function 展开面板(w){
         : 群.length+' share one shape (AR≈'+中.toFixed(2)+'), '+异.length+' outlier'+
           (异.length>1?'s':'')+' ('+异.map(r=>'#'+r.oid).join(' ')+
           ') → check whether those are just bad masks';
-  // 当前代表自己带质量警报 —— 这是最该被指出来的一种情况: 整类的 mesh 要拿它来建
-  const 代 = w.代表 && ins.find(r => r.oid === w.代表[0]);
+  // 整类样本(共用词才有)。它自己带质量警报 —— 这是最该被指出来的一种情况: 整类的 mesh 要拿它来建
+  const 样 = 当前样本(w);
+  const 代 = 样 && ins.find(r => r.oid === 样.oid);
   const 代警 = 代 ? 警报(代) : [];
 
   // ★ 面板列的是**全部**实例(包括被去重淘汰的, 要让人看得见它们存在),
   //   而卡片上的数字是**会进场景的**。两个数不一样, 所以这里必须把账算给人看,
   //   否则卡片说 10 个、面板列 13 个, 人不知道该信哪个。
-  const 淘 = ins.filter(r => r.去重淘汰).length;
-  const 丢 = w.已drop || 0;
-  const 账 = 淘||丢
+  // 有组装预告就按它的"因"记账(每个不摆的实例只记一个因, 加起来正好等于差额)
+  const 因计 = {};
+  if (w.去向) for (const v of w.去向.values()) if (!v.摆) 因计[v.因] = (因计[v.因] || 0) + 1;
+  const 淘 = w.去向 ? (因计.dedup || 0) : ins.filter(r => r.去重淘汰).length;
+  const 丢 = w.去向 ? (因计.drop || 0) : (w.已drop || 0);
+  const 其他 = [['vlm', ' rejected by VLM (review them)'], ['vlmnomesh', ' kept past the VLM, too small'],
+               ['nobox', ' without a 3D box'], ['size', ' with an impossible box size'],
+               ['borrowdropped', ' borrowing a dropped mesh'], ['nomesh', ' with no mesh']]
+    .filter(([k]) => 因计[k]).map(([k, t]) => '<span class="red">'+因计[k]+t+'</span>');
+  const 账 = 淘||丢||其他.length
     ? ' · '+ins.length+' here, '+w.实例数+' will be placed ('+
-      [淘?淘+' taken by another word':'', 丢?丢+' you dropped':''].filter(Boolean).join(', ')+')'
+      [淘?淘+' taken by another word':'', 丢?丢+' you dropped':'', ...其他].filter(Boolean).join(', ')+')'
     : '';
+  const 自样 = 自动样本(w.词);
+  // 整类样本本身不该被挡(人钉的 drop 会一起撤掉, 只有文件里带来的 / 源码表钉的会这样)
+  const 样F = 样 && ((S.网格事实 || {})[w.词] || {实例: []}).实例.find(x => x.oid === 样.oid);
+  const 样坏 = !样 || 可当样本(w.词, 样.oid) ? ''
+    : (样F && 样F.去重淘汰) ? 'dedup gave it to another word'
+    : 人决(w.词, 样.oid) === 'drop' ? 'you dropped it' : 'the VLM rejected it';
   // ★ 弹层头已经写了词名和数量(见 挂弹层 的 sub), h3 再说一遍就是 40px 内说两次。
   //   这里只留"怎么读这一屏"的说明。顺带修复 "1 instances" 的复数。
   t.innerHTML = '<h3>'+(ins.length===1?'One instance':'Largest first')+账+
     '<span>'+建议+
-    (坏数?'. '+坏数+' mask'+(坏数>1?'s':'')+' look wrong — those are desaturated':'')+
+    (坏数?'. '+坏数+' mask'+(坏数>1?'s':'')+' look wrong — those carry a ⚠ flag':'')+
     '</span></h3>'+
-    (代警.length ? '<div class="warn">The current representative #'+代.oid+
+    (w.钉冲突 ? '<div class="warn">Different class sources are set on several rows. '+
+      'Only one can be used — click set as rep on the one you want.</div>' : '')+
+    (样坏 ? '<div class="warn">The class mesh is built from #'+样.oid+', but '+样坏+
+      '. Click set as rep on another instance.</div>' : '')+
+    (代警.length ? '<div class="warn">The class source #'+代.oid+
       ' is itself flagged ('+esc(代警.join('; '))+') — and the mesh for this whole class '+
-      'is built from it. The top one, #'+ins[0].oid+', has median area '+
-      ins[0].中位面积pct+'%'+(坏(ins[0])?' (but is also flagged)':' and no flags')+
-      '. Worth switching.</div>' : '')+
+      'is built from it.'+(自样 && 自样.oid !== 代.oid
+        ? ' The top-scoring one is #'+自样.oid+'. Worth switching.' : '')+'</div>' : '')+
     '<div class="insts"></div>';
   const box = t.querySelector(".insts");
 
   ins.forEach(r => {
     r.召回 = r.oid >= 10000;
     const 行i = w.实例行.has(r.oid) ? w.实例行.get(r.oid) : null;
-    const 决 = 行i!=null ? S.行[行i].决定 : 'keep';
+    // ★ 闭环规则: 叉 = 不进场景, 亮 = 进场景, 按钮高亮永远和叉一致。所以 决 必须是
+    //   **组装时真实会发生的事**, 不是"表里写了什么":
+    //   * 去重淘汰: 下游根本不出盒子(boxes_from_masks 直接 continue), 表里写什么都不进场景。
+    //     界面也没有撤销去重的通路 —— 所以固定为 drop, 按钮禁用, 不给一个点了没用的 keep。
+    //   * VLM 否决: 只挡生成, 不挡组装 —— 没 drop 就借同词别人的 mesh 照样摆。所以按表/历史走,
+    //     默认是 keep(亮), 不能打叉。
+    //   * 早先闸口 drop 过、行已被 review_gate 删掉的: 回退查历史决定。
+    const 旧drop = 行i==null && 历史drop(w.词).includes(r.oid);
+    const 决 = r.去重淘汰 ? 'drop'
+             : 行i!=null ? S.行[行i].决定 : (旧drop ? 'drop' : 'keep');
+    // 组装预告(有盒子文件时才有)。叉 = 不摆, 以它为准; 没有预告时退回只看人的决定。
+    const 去 = w.去向 ? w.去向.get(r.oid) : null;
+    const 不摆 = 去 ? !去.摆 : 决 === 'drop';
+    // 按钮高亮跟叉走(闭环): 不摆就亮 drop —— 哪怕人点的是 keep、是没盒子/尺寸把它挡掉的。
+    // 那种情况按钮是锁着的, 原因写在卡片上和 title 里。
+    const 亮 = 不摆 ? 'drop' : 'keep';
+    const 去文 = 去 ? 去向文(去)[0] : '';
     // ★ solo 模式下没有"代表"这回事 —— 每个实例各造各的 mesh, 类 mesh 根本不会被读。
     //   第一版只判"有没有类行", 而点 solo 只是把类行的决定改成 solo, 行还在,
     //   于是徽章赖着不走, 人以为自己没点上。
@@ -1826,26 +2500,39 @@ function 展开面板(w){
     // 而这恰恰是最该看见的: 不选也是一种选择, 只是选的人不是你。
     // 判据用 样本分 最高(和 pick_from_masks 的打分同源), 面板本来就按它降序排,
     // 所以就是第一张。标成虚线徽章, 和"钉死的"区分开。
-    const 钉 = 实际模式(w) !== 'solo' && w.代表 && w.代表[0]===r.oid;
-    const 猜 = 实际模式(w) !== 'solo' && !w.代表 && ins[0] && ins[0].oid===r.oid;
-    const 是代表 = 钉 || 猜;
+    // 共用词: 标出整类样本是谁、从哪来(人钉 / 源码表 / 盘上机器挑的 / 保存后重挑的预测)。
+    //   没人钉的时候也要标 —— 不选也是一种选择, 只是选的人不是你。
+    const 是代表 = !!(样 && 样.oid === r.oid);
     const 警 = 警报(r);
+    // 卡片画哪一帧: solo 画人换的那帧(没换 = 服务端的代表帧); 共用词的样本画它用的那帧,
+    // 其余画它分最高的那帧 —— 就是点 set as rep 会用的那帧
+    const 选帧 = 实际模式(w) === 'solo' ? 人选帧(w, r.oid) : null;
+    const 显帧 = 实际模式(w) === 'solo' ? 选帧 : (是代表 ? 样.fr : (r.召回 ? null : 最佳帧(w.词, r.oid)));
+    // 不摆的原因跟人的决定无关时(去重 / 没盒子 / 盒子尺寸离谱 / 借的被 drop 了), keep/drop
+    // 都锁住: 点了不改变任何结果, 给了就是假按钮。
+    // 'vlm'(VLM 否决等人判)不锁 —— 那正是要人点 keep / drop 的地方
+    const 锁因 = 去 ? (!去.摆 && !['drop', 'vlm'].includes(去.因) ? 去.因 : null) : (r.去重淘汰 ? 'dedup' : null);
+    const 锁 = 锁因 ? ' disabled title="'+esc({
+        dedup: 'Removed by dedup: another word already represents this object, so it is never placed.',
+        word: 'The whole word is dropped.',
+        nobox: 'No 3D box in the current boxes file, so assembly has nothing to place.',
+        size: 'Assembly rejects this box size.',
+        nomesh: 'No mesh exists for this word.',
+        borrowdropped: 'It would borrow a mesh you dropped. Un-drop that one, or give this one its own mesh.',
+        vlmnomesh: 'Too small for its own mesh, and a VLM-rejected instance never borrows one.',
+      }[锁因]+' Keep/drop cannot change that here.')+'"' : '';
     const el = document.createElement("div");
     // 被 drop 的: 灰白 + 红框。★ 和"质量可疑"的降饱和要分得开 ——
     // 那个是"这张图信不过"(黄徽章), 这个是"你判了它不进场景"(红框), 两码事。
     el.className = "inst" + (警.length ? " bad" : "") + (是代表 ? " rep" : "")
-                 + (决==='drop' ? " dropped" : "");
+                 + (不摆 ? " dropped" : "");
     // AR 画成小矩形字形 —— 数字要读, 图形一扫就分堆
     const bw = Math.round(Math.min(Math.max(r.ar,0.15),4) * 14), bh = 14;
     el.innerHTML =
-      '<img loading="lazy" src="/img/inst?'+qs({word:w.词,oid:r.oid,size:120})+'">'+
+      '<img loading="lazy" src="'+U('/img/inst', 显帧 != null ? {word:w.词,oid:r.oid,frame:显帧,size:120}
+                                                          : {word:w.词,oid:r.oid,size:120})+'">'+
       (警.length ? '<i class="alarm" title="'+esc(警.join('；'))+'">⚠ '+esc(警[0])+'</i>' : '')+
-      (钉 ? '<i class="repbadge" title="The single mesh for this whole class is built '+
-        'from this instance. Every other instance just re-uses it. You pinned this.">'+
-        'class rep</i>'
-        : 猜 ? '<i class="repbadge guess" title="Nothing is pinned, so the pipeline picks — '+
-          'and this is the one it scores highest. Click \'set as rep\' on any instance '+
-          'to override.">class rep (auto)</i>' : '')+
+      (是代表 ? 样徽章(w, 样) : '')+
       '<div class="im">'+
         '<b>#'+r.oid+'</b><em>'+r.中位面积pct+'%</em>'+
         '<div class="bar"><s style="width:'+
@@ -1854,23 +2541,30 @@ function 展开面板(w){
           'AR '+r.ar.toFixed(2)+' · fill '+Math.round(r.fill*100)+'%</div>'+
         // 上一行是量(帧数/帧号), 下一行是**结论**。原来四样挂在同一根中点轨道上,
         // 人读不出 "below solo threshold" 是个判定而不是第四个字段。
-        '<div class="dim">alive '+r.活帧数+' frames · f'+r.代表帧+'</div>'+
-        ((r.去重淘汰||r.VLM否决||r.低于门槛)
-          ? '<div class="dim verdict">'+[
-              r.去重淘汰?'dropped by dedup':'',
-              r.VLM否决?'VLM rejected — not generated':'',
-              r.低于门槛?'below solo threshold':''].filter(Boolean).join('; ')+'</div>'
-          : '')+
+        '<div class="dim">alive '+r.活帧数+' frames · '+
+          (选帧 != null ? '<b class="picked">f'+选帧+' you picked</b> (auto f'+r.代表帧+')'
+           : 是代表 ? '<b class="picked">f'+样.fr+' builds the class mesh</b>'
+             + (样.fr !== 最佳帧(w.词, r.oid) ? ' (best f'+最佳帧(w.词, r.oid)+')' : '')
+           : 'f'+(显帧 != null ? 显帧 : r.代表帧))+'</div>'+
+        (去
+          ? '<div class="dim verdict">'+去文+'</div>'
+          : ((r.去重淘汰||r.VLM否决||r.低于门槛||旧drop)
+            ? '<div class="dim verdict">'+[
+                (旧drop && !r.去重淘汰)?'you dropped this at an earlier gate':'',
+                r.去重淘汰?'removed by dedup — another word represents it':'',
+                r.VLM否决?'VLM rejected':'',
+                r.低于门槛?'below solo threshold':''].filter(Boolean).join('; ')+'</div>'
+            : ''))+
       '</div>'+
       '<div class="iops">'+
         '<button data-io="keep" data-w="'+esc(w.词)+'" data-oid="'+r.oid+'"'+
-          ' class="'+(决==='keep'?'on':'')+'">keep</button>'+
+          ' class="'+(亮==='keep'?'on':'')+'"'+锁+'>keep</button>'+
         '<button data-io="drop" data-w="'+esc(w.词)+'" data-oid="'+r.oid+'"'+
-          ' class="'+(决==='drop'?'on':'')+'"'+
-          (行i==null ? ' title="Adds a row for this instance so it can be excluded '+
+          ' class="'+(亮==='drop'?'on':'')+'"'+锁+
+          (行i==null && !r.去重淘汰 ? ' title="Adds a row for this instance so it can be excluded '+
                        'from the scene (assemble_scene checks instance-level names too)"' : '')+
           '>drop</button>'+
-        代表钮(w, r) + 换帧钮(w, r, 行i) +
+        实例钮(w, r) +
       '</div>';
     box.appendChild(el);
   });
@@ -1892,46 +2586,57 @@ const RECALL_WHY = "Recalled candidates cannot take a source override — their 
                  + "made on the fly from the detection box, there is no other frame to switch "
                  + "to. review_gate.py refuses this outright (exit 2). Keep it or drop it.";
 
-function 代表钮(w, r){
-  if (r.召回) return '<button disabled title="'+RECALL_WHY+'">set as rep</button>';
-  // solo 下没有类 mesh, 「代表」无意义。除此之外**一律给**, 不管有没有类行 ——
-  // 没类行的词照样能设代表(写实例行, _ov_key 塌成裸词), 见 重建索引 里的注释。
-  if (实际模式(w) === 'solo') return '';
-  const 是 = w.代表 && w.代表[0]===r.oid && w.代表[1]===r.代表帧;
-  return '<button data-rep="'+esc(w.词)+'" data-oid="'+r.oid+'" data-fr="'+r.代表帧+'"'+
-    ' class="'+(是?'on':'')+'" title="Build this class mesh from this instance '+
-    '(writes 改用 on the class row)">'+
-    'set as rep</button>';
+// 整类样本的徽章: 实线 = 定了的(人钉 / 源码表 / 盘上机器挑的), 虚线 = 保存后要重挑的预测
+function 样徽章(w, 样){
+  const t = {
+    '人':   ['class rep', 'You picked this. The one mesh every '+w.词+' shares is built from f'+样.fr+' of it.'],
+    '配置': ['class rep (config)', 'Pinned in the pipeline source (PICK_OVERRIDE_BY_SCENE), applied on every run. '+
+             'Click set as rep on another instance to replace it.'],
+    '机器': ['class rep (auto)', 'The pipeline picked this: top scores, then a VLM check chose among them. '+
+             'Nothing is pinned. Click set as rep on another instance to replace it.'],
+    '预测': ['class rep (predicted)', 'Your decisions changed which instances may be used, so the pipeline '+
+             're-picks after Save — and its VLM check may choose a different one. This is the top-scoring one. '+
+             'Click set as rep to lock it.'],
+  }[样.来源];
+  return '<i class="repbadge'+(样.来源 === '预测' ? ' guess' : '')+'" title="'+esc(t[1])+'">'+t[0]+'</i>';
 }
-// 「换帧」按钮。★ 两个模式下**写的是不同的行**, 这是这个工具最容易搞错的一处:
-//   solo          -> 写这个实例自己的行 (overrides_inst, 键是 (词,实例号))
-//   default/shared-> 写**类行** (overrides, 键是词, 值是 (实例号,帧号))
-//                    也就是"用 #7 的第 123 帧当这一类的图" —— 完全合法, 有消费者。
-//   第一版把这两件事混成一件然后一起禁掉了, 于是"给这一类挑任意一帧"没有入口,
-//   只剩 set as rep 给的每个实例的代表帧。那是做窄了, 不是约束。
-function 换帧钮(w, r, 行i){
-  if (r.召回) return '<button disabled title="'+RECALL_WHY+'">frame</button>';
+
+// 实例卡上除 keep/drop 以外的按钮。★ 先看模式, 两种模式下是两件事:
+//   solo   -> frame ▾      这个实例自己的 mesh 用哪帧(写它自己的行, overrides_inst)
+//   共用   -> set as rep   整类样本换成它, 用它分最高的那帧 —— 一下就好, 不用挑图
+//             frame ▾      只在整类样本那个实例上: 嫌那帧不好再换一帧
+//   以前共用词每个实例都给 use as source ▾, 换样本必须自己挑一帧; 再早还有个名字按"表里有没有行"
+//   变来变去的版本。两步拆开: 选谁(一下) 和 选哪帧(要看图) 是两个问题。
+// 去重删掉的不给按钮(不进场景, 也不许当样本), 原因卡片上写着。
+function 实例钮(w, r){
+  if (r.去重淘汰) return '';
+  const solo = 实际模式(w) === 'solo';
+  if (r.召回) return '<button disabled title="'+RECALL_WHY+'">'+(solo ? 'frame' : 'set as rep')+'</button>';
   const 开 = openTray && openTray.词===w.词 && openTray.oid===r.oid;
-  // ★ 判据是"这个实例有没有自己的**逐实例行**", 不是 w.模式。
-  //   模式是从「决定」字段推的, 而 car 这种词的逐实例行是 pipeline 配置 SOLO=car 带来的,
-  //   决策文件里一个 solo 都没写 -> 推出来是 'default' -> 第一版走了类行那一支 ->
-  //   car 又没有类行 -> 15 个按钮全灰。而它明明每个实例都有行, 换帧完全有消费者。
-  if (行i != null && S.行[行i].来源 === '逐实例')
-    return '<button data-tray="'+esc(w.词)+'" data-toid="'+r.oid+'" '+
-           'title="Pick which frame of #'+r.oid+' builds its own mesh">'+
-           (开?'close ▴':'frame ▾')+'</button>';
-  if (w.类行 == null)
-    return '<button data-tray="'+esc(w.词)+'" data-toid="'+r.oid+'" '+
-           'title="Use this cutout of #'+r.oid+' to build the class mesh (fed to SAM3D)">'+
-           (开?'close ▴':'use as source ▾')+'</button>';
-  return '<button data-tray="'+esc(w.词)+'" data-toid="'+r.oid+'" '+
-         'title="Use this cutout of #'+r.oid+' to build the class mesh (fed to SAM3D)">'+
-         (开?'close ▴':'use as source ▾')+'</button>';
+  const 帧钮 = tip => '<button data-tray="'+esc(w.词)+'" data-toid="'+r.oid+'" title="'+esc(tip)+'">'+
+                     (开 ? 'close ▴' : 'frame ▾')+'</button>';
+  if (solo)
+    return 帧钮('Pick which frame of #'+r.oid+' builds its own mesh'+
+               (r.VLM否决 ? '. Picking one also overrides the VLM rejection' : ''));
+  const 样 = 当前样本(w);
+  const 是 = 样 && 样.oid === r.oid;
+  const 最 = 最佳帧(w.词, r.oid);
+  const 设钮 = 最 == null ? ''
+    : 人决(w.词, r.oid) === 'drop'
+      ? '<button disabled title="You dropped #'+r.oid+'. Keep it first to use it as the class source.">set as rep</button>'
+      : '<button data-rep="'+esc(w.词)+'" data-oid="'+r.oid+'" title="'+esc(
+          'Build the one mesh every '+w.词+' shares from #'+r.oid+', using its best frame (f'+最+'). '+
+          'Change the frame afterwards with frame ▾.'+
+          (r.VLM否决 && !放行了(w.词, r.oid) ? ' This also overrides the VLM rejection.' : ''))+'">set as rep</button>';
+  if (!是) return 设钮;
+  // 样本本人: 换帧; 预测出来的那个再给一个 set as rep, 点了就钉住(免得重挑时 VLM 换人)
+  return (样.来源 === '预测' ? 设钮 : '') +
+         帧钮('#'+r.oid+' is the class source. Pick which of its frames builds the mesh every '+w.词+' shares');
 }
 
 // ---- 质量警报: 这张图信不信得过 ----
-// 和"形状差异"分开成两个通道 —— 形状用几何(矩形字形/面积条), 质量用材质(降饱和+徽章)。
-// 降饱和的意思是"这张图本身信不过, 别拿它比形状"。
+// 和"形状差异"分开成两个通道 —— 形状用几何(矩形字形/面积条), 质量用徽章。
+// 徽章的意思是"这张图本身信不过, 别拿它比形状"。
 function 警报(r){
   const a = [];
   if (r.抖动 >= 4)      a.push('jitter '+r.抖动+'x');   // 游走的垃圾 mask 的指纹
@@ -2009,7 +2714,7 @@ function 绑事件(root){
     S.行[+b.dataset.i].决定 = b.dataset.rio; dirty = true; 重建索引(); render();
   });
   root.querySelectorAll("[data-rep]").forEach(b => b.onclick = () =>
-    设代表(b.dataset.rep, +b.dataset.oid, +b.dataset.fr));
+    设样本(b.dataset.rep, +b.dataset.oid, 最佳帧(b.dataset.rep, +b.dataset.oid)));
   root.querySelectorAll("[data-io]").forEach(b => b.onclick = () =>
     设实例决定(b.dataset.w, +b.dataset.oid, b.dataset.io));
   root.querySelectorAll("[data-tray]").forEach(b => b.onclick = () => {
@@ -2048,7 +2753,7 @@ function 画闸切换(){
 function rcLoad(){
   if (RC && RC.状态 === 'loading') return;       // 已在飞, 别叠
   RC = {状态:'loading', 判词:[], 统计:{}};
-  fetch('/api/recall').then(r => r.json())
+  fetch(U('/api/recall')).then(r => r.json())
     .then(d => { RC = d; render(); })
     .catch(e => { RC = {有:false, 判词:[], 统计:{},
       说明:'cannot reach the server — is gate_ui still running? '+e}; render(); });
@@ -2133,7 +2838,7 @@ function 召回表(){
     const d = document.createElement("div");
     d.className = "rcrow";
     d.innerHTML =
-      '<img loading="lazy" width="230" src="/img/recall?'+qs({oid:r.obj_id, size:230})+'">'+
+      '<img loading="lazy" width="230" src="'+U('/img/recall',{oid:r.obj_id, size:230})+'">'+
       '<div class="t">'+
         '<b>'+esc(r.词||'?')+'</b>'+
         '<span style="color:var(--dim);font-size:11px"> #'+r.obj_id+' · frame '+r.最佳帧+'</span>'+
@@ -2187,7 +2892,7 @@ function 挂弹层(){
   const 是源 = M.view === 'src';
   const scrim = document.createElement("div");
   scrim.className = "scrim";
-  scrim.onclick = e => { if (e.target === scrim) 关弹层(); };   // 点背景关掉
+  scrim.onclick = e => { if (e.target === scrim) 退一层(); };   // 点背景退一层
   const box = document.createElement("div");
   box.className = "modal";
   const sub = 是召
@@ -2206,7 +2911,7 @@ function 挂弹层(){
   body.appendChild(是召 ? 召回表() : 是源 ? tray(w, M.oid) : 展开面板(w));
   scrim.appendChild(box);
   document.body.appendChild(scrim);
-  box.querySelector("#mx").onclick = 关弹层;
+  box.querySelector("#mx").onclick = 退一层;
   // 焦点落进弹层。放在挂完之后 —— 元素得先在文档里才 focus 得上。
   requestAnimationFrame(() => { const x = box.querySelector("#mx"); if (x) x.focus(); });
   const bk = box.querySelector("#mback");
@@ -2214,89 +2919,106 @@ function 挂弹层(){
   绑事件(box);
 }
 
-// 帧抽屉。★ 写哪一行由**词的模式**决定, 不由从哪儿点开决定:
+// 帧抽屉: 只看一个实例的帧。★ 写哪一行由**词的模式**决定, 不由从哪儿点开决定:
 //     solo           -> 写这个实例自己的行   overrides_inst(): 键 (词,实例号), 值只取帧
-//     default/shared -> 写**类行**            overrides():      键 词,      值 (实例号,帧号)
+//     default/shared -> 交给 设样本           overrides():      键 词,      值 (实例号,帧号)
 //   两条通道的键形状不同, 写错一边就静默失配 —— solo 下写类行等于给一个没有类 mesh 的词
-//   设代表(没人读), default 下写实例行等于填一个带 # 的键(overrides 明确过滤掉)。
-//
-//   oid == null  -> 不限实例, 铺开整个词的候选(给"换这一类的图"用)
-//   oid != null  -> 只看这一个实例的帧
+//   设样本(没人读), default 下写实例行等于填一个带 # 的键(overrides 明确过滤掉)。
 function tray(w, oid){
   const t = document.createElement("div");
   t.className = "tray";
-  // 有这个实例自己的逐实例行就写它, 否则写类行 —— 和 换帧钮 用同一个判据
-  const 实例行 = (oid!=null && w.实例行.has(oid)) ? w.实例行.get(oid) : null;
-  const isSolo = 实际模式(w) === 'solo';
-  // solo -> 写这个实例自己的行(overrides_inst, 只取帧号)
-  // shared + 有类行 -> 写类行
-  // shared + 无类行 -> 写这个实例的行, _ov_key 会塌成裸词 = 类级代表
-  const 目标 = isSolo ? 实例行 : (w.类行 != null ? w.类行 : 实例行);
-  const solo = isSolo;
-  if (目标 == null){
-    t.innerHTML = '<h3>'+esc(w.词)+'<span>no row to write to</span></h3>';
+  if (oid == null){
+    t.innerHTML = '<h3>'+esc(w.词)+'<span>open an instance to pick its frames</span></h3>';
     return t;
   }
-  const row = S.行[目标];
-  const cur = row.改用 || [row.实例, row.帧];
-  t.innerHTML = '<h3>'+esc(w.词)+' frames<span>loading…</span></h3>';
+  const solo = 实际模式(w) === 'solo';
+  const 词 = w.词;
+  // 两种模式各有自己的"现状"和"原选":
+  //   solo  现状 = 这个实例行上的 改用, 没有就是 pick 给它挑的那帧(原选); 点原选/点现状 = 撤销
+  //   共用  现状 = 整类样本(只在样本本人身上打开); 原选 = 这个实例分最高的那帧(标 best)
+  //         ★ 不能拿这个实例自己的行当现状: 那行的帧是它逐实例时挑的, 不是整类的图
+  let cur, orig, row = null;
+  if (solo){
+    const i = w.实例行.has(oid) ? w.实例行.get(oid) : null;
+    if (i != null) row = S.行[i];
+    else {
+      // 这个实例表里还没行: 先按它自己的代表帧"虚拟"一行, 真点选了再建
+      const m = ((S.实例.get(词) || {}).数据 || []).find(x => x.oid === oid);
+      row = {实例: oid, 帧: m ? m.代表帧 : 0, 虚: true};
+    }
+    cur = row.改用 || [row.实例, row.帧];
+    orig = [row.实例, row.帧];
+  } else {
+    const 样 = 当前样本(w);
+    cur = 样 && 样.oid === oid ? [样.oid, 样.fr] : null;
+    const 最 = 最佳帧(词, oid);
+    orig = 最 != null ? [oid, 最] : null;
+  }
+  t.innerHTML = '<h3>'+esc(词)+' frames<span>loading…</span></h3>';
 
-  const q = {word:w.词, oid:cur[0], frame:cur[1]};
-  if (oid != null) q.only_oid = oid;
+  const q = {word: 词, only_oid: oid};
+  if (cur) { q.oid = cur[0]; q.frame = cur[1]; }
+  if (orig) q.best = orig[1];
   // ★ .catch 不能省: 服务没起/被杀掉时 fetch 直接 reject, 没有 catch 的话
   //   这个抽屉会**永远**停在"loading…", 人分不清是慢还是死了。实测踩过。
-  fetch("/api/cands?"+qs(q))
+  fetch(U("/api/cands", q))
    .then(r => r.json())
    .then(cs => {
     if(cs.error || !cs.length){
-      t.innerHTML = '<h3>'+esc(w.词)+'<span>no candidates'+
+      t.innerHTML = '<h3>'+esc(词)+'<span>no candidates'+
         (cs.error?': '+esc(cs.error):'')+'</span></h3>'; return; }
-    const scope = oid != null
-      ? (solo ? 'only #'+oid+'\'s own frames (solo: the override is keyed by instance)'
-              : 'frames of #'+oid+' — picking one makes it this class\'s image')
-      : new Set(cs.map(c=>c.oid)).size+' instances — pick the one that best represents this class';
-    t.innerHTML = '<h3>'+esc(w.词)+' frames<span>'+scope+'. '+cs.length+
-      ' sampled, green is in use. Click another to switch, click the green one to revert'+
+    t.innerHTML = '<h3>'+esc(词)+' frames<span>'+
+      (solo ? 'only #'+oid+'\'s own frames, for its own mesh. '+cs.length+' sampled, green is in use. '+
+              'Click another to switch, click the green one to go back to the pipeline pick'
+            : 'frames of #'+oid+' — the one you pick builds the mesh every '+esc(词)+' shares. '+
+              cs.length+' sampled, green is in use, "best" is its top-scoring frame')+
       '</span></h3><div class="cands"></div>';
     const box = t.querySelector(".cands");
     cs.forEach(c => {
-      const isCur  = (c.oid===cur[0]    && c.frame===cur[1]);   // 现在用的
-      const isOrig = (c.oid===row.实例  && c.frame===row.帧);    // pick 原本选的
-      // ★ 这是决定"哪一帧拿去建 mesh"的控件, 原来是个挂了 onclick 的 <div> ——
-      //   没有 tabindex、没有 role、没有 keydown, 键盘完全够不着。
-      //   用 <button> 而不是补 tabindex: 回车/空格、焦点环、AT 语义全都白送。
+      const isCur  = !!cur  && c.oid === cur[0]  && c.frame === cur[1];
+      const isOrig = !!orig && c.oid === orig[0] && c.frame === orig[1];
+      // ★ 这是决定"哪一帧拿去建 mesh"的控件, 用 <button>: 回车/空格、焦点环、AT 语义全都白送。
       const el = document.createElement("button");
       el.type = "button";
       el.className = "cand" + (isCur ? " cur" : "") + (isOrig ? " orig" : "");
-      el.innerHTML = '<img loading="lazy" src="/img/cand?'+
-        qs({word:w.词,oid:c.oid,frame:c.frame,size:160})+'">'+
-        (isOrig && !isCur ? '<i class="ohome">pipeline pick</i>' : '')+
+      el.innerHTML = '<img loading="lazy" src="'+U('/img/cand',{word:词,oid:c.oid,frame:c.frame,size:160})+'">'+
+        (isOrig && !isCur ? '<i class="ohome">'+(solo ? 'pipeline pick' : 'best')+'</i>' : '')+
         '<div>#'+c.oid+' f'+c.frame+(isCur?' · in use':'')+'<br>'+
         c.pct+'% · '+c.nframes+' frames'+(c.edge>0.2?' · edge '+c.edge:'')+'</div>';
-      el.title = isCur ? (isOrig ? 'This is the pipeline own pick, and it is in use.'
-                                 : 'In use. Click to revert to the pipeline pick.')
+      el.title = isCur ? (isOrig ? 'In use, and it is the '+(solo ? 'pipeline pick' : 'best frame')+'.'
+                                 : 'In use. Click to go back to the '+(solo ? 'pipeline pick' : 'best frame')+'.')
                        : 'Click to use this one.';
       el.onclick = () => {
-        // ★ 点当前选中的那张 = 撤销, 回到 pick 原本选的那张。
-        //   第一版比的是"点的是不是原选", 于是点当前那张 = 把同一个值再写一遍,
-        //   什么都没发生 —— 而抽屉标题写着"再点一次退回原选", 界面在撒谎。
-        //   撤销一律走"删字段", 不写一个和原选等值的进去: 留着它,
-        //   --apply 会当成人明确做过判断来处理。
-        const 撤 = isCur;
-        if (!solo && w.类行 == null){
-          if (撤){ w.实例行.forEach(i => { delete S.行[i].改用; });
-                   dirty = true; 重建索引(); render(); }
-          else 设代表(w.词, c.oid, c.frame);   // 它负责清掉同词其它行的改用
+        if (!solo){
+          // 共用: 全部交给 设样本(清掉别的改用 / 等于盘上机器那张就不钉 / VLM 放行)
+          if (!isCur) 设样本(词, oid, c.frame);
+          else if (!isOrig && orig) 设样本(词, oid, orig[1]);     // 点现状 = 退回 best
+          退一层();
           return;
         }
-        if (撤) delete row.改用; else row.改用 = [c.oid, c.frame];
-        dirty = true; 重建索引(); render();
+        // solo: 点现状 = 撤销, 回到 pick 原本选的那张。撤销一律走"删字段",
+        //   不写一个和原选等值的进去: 留着它, --apply 会当成人明确做过判断来处理。
+        const 撤 = isCur || isOrig;
+        let rr = row;
+        if (row.虚){
+          if (撤) { 退一层(); return; }                     // 虚拟行上"撤销"= 什么都没选
+          rr = S.行[确保行(词, oid)];
+        }
+        if (撤){ delete rr.改用; delete rr.VLM放行; }       // 撤销就撤干净, 放行是跟着这次换帧来的
+        else {
+          rr.改用 = [c.oid, c.frame];
+          // 人亲手挑了一帧 = 人看过了。VLM 否掉的那一帧不是这一帧, 以人为准。
+          if (VLM否(词, rr.实例)) { rr.VLM放行 = true; if (rr.决定 === 'drop') rr.决定 = 'keep'; }
+        }
+        收尾全部(词);
+        dirty = true; 重建索引();
+        退一层();          // 选完回到上一层, 卡片上直接看到换上去的那一帧
       };
       box.appendChild(el);
     });
    })
    .catch(e => {
-    t.innerHTML = '<h3>'+esc(w.词)+'<span style="color:var(--red)">cannot reach the server — '+
+    t.innerHTML = '<h3>'+esc(词)+'<span style="color:var(--red)">cannot reach the server — '+
       esc(e)+'. This page may be a stale copy from before the server stopped; '+
       'make sure it is running, then reload.</span></h3>';
    });
@@ -2306,7 +3028,7 @@ function tray(w, oid){
 document.getElementById("save").onclick = async () => {
   if (GATE === 'scale') return scSave();
   const b = document.getElementById("save"); b.disabled = true; b.textContent = "Saving…";
-  const r = await (await fetch("/api/save", {method:"POST",
+  const r = await (await fetch(U("/api/save"), {method:"POST",
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({候选: S.行, 删除: [...S.待删]})})).json();
   if(r.error){ alert("Save failed: "+r.error); b.disabled=false; b.textContent="Save *"; return; }
@@ -2334,12 +3056,11 @@ def main():
     ap.add_argument("--gate", choices=["review", "scale"], default="review",
                     help="打开时停在哪道闸。review=闸2/4(候选决策台), scale=闸3(尺子表)。"
                          "两道闸在同一个服务里, 顶栏可以随时切")
-    ap.add_argument("--solo-th", type=float, default=None,
-                    help="逐实例面积门槛(%%), 只用于面板标注。默认 0.5;"
-                         " beach/carpark 这类俯视场景 pipeline 里配的是 0.03")
+    ap.add_argument("--solo-min-px", type=int, default=None,
+                    help="逐实例面积门槛(像素), 只用于面板标注。默认问 pipeline 要(SOLO_MIN_PX)")
     a = ap.parse_args()
 
-    st = Store(a.scene, a.run, a.indoor, a.stage, a.solo_th)
+    st = Store(a.scene, a.run, a.indoor, a.stage, a.solo_min_px)
     d = st.load()                    # 起服务之前先把决策文件读通, 免得页面开出来才报错
     print(f"场景 {a.scene} 轮次 {a.run}   闸 {2 if st.stage=='pre' else 4} ({st.stage})")
     print(f"决策 {st.DEC}   {len(d['候选'])} 个候选")

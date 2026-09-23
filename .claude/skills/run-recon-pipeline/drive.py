@@ -20,7 +20,7 @@
   drive.py --scene carpark --reset      从头开始
   加 -n 干跑, 只打印要执行的命令
 """
-import argparse, json, os, subprocess, sys
+import argparse, fcntl, json, os, subprocess, sys, time
 
 SAM3D = os.path.expanduser("~/sam3d")
 PIPE_OUT = f"{SAM3D}/pipeline/outdoor_pipeline.py"
@@ -61,7 +61,10 @@ SEGMENTS = {
         ("地基",   ["frames", "vlm", "da3", "up"],                                     "check_ground"),
         ("生成前", ["track", "dedup", "relabel", "pick", "verify", "override"],        "check_picks"),
         ("尺度",   ["gen", "ratio", "meshes", "boxes", "vlm_sizes", "scale"],          "check_scale"),
-        ("召回",   ["solo", "boxes_wd", "compare", "detect", "recall", "recall_mask"], "check_recall"),
+        # ★ 段名按"这段跑完你要在闸口看什么"起, 不按步骤性质。solo(逐实例生成)和召回是
+        #   两件事, 之所以同段: solo 要读 06_all_boxes.json 决定哪些实例值得单独生成,
+        #   而那个文件是上一段 boxes 步才产的 —— 依赖关系决定的顺序。
+        ("逐实例+召回", ["solo", "boxes_wd", "compare", "detect", "recall", "recall_mask"], "check_recall"),
         ("验收",   ["recall_gen", "recall_merge", "assemble", "phys", "render"],       "check_scene"),
         ("收尾",   ["building_scene", "assemble_wd", "phys_wd", "render_wd"],          "check_final"),
     ],
@@ -70,7 +73,7 @@ SEGMENTS = {
         ("地基",   ["frames", "bright", "sub", "vlm", "da3", "up"],                    "check_ground"),
         ("生成前", ["track", "dedup", "relabel", "pick", "verify", "override"],        "check_picks"),
         ("尺度",   ["gen", "ratio", "meshes", "boxes", "vlm_sizes", "scale"],          "check_scale"),
-        ("召回",   ["solo", "detect", "recall", "recall_mask"],                        "check_recall"),
+        ("逐实例+召回", ["solo", "detect", "recall", "recall_mask"],                    "check_recall"),
         # walls 已从两张步骤表里摘掉(房间壳改从点云自己算足迹), 这里再列它会直接 SystemExit
         # zup 排在 scale 之后(见 indoor_pipeline 的注释), 所以它在这一段不在地基段
         ("验收",   ["recall_gen", "recall_merge", "zup", "shell",
@@ -134,6 +137,31 @@ def check_segments(kind):
         print(f"[提示] 这些步骤不在任何一段里, 用 drive.py 永远跑不到: {miss}")
 
 def state_path(R1): return f"{R1}/logs/.drive_state.json"
+
+# 同一轮只许有一个驱动在跑。★ 不是洁癖:
+#   drive.py 的每一步都会往 logs/timing.tsv 追一行、往 logs/.drive_state.json 写"跑到第几段",
+#   两个进程并排跑就是两边各写各的 —— 后写的那个把前一个的段号盖掉, 于是同一段会被跑两遍
+#   (实测 office 2026-09-20: timing.tsv 里 ratio/meshes/boxes/vlm_sizes 各两行, gen 那行
+#   耗时 0 秒、等 GPU 111 秒 —— 那 111 秒就是另一个进程占着 GPU 锁)。
+#   这次没坏数据纯属运气: GPU 有 flock 挡着, 步骤本身又是幂等的。
+#   drive_go.sh 里的 pgrep 只挡住"从它启动"的那条路, 直接敲 drive.py 就绕过去了 —— 锁要在这里。
+_LOCK_FH = None                        # 全局持有, 别让它被回收 —— 文件对象一关, 锁就没了
+def take_run_lock(R1):
+    """拿这一轮的独占锁。拿不到就说清是谁占着, 然后退出。"""
+    global _LOCK_FH
+    os.makedirs(f"{R1}/logs", exist_ok=True)
+    fh = open(f"{R1}/logs/.drive.lock", "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.seek(0); who = fh.read().strip() or "(没记上是谁)"
+        sys.exit(f"[失败] 这一轮已经有一个驱动在跑了: {who}\n"
+                 f"       两个一起跑会互相盖掉 logs/.drive_state.json 的段号, 同一段跑两遍。\n"
+                 f"       等它跑完, 或者确认那个进程已经没了再删 {R1}/logs/.drive.lock")
+    fh.seek(0); fh.truncate()
+    fh.write(f"pid {os.getpid()}  {time.strftime('%F %T')}  {' '.join(sys.argv[1:])}\n")
+    fh.flush()
+    _LOCK_FH = fh                      # 进程退出时内核自动释放, 不用自己解
 def load_state(R1):
     p = state_path(R1)
     return json.load(open(p)) if os.path.exists(p) else dict(段=0, 停在闸口=False)
@@ -182,6 +210,20 @@ def check_ground(R1, tag, scene, kind="outdoor", run="r1"):
                          f" 细长物体容易躺倒。重拍时让相机走动, 别悬停。")
         jump = float(np.percentile(step, 99)/max(np.median(step), 1e-9))
         if jump > 5: lines.append(f"  ★ 帧间位移有跳变 (99分位是中位的 {jump:.0f} 倍), 位姿可能出错了")
+    # 坏位姿帧(pose_check.py, da3 那步写的)。跳变只是个弱信号(ithor312 只抓到 3/11),
+    # 真正决定哪些帧不进 3D 的是这份名单, 闸口必须把它摆出来。
+    bf = _j(f"{D3}/bad_frames.json")
+    if bf is None:
+        lines.append("  ★ 没有 bad_frames.json —— 这一轮 DA3 没做坏位姿筛选, 所有帧都会进 3D")
+    else:
+        nb, nt = len(bf.get("坏帧", [])), bf.get("帧数", 0)
+        lines.append(f"坏位姿帧 {nb}/{nt}" + (f", 不进点云/定天/量盒子/召回: "
+                     f"{[os.path.splitext(x)[0] for x in bf['坏帧']]}" if nb else " (没有)"))
+        sc_ = sorted((v, k) for k, v in (bf.get("分数") or {}).items() if k not in bf.get("坏帧", []))
+        if sc_ and sc_[0][0] < 0.7:
+            lines.append(f"  ★ 留下的帧里最低分 {sc_[0][0]} ({os.path.splitext(sc_[0][1])[0]}), 离门槛 0.6 很近")
+        if nt and nb / nt > 0.2:
+            lines.append(f"  ★ 剔掉了 {nb/nt:.0%} 的帧(上限 25%) —— 位姿大面积不可靠, 考虑重拍")
     v = _j(f"{R1}/01_vlm_vocab.json")
     if v: lines.append(f"词表 {len(v['vocab'])} 个: {', '.join(v['vocab'])}")
     # 这张图现场生成: 抽帧一览 + 点云俯视(带相机轨迹) + 点云侧视(带拟合的地面线)。
@@ -210,7 +252,7 @@ def frames_dir(kind, scene, run):
 def gate_env(R1, tag, scene, kind, run):
     """给人工闸准备环境。**必须把 SOLO/EXCLUDE 那几个也带上。**
 
-    ★ 闸要展示"哪些东西会被生成", 而"会不会逐实例生成"由 SOLO/SOLO_KEEP/SOLO_TH 决定,
+    ★ 闸要展示"哪些东西会被生成", 而"会不会逐实例生成"由 SOLO/SOLO_KEEP/SOLO_MIN_PX 决定,
       这几个值住在 pipeline 的 resolve_cfg 里。以前这里只传 R1/TAG/FR, 于是 review_gate
       里 SOLO_CFG 拿到空串, 整个逐实例枚举被跳过 —— 而 beach/carpark 配的是 SOLO="*"
       (全部逐实例), 等于联络图上一个真正会生成的候选都没有。
@@ -223,10 +265,10 @@ def gate_env(R1, tag, scene, kind, run):
     if r.returncode == 0:
         try:
             cfg = json.loads(r.stdout)
-            for k in ("SOLO", "SOLO_KEEP", "SOLO_TH", "TH", "EXCLUDE", "MIN_AREA_PCT"):
+            for k in ("SOLO", "SOLO_KEEP", "SOLO_MIN_PX", "EXCLUDE", "MIN_AREA_PCT"):
                 if k in cfg: env[k] = str(cfg[k])
-            # 室内那边逐实例门槛的键叫 TH 不叫 SOLO_TH
-            if "SOLO_TH" not in cfg and "TH" in cfg: env["SOLO_TH"] = str(cfg["TH"])
+            # 门槛以前是 SOLO_TH(%, 室内键名还叫 TH), 2026-09-16 两边统一成 SOLO_MIN_PX(像素)。
+            # shell 里残留老键不在这里清: 闸口脚本和流水线各步一样, 见到 SOLO_TH 直接报错(solo_gate.py)。
         except Exception as e:
             print(f"[提示] 配置读不出来({e}), 闸只能看到类候选, 逐实例那批会缺")
     else:
@@ -348,7 +390,7 @@ def gate_report(i, R1, tag, scene, kind, run, last=False):
     missing = [p for p in look if not os.path.exists(p)]
     if missing and not exist:
         print("  (图还没生成: " + ", ".join(os.path.basename(p) for p in missing) + ")")
-    flag = "" if kind == "outdoor" else " --indoor"
+    flag = ("" if kind == "outdoor" else " --indoor") + ("" if run == "r1" else f" --run {run}")   # 漏了 --run 会去推默认的 r1
     if last: print(f"\n★ 这是最后一道闸, {len(segs)} 段都跑完了。")
     else:    print(f"\n★ 停在这里等人。看完之后: drive.py --scene {scene}{flag} --go")
 
@@ -359,6 +401,18 @@ def _applied(R1):
         return json.load(open(f"{R1}/05_review_applied.json"))
     except Exception:
         return {}
+
+
+def _stale_samples(R1, tag):
+    """样本按旧决定挑的词。查不了就当全都过时 —— 白重跑一遍挑图, 好过拿 drop 掉的实例生成整类 mesh。"""
+    r = subprocess.run([PY, f"{SAM3D}/data/outdoor/scripts/class_sample.py", "stale", R1, tag],
+                       capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout)
+    except Exception:
+        print(f"[提示] 查不了整类样本是否过时(退出码 {r.returncode}): {r.stderr.strip()[-300:]}\n"
+              f"       当作过时处理, 重跑挑图")
+        return ["(查不了)"]
 
 
 def apply_decisions(R1, tag, scene, kind, run, seg, dry):
@@ -405,12 +459,19 @@ def apply_decisions(R1, tag, scene, kind, run, seg, dry):
     #   ★ 只动"不生成"的那一类不用重跑 —— 生成那步是当场读 05_review_applied.json 的
     #     (review_decisions.filter_dirs), 没有时序依赖。闸 4 绝大多数情况就是这一类,
     #     不加这个判断的话每次 --go 都要白重跑一遍挑图。
-    NEED_RERUN_KEYS = ("排除词", "逐实例词", "共用词", "改类别", "指定样本")
+    # VLM放行 变了 -> gen_per_instance 要重列清单(被放行的才开始生成)
+    NEED_RERUN_KEYS = ("排除词", "逐实例词", "共用词", "改类别", "指定样本", "VLM放行")
     after = _applied(R1)
     # 空列表/空字典/缺键都当"没有决定" —— 第一次跑时 before 是 {}, before.get() 给 None,
     # 而 after 里是 [] , None != [] 会把 5 个键全判成"变了", 白重跑一遍挑图(verify 还吃 GPU)。
     _norm = lambda v: v or None
     changed = [k for k in NEED_RERUN_KEYS if _norm(before.get(k)) != _norm(after.get(k))]
+    # ★ "不生成"本身不触发重跑, 但它要是挡掉(或放回)了某个词的**整类样本**, 挑图就得重来 ——
+    #   否则整类 mesh 照样拿人 drop 掉的那个实例抠的图生成。按 picks.json 里记的"挑的时候挡了谁"
+    #   和现在的决定逐词比(class_sample.stale_words), 不靠猜。
+    stale = _stale_samples(R1, tag)
+    if stale:
+        changed.append(f"整类样本是按旧决定挑的({', '.join(stale)})")
     if not changed:
         print("[落地决策] 只动了'不生成'一类的决定, 生成那步当场读, 不用重跑任何步骤")
         return
@@ -452,7 +513,9 @@ def main():
     segs = SEGMENTS[kind]
 
     # 场景名打错的话, pipeline 会拿默认配置照跑不误, 干跑还看着像成功的 —— 先挡住
-    root = f"{SAM3D}/data/outdoor/dataset" if kind == "outdoor" else f"{SAM3D}/data"
+    # ★ 素材根目录。室内 2026-09-20 从 data/ 顶层挪到 data/indoor/dataset/(和室外对称),
+    #   indoor_pipeline.py 的 Ctx.SRC 也改了 —— 两处必须一起改, 否则这里放行、那里找不到。
+    root = f"{SAM3D}/data/outdoor/dataset" if kind == "outdoor" else f"{SAM3D}/data/indoor/dataset"
     if not os.path.isdir(f"{root}/{a.scene}"):
         have = sorted(d for d in os.listdir(root)) if os.path.isdir(root) else []
         sys.exit(f"[失败] 没有这个场景: {root}/{a.scene}\n       现有的: {', '.join(have)}")
@@ -460,6 +523,9 @@ def main():
     R1 = (f"{SAM3D}/data/outdoor/result/{a.scene}/{a.run}" if kind == "outdoor"
           else f"{SAM3D}/data/indoorOutput/{a.scene}/{a.run}")
     tag = scene_tag(kind, a.scene, a.run)
+    # --status 是只读的, 跑着的时候也该看得了; 别的都要独占(--reset 也写状态文件)。
+    if not a.status:
+        take_run_lock(R1)
     s = load_state(R1)
 
     if a.reset:
@@ -483,6 +549,15 @@ def main():
 
     while s["段"] < len(segs):
         i = s["段"]; name, steps, _ = segs[i]
+        # 记下"当前在跑哪一轮", 给看板用 —— 这样 tools/watch_run.sh 不带参数也知道看谁。
+        # 不代跑看板: 它的生命周期比这个进程长(这里每跑完一段就退出), 代跑会变成
+        # "跑一段重启一次看板"。挂 tmux 的活在 watch_run.sh 里自己做。
+        try:
+            with open(f"{SAM3D}/tools/.last_run", "w") as _f:
+                _f.write(f"{a.scene}\t{a.run}\t{kind}\n")
+        except OSError:
+            pass
+        print("\n[看板] bash ~/sam3d/tools/watch_run.sh          (不带参数 = 看当前这轮)")
         print(f"\n{'#'*72}\n# 第 {i+1} 段: {name}   ({' -> '.join(steps)})\n{'#'*72}")
         rc = run_steps(kind, a.scene, a.run, steps, a.dry_run)
         if rc != 0:

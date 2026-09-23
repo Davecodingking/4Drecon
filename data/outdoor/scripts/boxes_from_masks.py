@@ -8,7 +8,7 @@
 """
 import sys, os, json, numpy as np, cv2
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from world_frame import load_up, export_T, inverse_T
+from world_frame import load_up, export_T, inverse_T, usable_frames
 from pycocotools import mask as mask_util
 
 ROOT = os.environ.get("R1","/home/jincheng/sam3d/data/outdoor/result/timesquare/r1")
@@ -28,7 +28,8 @@ SAMPLE_FRAMES = int(os.environ.get("SAMPLE_FRAMES","8"))
 # 过得了 2.0, 照搬会把整个场景滤空; 停车场有路面标线和车身纹理, 反而有 92.6%。
 CONF_MIN = float(os.environ.get("CONF_MIN","2.0"))
 cams = json.load(open(f"{DA3}/cameras.json"))["cameras"]
-HAVE = {int(f[:4]) for f in os.listdir(f"{DA3}/depth") if f.endswith("_depth.npy")}
+# 位姿错的帧不许参与(像素会落在错的位置, 盒子被拉长), 见 world_frame.usable_frames
+HAVE = usable_frames(DA3, "量盒子")
 # "天"的方向。老的写法是写死 [0,-1,0] = 首帧相机的 -y —— 街头平视时相机水平, 这个假设
 # 成立(时代广场实测只偏 0.4°); 但高空俯拍时相机低着头, 它的 -y 指向斜上后方, beach 偏
 # 26.2°、carpark 偏 29.2°, 整个场景连同地面一起歪掉。

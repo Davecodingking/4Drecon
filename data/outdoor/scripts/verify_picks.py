@@ -19,6 +19,9 @@ MIN_AREA_PCT=float(os.environ.get("MIN_AREA_PCT","0.05"))
 # 否则 VLM 会拿"这是街景吗"当额外判据, 把吧凳判成 no。
 SCENE_DESC=os.environ.get("SCENE_DESC","street photo")
 HAVE={int(f[:4]) for f in os.listdir(f"{R1}/02_da3/depth") if f.endswith("_depth.npy")}
+import class_sample
+_banned = class_sample.banned_fn(R1, TAG)
+_DEAD = class_sample.dedup_dead(R1)
 
 def crop_on_gray(img, m, pad=0.12):
     ys,xs=np.nonzero(m); y0,y1,x0,x1=ys.min(),ys.max()+1,xs.min(),xs.max()+1
@@ -103,16 +106,9 @@ for fn in sorted(os.listdir(f"{R1}/03_masks")):
     meta=z["meta"]; counts=z["counts"]; H,W=z["hw"]; word=str(z["word"])
     if word not in _todo: continue
     if len(meta)==0 or meta["area"].max()==0: continue
-    live={}
-    for i,(oid,fi,a,e) in enumerate(meta):
-        if a>0 and int(fi) in HAVE: live.setdefault(int(oid),[]).append((i,int(fi),int(a),float(e)))
-    cands=[]
-    for oid,rows in live.items():
-        if len(rows)<2: continue
-        nf=min(len(rows)/10,1.0)
-        i,fi,a,e=max(rows,key=lambda t:t[2]*(1-min(t[3]*4,0.9)))
-        cands.append((a*(1-min(e*4,0.9))*nf, oid, i, fi, a, e, len(rows)))
-    cands.sort(reverse=True)
+    # ★ 候选和 pick 同一条规则(class_sample.py): 去重判给别的词的、人 drop 的、VLM 否决没放行的
+    #   不许进选择题。以前这里从全部实例里重挑, VLM 一选, 被挡掉的实例又回来当了整类样本。
+    cands, _ban, _ = class_sample.ranked(meta, HAVE, word, dead=_DEAD.get(word, ()), banned=_banned)
     tried=[]
     # 先把候选都抠出来, 一次性给 VLM 做选择题
     pool=[]
@@ -145,7 +141,8 @@ for fn in sorted(os.listdir(f"{R1}/03_masks")):
             cv2.imwrite(f"{R1}/04_picks/{name}.jpg",ov,[cv2.IMWRITE_JPEG_QUALITY,88])
             cv2.imwrite(f"{R1}/04_picks/{name}_cut.jpg",cut,[cv2.IMWRITE_JPEG_QUALITY,90])
             picked[word]=dict(obj_id=oid,frame=fi,面积占比=round(100*a/(H*W),2),活帧数=nfr,
-                              贴边=round(e,3),候选数=len(cands),试过=len(tried))
+                              贴边=round(e,3),候选数=len(cands),试过=len(tried),
+                              **{class_sample.BANNED_KEY: sorted(_ban)})
             _ok.add(word)
             break
     report[word]=tried
@@ -168,13 +165,14 @@ print(f"\n[done] 校验 {len(report)} 个词, {len(picked)} 个通过 (只校验
 #   越该验的时候越没人验。pedestrian/r2 实测: person 15 个实例里 3 个根本不是人
 #   (一个黑背包、一堆碎片、半截身子), 全程没有任何机器环节看过它们一眼。
 #
-#   枚举方式和 review_gate.py:128-150 保持一致(同一个打分公式、同一个 SOLO_TH 门槛),
+#   枚举方式和 review_gate.py 保持一致(同一个打分公式、同一个 SOLO_MIN_PX 门槛, 见 solo_gate.py),
 #   这样人在闸口看到的那批, 就是这里验过的那批 —— 否则又是"人在看 A 判 B"。
 SOLO_CFG = os.environ.get("SOLO", "")
 if SOLO_CFG:
     KEEP  = {w.strip() for w in os.environ.get("SOLO_KEEP", "").split(",") if w.strip()}
     EXCL  = {w.strip() for w in os.environ.get("EXCLUDE", "").split(",") if w.strip()}
-    SOLO_TH = float(os.environ.get("SOLO_TH", "0.5"))
+    from solo_gate import min_px
+    SOLO_MIN_PX = min_px()
     _dd = f"{R1}/03_dedup_words.json"
     _dead = {}
     if os.path.exists(_dd):
@@ -205,7 +203,7 @@ if SOLO_CFG:
             if o in _dead.get(w, ()):            # 跨词去重判掉的, 下游本来就不出盒子
                 continue
             pct = 100 * a / (int(H) * int(W))
-            if pct < SOLO_TH:                    # 太小的不逐实例生成, 不必验
+            if a < SOLO_MIN_PX:                  # 太小的不逐实例生成, 不必验
                 continue
             m = mask_util.decode({"counts": counts[i], "size": [int(H), int(W)]}).astype(bool)
             img = cv2.imread(f"{FR}/{fi:04d}.jpg")

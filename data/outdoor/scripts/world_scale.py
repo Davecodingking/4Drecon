@@ -31,6 +31,11 @@ carpark 八类里六类挤在 6.1~7.2, 说明这是一个干净的全局常数, 
   SCALE_AGREE_MIN   保险闸: 落在带内的实例占比低于它就拒绝施加, 默认 0.6
   SCALE_APPLY=0     只估计不施加(想先看看数字时用)
   SCALE_FORCE=1     绕过幂等保护 (危险: 会二次缩放)
+  --- 下面三个只有室内流水线给; 都不给时行为逐位不变 (室外) ---
+  SCALE_PEOPLE      body4d 那一轮的目录。给了就拿人当主尺子, 家具只作对照 (见 1c)
+  REST              01_vlm_rest.json。立在地上的类量"顶面离地多高", 不量盒子厚度 (见 1b)
+  SCALE_CAM_H       "1.0,2.0" 手持相机离地的合理范围。家具给的倍数会让相机跑出这个范围,
+                    就不信它、保留原尺度; 人给的倍数只提醒不拦
 """
 import os, json, shutil, subprocess, sys, time
 import numpy as np
@@ -107,6 +112,66 @@ boxes = json.load(open(f"{R1}/06_all_boxes.json"))
 print(f"[尺子] {len(REAL)} 个词有参考高度; 盒子 {len(boxes)} 类 "
       f"{sum(len(v) for v in boxes.values())} 个实例")
 
+# ---------- 1b. 立在地上的东西: 量"顶面离地多高", 不量盒子厚度 (2026-09-21) ----------
+# ★ 盒子只量得到拍到的部分。办公室的桌子腿被椅子和人挡住, 盒子只剩桌面一片
+#   (office 实测 table 量到 0.43 对常识 0.75), 柱子、柜子下半截同理。遮挡只会量矮、从不量高,
+#   这个偏差永远朝"世界太小、要放大"一个方向, 加权中位数平均不掉 —— office 就这样被放大了
+#   1.499 倍: 放大前相机离地 1.43 m(正是手持高度), 放大后 2.15 m, 放进去的真人只有点云里人的
+#   六成高。唯一从头到脚拍全的门给 0.89, 被桌子柱子的票压过去了。
+#   桌面总是拍得到的, 它离地多高就是桌子多高, 腿挡没挡住都不影响。
+#   哪些类算"立在地上"问 VLM (vlm_rest.py -> 01_vlm_rest.json)。没给 REST 就是老量法。
+REST_P = os.environ.get("REST", "")
+REST = json.load(open(REST_P)) if REST_P and os.path.exists(REST_P) else {}
+GH_RAW = None
+if REST:
+    try:
+        GH_RAW = float(json.load(open(f"{DA3}/world_up.json"))["ground_h"])
+        print(f"[量法] 立在地上的 {sum(v == 'floor' for v in REST.values())} 类改量顶面离地多高 "
+              f"(地面 {GH_RAW:.2f})")
+    except Exception as _e:
+        print(f"[注意] 读不到地面高度({_e}), 立在地上的也只能量盒子厚度")
+
+# ---------- 1c. 人当尺子 (2026-09-21) ----------
+# ★ 有人的场景优先拿人量。人从头到脚都拍得到(不像桌子腿总被挡), SAM 3D Body 给的是真实身高,
+#   它自己估人离镜头多远(只看图和焦距, 不吃深度)。同一个人, 场景深度说他在 d 米、人体模型说
+#   他在 t 米, d/t 就是场景比真米大了多少倍; 每人取中位, 再在人之间取中位。
+#   和 body_into_scene.py 摆人时量的是同一个比例(同一个函数) —— 尺度对了, 摆人时它就该是 1。
+#   人体那一轮只吃帧和焦距、不吃深度, 所以能排在尺度这步之前跑。
+PEOPLE_RUN = os.environ.get("SCALE_PEOPLE", "")
+PEOPLE_MIN_FR = int(os.environ.get("SCALE_PEOPLE_MIN_FRAMES", "5"))
+k_people = None; people_rep = None
+if PEOPLE_RUN:
+    if not os.path.isdir(PEOPLE_RUN):
+        print(f"[人] SCALE_PEOPLE={PEOPLE_RUN} 不存在, 只能用家具")
+    else:
+        sys.path.insert(0, os.path.expanduser("~/sam3d/pipeline"))
+        import body_into_scene as BIS
+        _ppl, _faces, _kept = BIS.load_body(PEOPLE_RUN)
+        _da3, _cams, _UPb, _GHb, _v2k = BIS.load_scene(R1)
+        _mrun = next((f"{PEOPLE_RUN}/{d}" for d in ("04_mesh_occ1", "04_mesh_occ0")
+                      if os.path.isdir(f"{PEOPLE_RUN}/{d}/mesh_4d_individual")), None)
+        _roots = BIS.load_roots(_mrun)
+        _per = {}
+        for _pid, _frs in sorted(_ppl.items(), key=lambda x: int(x[0])):
+            _bis = sorted(b for b in _frs if b < len(_kept) and _kept[b] in _v2k
+                          and _v2k[_kept[b]] in _cams and b in _roots.get(_pid, {}))
+            _r = BIS.depth_ratio(_pid, _bis, _roots[_pid], _mrun, _da3, _v2k, _kept) if _bis else {}
+            if len(_r) >= PEOPLE_MIN_FR:
+                _per[_pid] = (float(np.median(list(_r.values()))), len(_r))
+        if _per:
+            _rr = np.array([v[0] for v in _per.values()])
+            k_people = float(1.0 / np.median(_rr))
+            people_rep = dict(人数=len(_per), 比例中位=round(float(np.median(_rr)), 4),
+                              比例10_90=[round(float(np.percentile(_rr, 10)), 3),
+                                        round(float(np.percentile(_rr, 90)), 3)],
+                              每人={p: dict(场景深度比模型=round(v[0], 3), 帧=v[1]) for p, v in _per.items()},
+                              k=round(k_people, 4))
+            print(f"[人] {len(_per)} 个人当尺子 (场景深度 / 人体模型给的距离, 每人取中位, 至少 {PEOPLE_MIN_FR} 帧):")
+            print("     " + "  ".join(f"{p}: {v[0]:.3f}({v[1]}帧)" for p, v in _per.items()))
+            print(f"     人之间中位 {np.median(_rr):.3f} -> 场景要乘 k = {k_people:.3f}")
+        else:
+            print(f"[人] 没有一个人量到 {PEOPLE_MIN_FR} 帧以上, 只能用家具")
+
 # ---------- 2. 逐类算倍数 ----------
 rows = []
 for w, lst in boxes.items():
@@ -115,55 +180,82 @@ for w, lst in boxes.items():
     # 扁的东西当不了竖直尺子: 井盖真实厚度几厘米, 量出来是噪声, 比出来的倍数能到 11 倍。
     # 用"参照高度本身够不够高"来筛, 不用手写黑名单。
     if real is None or float(real) < MIN_REAL: continue
-    hs = [b["尺寸"][2] for b in lst if b.get("点数", 0) >= MIN_POINTS and b["尺寸"][2] > 1e-4]
+    ok_ = [b for b in lst if b.get("点数", 0) >= MIN_POINTS and b["尺寸"][2] > 1e-4]
+    on_floor = GH_RAW is not None and (REST.get(w) or REST.get(base_word(w))) == "floor"
+    if on_floor:           # 见 1b: 顶面离地多高才是它的高度
+        hs = [float(b["底高"]) + b["尺寸"][2] - GH_RAW for b in ok_ if "底高" in b]
+        hs = [h for h in hs if h > 1e-4]
+    else:
+        hs = [b["尺寸"][2] for b in ok_]
     if len(hs) < MIN_INST: continue
     med = float(np.median(hs))
-    rows.append(dict(词=w, 实例数=len(hs), 量到=round(med, 3), 真实=float(real),
-                     倍数=round(float(real)/med, 4)))
-if len(rows) < 2:
+    row = dict(词=w, 实例数=len(hs), 量到=round(med, 3), 真实=float(real),
+               倍数=round(float(real)/med, 4))
+    if REST: row["量法"] = "顶面离地" if on_floor else "盒子高"
+    rows.append(row)
+if len(rows) < 2 and k_people is None:
     raise SystemExit(f"[失败] 能当尺子的类只有 {len(rows)} 个, 不够。"
                      f"(要求: 词在尺子表里、点数 >= {MIN_POINTS}、每类 >= {MIN_INST} 个实例)")
 
-def wq(v, w, q):
-    """按实例数加权的分位数。不加权是不对的: 19 辆车和 2 台叉车不该一人一票 ——
-    实例多的类中位数更稳, 也更可能是场景的主体。"""
-    o = np.argsort(v); v = np.asarray(v, float)[o]; w = np.asarray(w, float)[o]
-    return float(np.interp(q, (np.cumsum(w) - 0.5*w)/w.sum(), v))
+if len(rows) >= 2:
+    def wq(v, w, q):
+        """按实例数加权的分位数。不加权是不对的: 19 辆车和 2 台叉车不该一人一票 ——
+        实例多的类中位数更稳, 也更可能是场景的主体。"""
+        o = np.argsort(v); v = np.asarray(v, float)[o]; w = np.asarray(w, float)[o]
+        return float(np.interp(q, (np.cumsum(w) - 0.5*w)/w.sum(), v))
 
-f_all = np.array([r["倍数"] for r in rows])
-n_all = np.array([r["实例数"] for r in rows], float)
-med0  = wq(f_all, n_all, 0.5)
-keep  = np.abs(np.log(f_all/med0)) < np.log(OUTLIER)
-if keep.sum() < 2:                       # 全被剔光就退回不剔
-    print("[注意] 剔离群后不足 2 类, 这一步不剔了")
-    keep = np.ones(len(rows), bool)
-for r, k in zip(rows, keep): r["采用"] = bool(k)
+    f_all = np.array([r["倍数"] for r in rows])
+    n_all = np.array([r["实例数"] for r in rows], float)
+    med0  = wq(f_all, n_all, 0.5)
+    keep  = np.abs(np.log(f_all/med0)) < np.log(OUTLIER)
+    if keep.sum() < 2:                       # 全被剔光就退回不剔
+        print("[注意] 剔离群后不足 2 类, 这一步不剔了")
+        keep = np.ones(len(rows), bool)
+    for r, k in zip(rows, keep): r["采用"] = bool(k)
 
-kept = [r for r in rows if r["采用"]]
-fk = np.array([r["倍数"] for r in kept]); nk = np.array([r["实例数"] for r in kept], float)
-k_hat = wq(fk, nk, 0.5)
-spread = float(wq(fk, nk, 0.9)/max(wq(fk, nk, 0.1), 1e-9))
-# ★ 闸门看的是"一致率"不是"离散"。
-# 离散是个太苛刻的判据: 总有一两类的参照高度被 VLM 说错(路灯说成 3.5 米), 或者高度被遮挡
-# 截短(俯拍只看得到卡车顶), 这几类会把 90/10 分位撑开, 但它们并不影响加权中位数。
-# 真正该问的是"大部分证据同不同意", 所以统计落在 k 的 ±AGREE_BAND 倍带内的实例占比。
-inband = (fk > k_hat/AGREE_BAND) & (fk < k_hat*AGREE_BAND)
-agree = float(nk[inband].sum()/nk.sum())
+    kept = [r for r in rows if r["采用"]]
+    fk = np.array([r["倍数"] for r in kept]); nk = np.array([r["实例数"] for r in kept], float)
+    k_hat = wq(fk, nk, 0.5)
+    spread = float(wq(fk, nk, 0.9)/max(wq(fk, nk, 0.1), 1e-9))
+    # ★ 闸门看的是"一致率"不是"离散"。
+    # 离散是个太苛刻的判据: 总有一两类的参照高度被 VLM 说错(路灯说成 3.5 米), 或者高度被遮挡
+    # 截短(俯拍只看得到卡车顶), 这几类会把 90/10 分位撑开, 但它们并不影响加权中位数。
+    # 真正该问的是"大部分证据同不同意", 所以统计落在 k 的 ±AGREE_BAND 倍带内的实例占比。
+    inband = (fk > k_hat/AGREE_BAND) & (fk < k_hat*AGREE_BAND)
+    agree = float(nk[inband].sum()/nk.sum())
 
-print(f"\n{'词':14s} {'实例':>4s} {'量到高':>7s} {'真实':>6s} {'倍数':>6s}")
-for r in sorted(rows, key=lambda x: -x["倍数"]):
-    print(f"{r['词']:14s} {r['实例数']:4d} {r['量到']:7.2f} {r['真实']:6.2f} {r['倍数']:6.2f}"
-          + ("" if r["采用"] else "   <- 离群, 不用"))
-print(f"\n[结果] 采用 {len(kept)}/{len(rows)} 类, 加权中位倍数 k = {k_hat:.3f}")
-print(f"       一致率 {100*agree:.0f}% 的实例落在 k 的 {1/AGREE_BAND:.2f}~{AGREE_BAND:.2f} 倍带内 "
-      f"(闸门 {100*AGREE_MIN:.0f}%), 加权离散(90/10) {spread:.2f}")
-for r, ib in zip(kept, inband):
-    if not ib: print(f"       带外: {r['词']} ({r['实例数']}个, {r['倍数']:.2f}) —— 参照高度或量到的高度有问题")
+    print(f"\n{'词':14s} {'实例':>4s} {'量到高':>7s} {'真实':>6s} {'倍数':>6s}")
+    for r in sorted(rows, key=lambda x: -x["倍数"]):
+        print(f"{r['词']:14s} {r['实例数']:4d} {r['量到']:7.2f} {r['真实']:6.2f} {r['倍数']:6.2f}"
+              + ("" if r["采用"] else "   <- 离群, 不用") + (f"   ({r['量法']})" if "量法" in r else ""))
+    print(f"\n[结果] 采用 {len(kept)}/{len(rows)} 类, 加权中位倍数 k = {k_hat:.3f}")
+    print(f"       一致率 {100*agree:.0f}% 的实例落在 k 的 {1/AGREE_BAND:.2f}~{AGREE_BAND:.2f} 倍带内 "
+          f"(闸门 {100*AGREE_MIN:.0f}%), 加权离散(90/10) {spread:.2f}")
+    for r, ib in zip(kept, inband):
+        if not ib: print(f"       带外: {r['词']} ({r['实例数']}个, {r['倍数']:.2f}) —— 参照高度或量到的高度有问题")
 
-report = dict(k=round(k_hat, 4), 一致率=round(agree, 3), 离散=round(spread, 3),
-              采用类数=len(kept), 候选类数=len(rows), 闸门=AGREE_MIN, 逐类=rows,
-              一致率达标=bool(agree >= AGREE_MIN),
-              说明="k = 真实米 / DA3 米")
+    report = dict(k=round(k_hat, 4), 一致率=round(agree, 3), 离散=round(spread, 3),
+                  采用类数=len(kept), 候选类数=len(rows), 闸门=AGREE_MIN, 逐类=rows,
+                  一致率达标=bool(agree >= AGREE_MIN),
+                  说明="k = 真实米 / DA3 米")
+else:
+    # 家具不够两类, 但有人(没人的话上面已经退出了): 只用人
+    print(f"[家具] 能当尺子的类只有 {len(rows)} 个, 不够单独定倍数 —— 只用人")
+    k_hat, agree, spread, kept = None, None, None, []
+    report = dict(k=None, 一致率=None, 离散=None, 采用类数=0, 候选类数=len(rows), 闸门=AGREE_MIN,
+                  逐类=rows, 一致率达标=None, 说明="k = 真实米 / DA3 米")
+
+# ---------- 2b. 有人就用人的 ----------
+SRC = "家具"
+if k_people is not None:
+    print(f"\n[人 vs 家具] 人说 k = {k_people:.3f}" + (f", 家具说 k = {k_hat:.3f}" if k_hat else "")
+          + "  -> 用人的")
+    print("       人从头到脚拍得全、身高是真的; 家具的盒子被遮挡量矮, 只会往大了偏。")
+    report.update(k=round(k_people, 4), 来源="人", 家具给的k=(round(k_hat, 4) if k_hat else None),
+                  人=people_rep)
+    k_hat = k_people; SRC = "人"
+elif REST or PEOPLE_RUN:
+    report["来源"] = "家具"
 
 # ---------- 3. 保险闸 ----------
 # ★ 一致率的判定要**先记进报告再分支**。原来 SCALE_APPLY=0 排在闸门前面直接 exit,
@@ -171,13 +263,13 @@ report = dict(k=round(k_hat, 4), 一致率=round(agree, 3), 离散=round(spread,
 #   会以为是自己主动跳过的, 而真相是这个场景的尺子本身就对不上。
 if not APPLY:
     report["施加"] = False
-    report["拒绝原因"] = ("SCALE_APPLY=0, 只估计" if agree >= AGREE_MIN else
+    report["拒绝原因"] = ("SCALE_APPLY=0, 只估计" if (agree is None or agree >= AGREE_MIN) else
                           f"SCALE_APPLY=0, 只估计(而且一致率 {agree:.2f} 本来也低于闸门 {AGREE_MIN})")
     write_est(report)
     print(f"[只估计] SCALE_APPLY=0, 没动数据。报告 -> {EST}")
     print(f"       ★ 没有写 {os.path.basename(OUT)} —— 这一步在 --check 里仍然算没做完, 这是故意的。")
     sys.exit(0)
-if agree < AGREE_MIN:
+if SRC == "家具" and agree < AGREE_MIN:      # 用人的时候不看家具的一致率
     report["施加"] = False
     report["拒绝原因"] = f"一致率 {agree:.2f} 低于闸门 {AGREE_MIN}"
     write_est(report)
@@ -190,8 +282,32 @@ if agree < AGREE_MIN:
            "         3. SCALE_APPLY=0 —— 只估计不施加, 明确接受 这个场景不校准。")
     print(f"       尺度改错比不改更糟。报告写在 {EST}, 自己看一眼是哪个词的参照高度不对。")
     sys.exit(2)
-if abs(np.log(k_hat)) < np.log(1.05):
-    print(f"[无需施加] k = {k_hat:.3f}, 和 1 差不到 5%, 当作本来就是对的。")
+# 人是精确的尺子, 差 2% 就值得改; 家具噪声大, 差不到 5% 当作本来就对 (室外只走家具, 逐位不变)
+NOOP = 1.02 if SRC == "人" else 1.05
+# ---- 相机离地核对 (只有室内给 SCALE_CAM_H) ----
+# 手持拍的, 相机离地 1.4~1.6 m。家具给的倍数把它推出合理范围, 说明家具量错了, 不如不改;
+# 人给的倍数只提醒 —— 人比家具可信, 真有人蹲着或举高拍也说得通。
+CAM_BAD = False
+if os.environ.get("SCALE_CAM_H", ""):
+    _lo, _hi = (float(x) for x in os.environ["SCALE_CAM_H"].split(","))
+    _u = json.load(open(f"{DA3}/world_up.json")); _UPv = np.array(_u["up"], float)
+    _cc = np.array([np.linalg.inv(np.array(c["extrinsic_w2c_4x4"], float).reshape(4, 4))[:3, 3]
+                    for c in cams_doc["cameras"].values()])
+    ch_raw = float(np.median(_cc @ _UPv) - float(_u["ground_h"])); ch = ch_raw * k_hat
+    report["相机离地"] = dict(乘之前=round(ch_raw, 3), 乘之后=round(ch, 3), 合理范围=[_lo, _hi])
+    if _lo <= ch <= _hi:
+        print(f"[核对] 相机离地 {ch_raw:.2f} m, 乘 {k_hat:.3f} 后 {ch:.2f} m —— 像手持拍的 ({_lo}~{_hi} m)")
+    elif SRC == "人":
+        print(f"[注意] 按人的倍数乘完, 相机离地 {ch:.2f} m, 不在 {_lo}~{_hi} m —— 仍按人施加, 出图请核对")
+    else:
+        print(f"[不放大] 家具给的 k = {k_hat:.3f} 会让相机离地 {ch:.2f} m (乘之前 {ch_raw:.2f} m), "
+              f"不在手持的 {_lo}~{_hi} m 里 —— 不信它, 保留原尺度")
+        CAM_BAD = True
+if CAM_BAD or abs(np.log(k_hat)) < np.log(NOOP):
+    if CAM_BAD:
+        print("[无需施加] 相机高度不支持家具给的倍数, 保留原尺度。")
+    else:
+        print(f"[无需施加] k = {k_hat:.3f}, 和 1 差不到 {100*(NOOP-1):.0f}%, 当作本来就是对的。")
     # ★ 还是要写进 cameras.json。否则下游(assemble_scene 的守卫)看不到这个字段,
     #   会当成"这个场景从没标定过"天天报警 —— 而这其实是**正常结果**, 室内几乎每次都走这条。
     #   醒目警告出现在正常结果上, 练几次就没人看了。
@@ -203,7 +319,8 @@ if abs(np.log(k_hat)) < np.log(1.05):
     # ★ 这条写 OUT 不写 EST, 是有意的: 它算"这一步做完了, 结论是无需施加" ——
     #   cameras.json 拿到了 metric_scale_applied=1.0, 下游守卫满足, 重跑幂等。
     #   和上面两条"拒绝"不是一回事, 别按"没施加就写 EST"一刀切。
-    report["施加"] = False; report["拒绝原因"] = "k 已经接近 1"; report["无需施加"] = True
+    report["施加"] = False; report["无需施加"] = True
+    report["拒绝原因"] = "相机离地不像手持, 不信家具给的倍数" if CAM_BAD else "k 已经接近 1"
     for _junk in (f"{OUT}.stale", EST):      # 一个场景只该留一个说法
         if os.path.exists(_junk): os.remove(_junk)
     json.dump(report, open(OUT, "w"), ensure_ascii=False, indent=1)

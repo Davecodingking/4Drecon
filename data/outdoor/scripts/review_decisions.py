@@ -19,6 +19,7 @@
   不生成    [生成名...]            单个候选不要      -> filter_dirs / 组装也挡
   指定样本  {"词"或"词#实例": [实例, 帧]}  换一张抠图 -> s_override / gen_per_instance
   改类别    {"词#实例": 目标词}    实例挪到别的词    -> relabel_words.py
+  VLM放行   [生成名...]            VLM 说"不是它", 人看过还是要 -> gen_per_instance / 组装
 
 ★ 人在闸口填的"分组复用"不是第七个字段 —— 它在 review_gate --apply 里就被展开成
   "改类别 + 共用词"两条已有机制了, 运行期没有第三套代码。
@@ -105,6 +106,26 @@ def _parse_ov(R1):
             raise SystemExit(f"[失败] 决策文件里 {k!r} 的\"指定样本\"应该是 [实例号, 帧号], 拿到 {v!r}")
         out[str(k)] = (int(v[0]), int(v[1]))
     return out
+
+
+VLM_INST = "04_picks/vlm_verify_inst.json"
+
+
+def vlm_rejected(R1):
+    """verify_picks.py 逐实例那一遍否掉的实例 {词: {实例号}}。文件不在当空的(老轮次没有)。"""
+    p = f"{R1}/{VLM_INST}"
+    if not os.path.exists(p):
+        return {}
+    return {w: {int(x) for x in v} for w, v in (json.load(open(p)).get("否决") or {}).items()}
+
+
+def vlm_released(R1):
+    """人在闸口看过、决定"VLM 说不是也照样要"的生成名集合。
+    ★ VLM 的否决只是**提醒**, 不是判决: 它只看了机器自动挑的那一帧, 而且会看错。
+      以前否决 = 直接不生成, 组装再按名字借同词别人的 mesh 摆上去(pedestrian r2 的 car #2
+      就这样变成一辆 8 米长的 car_0), 人在闸口没有任何办法把它要回来。
+      现在: 否决且没放行 = 不生成、不摆、不借; 放行 = 按人选的帧生成它自己的 mesh。"""
+    return set(load(R1).get("VLM放行") or [])
 
 
 def overrides(R1, fallback=None):

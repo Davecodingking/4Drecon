@@ -13,6 +13,11 @@
 
 墙/门/窗行原样保留, bbox_N 的编号也原样保留 —— 下游全靠这个 idx 对应物体。
 
+★ 物体链有对应的一步: data/outdoor/scripts/assemble_scene.py 的 YAW_SNAP / snap_yaw()。
+  那边吸附目标不是 0/90 —— 物体链的 assemble 跑在未旋转的 DA3 系里, 坐标轴和墙无关,
+  所以它从房间壳的墙线里按长度加权数出建筑主方向再吸。同一件事, 两个坐标系。
+  改这里的掰正规则时想想那边。
+
 用法: python layout_boxfix.py --layout 04_布局.txt --out 05_布局_掰正.txt
 """
 import argparse, os, re, sys

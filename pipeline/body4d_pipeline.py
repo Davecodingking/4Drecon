@@ -43,7 +43,13 @@
     python body4d_pipeline.py --scene mayday -n                  # 干跑, 打印能直接粘的命令
     PICK=1,2,4 python body4d_pipeline.py --scene mayday --from pick
 """
-import argparse, fcntl, glob, json, os, shlex, subprocess, time
+import argparse, glob, json, os, shlex, subprocess, sys, time
+
+# ★ 驱动层的公共件在 _common.py(见那个文件的文件头)。三条流水线共用同一把 GPU 锁、
+#   同一个跑命令/计时/配置解析的实现 —— 复制粘贴过的东西一定会漂移。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _common import (LOCK, GpuLock, wait_gpu, sh, envcmd, stamp_path,
+                     timing as _timing, resolve_cfg as _resolve_cfg)
 
 HOME = os.path.expanduser("~")
 SAM3D = f"{HOME}/sam3d"
@@ -69,6 +75,9 @@ CFG = dict(
                           # mayday 人高 345~409px 一帧不丢; pedestrian 148~372px 仍有帧被跳。
                           # ★ 所以人像高度**不是**决定跳不跳帧的因素 —— 提分辨率救不回来, 实测过。
     MAX_FRAMES = "96",    # 帧数上限。论文自测 90 帧/5 人/A100-80G, 先不越过
+    SCENE_R1   = "",      # 场景重建的结果目录。给了就不从视频抽帧, 直接用场景那套帧(frames_r1)
+                          # 和它的相机焦距 —— 人要放回这个场景, 每一帧都得有场景的相机和深度。
+                          # ★ 自己抽帧的话帧对不齐: pedestrian 44 帧里只有 30 帧能对上场景相机。
     START_SEC  = "0",
     JPEG_Q     = "95",
 
@@ -83,11 +92,14 @@ CFG = dict(
     IOU_TH       = "0.20",
 
     # ---- 人工闸 ----
-    PICK = "",              # 逗号分隔的 id; 空 = 留下 MIN_AREA_PCT 过滤后的全部。
+    PICK = "",              # 逗号分隔的 id; 空 = 自动挑: MIN_AREA_PCT 过滤后、帧数够的全部。
                             # 看完 03_check.jpg 再填, 或者直接改 SCENES
+    MIN_PICK_FRAMES = "5",  # 自动挑人时, 出现不到这么多帧的 id 不要(一闪而过的多半是误检/路过的半个人)
 
     # ---- 出网格 ----
-    OCC         = "0",      # 1 开 Diffusion-VAS 补全。★ 32G 上开了会 OOM, 见文件头
+    OCC         = "0",      # 1 开 Diffusion-VAS 补全。★ 32G 上开了会 OOM, 见文件头。
+                            # ★ 2026-09-21 补全的三份权重(Diffusion-VAS x2 + Depth-Anything V2, 16G)
+                            #   已删 —— 32G 上从来没开成过。要开得重新下, 见 sam-body4d/NOTES_5090.md 权重表
     BATCH       = "8",      # 上游默认 64 (论文写 32), 我们显存只有人家 40%。
                             # ★ 注意 max_occ_len 会被 min(它, BATCH) 夹, 两个参数不独立
     MAX_OCC_LEN = "25",
@@ -97,7 +109,7 @@ CFG = dict(
     ALPHA  = "0.6",         # 网格叠回原片的不透明度
 )
 
-SCENE_TAG = {"mayday": "md", "pedestrian": "pd"}
+SCENE_TAG = {"mayday": "md", "pedestrian": "pd", "office": "of"}
 SCENES = {
     # 2538x1066 (2.381:1 超宽), 335 帧。酒吧三人打架, 重度互遮挡 + 运动模糊 + 低光。
     # 人占画面高 60~90%, 分辨率不是瓶颈。
@@ -112,16 +124,17 @@ SCENES = {
     #   一帧没救回来。跳过的真实原因是 SAM 3D Body 自己返回全零 bbox 拒绝出网格,
     #   判据在它内部, 还没定位。用 1920 纯粹是"人本来就小, 没必要再缩"。
     "pedestrian": dict(MAX_FRAMES="44", LONG_SIDE="1920"),
+
+    # 室内办公室, 1920x1080。人既有走动的也有坐着的。帧和焦距都直接取场景 r1 那套,
+    # 人最后要放回这个场景里 (body_into_scene / indoor_pipeline 的 people 步)。
+    "office": dict(SCENE_R1=f"{SAM3D}/data/indoorOutput/office/r1"),
 }
 
 
 def resolve_cfg(scene, R1=None):
-    """CFG 默认值 <- 场景覆盖 <- 环境变量。和 outdoor_pipeline 同一套。
-    环境变量层只认已经在 CFG 里的键, 所以 CFG 同时也是"可调参数白名单"。"""
-    cfg = dict(CFG)
-    cfg.update(SCENES.get(scene, {}))
-    cfg.update({k: v for k, v in os.environ.items() if k in CFG})
-    return cfg
+    """本文件的 CFG/SCENES 接到共用实现上。这条链没有人工闸决策文件, 所以不传 review。
+    生效顺序: CFG 默认 <- 场景覆盖 <- 环境变量, 详见 _common.py。"""
+    return _resolve_cfg(CFG, SCENES, scene)
 
 
 class Ctx:
@@ -144,75 +157,6 @@ class Ctx:
         return f"{self.R1}/04_mesh_occ{1 if self.cfg['OCC'] == '1' else 0}"
 
 
-LOCK = "/tmp/outdoor_pipeline_gpu.lock"        # ★ 和另外两条 pipeline 共用一把锁
-
-
-class GpuLock:
-    """一张 32G 卡塞不下两个常驻大模型。抢不到就排队, 不杀别人。"""
-    def __enter__(self):
-        self.f = open(LOCK, "a+")
-        try:
-            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            print("    [等待] 另一条 pipeline 正在占用 GPU, 排队中...", flush=True)
-            fcntl.flock(self.f, fcntl.LOCK_EX)
-        return self
-
-    def __exit__(self, *a):
-        fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
-
-
-def wait_gpu(need_mb, dry=False, timeout=10800):
-    """等到卡上没有别人的进程且余量够。★ 只等不杀 —— 别人的活不归我们管。"""
-    if dry:
-        return
-    me, t0 = os.getpid(), time.time()
-    while True:
-        q = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory",
-                            "--format=csv,noheader,nounits"], capture_output=True, text=True)
-        others = sum(int(r.split(",")[1]) for r in q.stdout.strip().splitlines()
-                     if r.strip() and int(r.split(",")[0]) != me and int(r.split(",")[1]) > 2000)
-        g = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total",
-                            "--format=csv,noheader,nounits"], capture_output=True, text=True)
-        used, total = [int(x) for x in g.stdout.strip().splitlines()[0].split(",")]
-        if not others and total - used >= need_mb:
-            return
-        if time.time() - t0 > timeout:
-            raise SystemExit(f"[失败] 排了 {timeout/60:.0f}min 队还是轮不上 GPU")
-        print(f"    [等待GPU] 别人占 {others}MB, 空闲 {total-used}MB, 要 {need_mb}MB", flush=True)
-        time.sleep(30)
-
-
-def stamp_path(c, key):
-    return f"{c.LOG}/.stamp_{key}"
-
-
-def sh(cmd, log=None, dry=False, cwd=None, sep=None):
-    line = cmd if isinstance(cmd, str) else " ".join(shlex.quote(x) for x in cmd)
-    print(f"    $ {line}" + (f"   > {os.path.basename(log)}" if log else ""), flush=True)
-    if dry:
-        return 0
-    if log:
-        os.makedirs(os.path.dirname(log), exist_ok=True)
-        if sep:
-            with open(log, "a") as f:
-                f.write(sep)
-    with (open(log, "a") if log else open(os.devnull, "w")) as f:
-        out = f if log else None
-        r = subprocess.run(cmd, shell=isinstance(cmd, str), cwd=cwd,
-                           stdout=out or None, stderr=subprocess.STDOUT if out else None)
-    if r.returncode:
-        raise SystemExit(f"[失败] 退出码 {r.returncode}: {line}")
-    return r.returncode
-
-
-def envcmd(py, script, env, args=()):
-    """环境变量写在命令行最前面, 这样 -n 打印出来的就是能直接粘去跑的命令。"""
-    pre = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items())
-    return (pre + " " if pre else "") + f"{shlex.quote(py)} {shlex.quote(script)} " + \
-        " ".join(shlex.quote(str(x)) for x in args)
-
-
 GPUENV = dict(CUDA_HOME="/usr/local/cuda-12.8", TORCH_CUDA_ARCH_LIST="12.0",
               PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
 
@@ -220,8 +164,48 @@ GPUENV = dict(CUDA_HOME="/usr/local/cuda-12.8", TORCH_CUDA_ARCH_LIST="12.0",
 # ============================ 各步骤 ============================
 
 def s_frames(c, dry):
-    """抽帧。降 fps + 等比缩放 + 补零四位。理由见 body4d_frames.py 的文件头。"""
+    """抽帧。降 fps + 等比缩放 + 补零四位。理由见 body4d_frames.py 的文件头。
+    给了 SCENE_R1 就不抽: 直接软链场景那套帧, kept_indices 取场景的 frame_map ——
+    这样人体的每一帧都对得上场景的一个相机, body_into_scene 按同一张表找回相机。"""
     g = c.cfg
+    if g["SCENE_R1"]:
+        code = f'''
+import json, os, sys
+sys.path.insert(0, {SAM3D + "/pipeline"!r})
+from _common import load_frame_map
+da3 = {g["SCENE_R1"] + "/02_da3"!r}
+fm = load_frame_map(da3)
+src = json.load(open(da3 + "/frame_map.json")).get("frames_dir") if os.path.exists(da3 + "/frame_map.json") else None
+src = src or json.load(open(da3 + "/cameras.json"))["source"]
+names = sorted(fm)
+if names != [f"{{i:04d}}.jpg" for i in range(len(names))]:
+    raise SystemExit(f"[失败] 场景帧不是 0000.jpg 起连续编号, body4d 按位置序号读帧会错位: {{names[:5]}}")
+out = {c.FR!r}; os.makedirs(out, exist_ok=True)
+for f in os.listdir(out):
+    if f.endswith((".jpg", ".json")): os.remove(os.path.join(out, f))
+for n in names:
+    os.symlink(os.path.join(src, n), os.path.join(out, n))
+from PIL import Image
+W, H = Image.open(os.path.join(src, names[0])).size
+# 帧率给动画时间轴用(原视频帧号 / fps)。frame_map 里没记的话去数据集找原视频读
+fps = json.load(open(da3 + "/frame_map.json")).get("fps") if os.path.exists(da3 + "/frame_map.json") else None
+if not fps:
+    import glob, cv2
+    scene = os.path.basename(os.path.dirname({g["SCENE_R1"]!r}))
+    vids = sorted(glob.glob({SAM3D!r} + f"/data/indoor/dataset/{{scene}}/*.mp4")
+                  + glob.glob({SAM3D!r} + f"/data/outdoor/dataset/{{scene}}/*.mp4"))
+    fps = cv2.VideoCapture(vids[0]).get(cv2.CAP_PROP_FPS) if vids else 0
+    if not fps:
+        fps = 30.0; print("[警告] 找不到原视频的帧率, 按 30fps 算 —— 动画会快慢不对")
+json.dump(dict(scene_r1={g["SCENE_R1"]!r}, frames_dir=src, out_wh=[W, H], n_frames=len(names),
+               src_fps=float(fps),
+               kept_indices=[int(fm[n]) for n in names],
+               note="帧是场景 frames_r1 的软链, kept_indices = 场景 frame_map 里的原视频帧号"),
+          open(os.path.join(out, "frames.json"), "w"), ensure_ascii=False, indent=1)
+print(f"[场景帧] {{len(names)}} 帧 {{W}}x{{H}} <- {{src}}  (软链, 原视频帧号 {{fm[names[0]]}}..{{fm[names[-1]]}})")
+'''
+        sh([PY["sam3d"], "-c", code], f"{c.LOG}/00_frames.log", dry)
+        return
     sh(envcmd(PY["sam3d"], f"{SAM3D}/pipeline/body4d_frames.py", {},
               ["--video", c.VID, "--out", c.FR, "--fps", g["FPS_OUT"],
                "--stride", g["STRIDE"], "--long-side", g["LONG_SIDE"],
@@ -259,11 +243,11 @@ def s_pick(c, dry):
 import json, os
 rep = json.load(open({rep!r}))
 cov = {{int(k): v for k, v in rep["coverage"].items()}}
-pick = [int(x) for x in {pick!r}.split(",") if x.strip()] or sorted(cov)
+pick = [int(x) for x in {pick!r}.split(",") if x.strip()] or sorted(i for i in cov if cov[i] >= {int(c.cfg["MIN_PICK_FRAMES"])})
 miss = [i for i in pick if i not in cov]
 if miss:
     raise SystemExit(f"[失败] PICK 里的 id {{miss}} 跟踪结果里没有。有的是 {{sorted(cov)}}")
-json.dump(dict(keep_ids=pick, decided_by=("human" if {pick!r} else "auto-全留"),
+json.dump(dict(keep_ids=pick, decided_by=("human" if {pick!r} else "auto(帧数>={c.cfg['MIN_PICK_FRAMES']})"),
                scene={c.scene!r}, run={c.run!r},
                coverage={{str(i): cov[i] for i in pick}},
                dropped={{str(i): cov[i] for i in cov if i not in pick}}),
@@ -279,7 +263,8 @@ def s_mesh(c, dry):
     wait_gpu(26000 if g["OCC"] == "1" else 15000, dry)
     sh(envcmd(PY["body4d"], f"{B4D}/body4d_mesh_5090.py", GPUENV,
               ["--dir", c.TRK, "--out", c.MESH, "--completion", g["OCC"],
-               "--batch-size", g["BATCH"], "--max-occ-len", g["MAX_OCC_LEN"]]),
+               "--batch-size", g["BATCH"], "--max-occ-len", g["MAX_OCC_LEN"]]
+              + (["--cam-json", f"{g['SCENE_R1']}/02_da3/cameras.json"] if g["SCENE_R1"] else [])),
        f"{c.LOG}/04_mesh.log", dry, cwd=B4D)
 
 

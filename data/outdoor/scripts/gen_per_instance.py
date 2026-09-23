@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """对不该复用的类, 每个实例各自裁一张最好的图去生成 mesh.
-够大的单独生成; 太小的(生成必是垃圾)继续复用同类里最清楚的那个。"""
+够大的(>= SOLO_MIN_PX 像素, 见 solo_gate.py)单独生成; 太小的(生成必是垃圾)继续复用。"""
 import os, sys, json, numpy as np, cv2
 from pycocotools import mask as mask_util
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -14,7 +14,11 @@ KEEP=set(x for x in os.environ.get("SOLO_KEEP","").split(",") if x)   # 白名�
 # SOLO 和 EXCLUDE 可能同时含一个词 (cyberpunk 上 sofa 就是), 排除优先 —— 否则逐实例
 # 生成一堆 mesh, 组装时全被扔。
 EXCLUDE=set(x.strip() for x in os.environ.get("EXCLUDE","").split(",") if x.strip())
-TH=float(os.environ.get("TH","0.5"))
+# 门槛按像素, 定义在 solo_gate.py。老键 TH(画面百分比)还在环境里就报错, 别静默换门槛。
+if "TH" in os.environ:
+    raise SystemExit(f"[失败] 环境里还有 TH={os.environ['TH']} —— 已废弃, 改用 SOLO_MIN_PX(像素数)")
+from solo_gate import min_px
+MIN_PX=min_px()
 BOXES=os.environ.get("BOXES", f"{R1}/06_all_boxes.json")
 d=json.load(open(BOXES))
 if "*" in SOLO: SOLO=set(d)-KEEP          # "*" = 除白名单外全部逐实例生成
@@ -29,17 +33,19 @@ OV_INST=review.overrides_inst(R1)     # {(词, 实例号): 帧号} —— 人在
 _VP = f"{R1}/04_picks/vlm_verify_inst.json"
 VLM_REJ = ({w: set(v) for w, v in (json.load(open(_VP)).get("否决") or {}).items()}
            if os.path.exists(_VP) else {})
+RELEASE = review.vlm_released(R1)     # 人看过、VLM 说不是也照样要的
 if VLM_REJ:
-    print(f"[VLM否决] {sum(len(v) for v in VLM_REJ.values())} 个实例不生成: "
-          + json.dumps({k: sorted(v) for k, v in VLM_REJ.items()}, ensure_ascii=False))
+    print(f"[VLM否决] {sum(len(v) for v in VLM_REJ.values())} 个实例被 VLM 否决: "
+          + json.dumps({k: sorted(v) for k, v in VLM_REJ.items()}, ensure_ascii=False)
+          + (f"; 其中人工放行 {sorted(RELEASE)}" if RELEASE else "; 没有人工放行的, 都不生成"))
 jobs=[]
 for w in SOLO:
     z=np.load(f"{R1}/03_masks/{w.replace(' ','_')}.npz",allow_pickle=True)
     meta=z["meta"]; counts=z["counts"]; H,W=z["hw"]
     for b in d.get(w,[]):
         oid=b["obj_id"]
-        if oid in VLM_REJ.get(w, ()):      # VLM 说这不是这个词, 别烧这份 GPU
-            continue
+        if oid in VLM_REJ.get(w, ()) and f"{TAG}_{w.replace(' ','_')}_{oid}" not in RELEASE:
+            continue                       # VLM 说这不是这个词, 人也没放行 -> 不生成
         rows=[(i,int(a),int(f),float(e)) for i,(o,f,a,e) in enumerate(meta) if int(o)==oid and a>0]
         if not rows: continue
         i,a,fi,e = max(rows, key=lambda t: t[1]*(1-min(t[3]*4,0.9)))   # 面积大且不贴边
@@ -57,15 +63,15 @@ for w in SOLO:
                 print(f"[人工指定] ★ {w}#{oid} 点的第 {_want} 帧没有这个实例的 mask, "
                       f"退回自动挑的第 {fi} 帧 —— 换个帧号重填")
         pct=100*a/(H*W)
-        if pct<TH:
+        if a<MIN_PX:
             if _want is not None:
-                print(f"[人工指定] ★ {w}#{oid} 第 {fi} 帧只占 {pct:.2f}% < TH={TH}, 仍然不生成")
+                print(f"[人工指定] ★ {w}#{oid} 第 {fi} 帧只有 {a} 像素 < SOLO_MIN_PX={MIN_PX}, 仍然不生成")
             continue
         m=mask_util.decode({"counts":counts[i],"size":[int(H),int(W)]}).astype(np.uint8)
         name=f"{TAG}_{w.replace(' ','_')}_{oid}"
         dd=os.path.expanduser(f"~/sam3d/sam-3d-objects/my_images/{name}"); os.makedirs(dd,exist_ok=True)
         imwrite_stable(f"{dd}/frame.png", cv2.imread(f"{FR}/{fi:04d}.jpg"))
         imwrite_stable(f"{dd}/mask.png", m*255)
-        jobs.append(name); print(f"[{w}#{oid}] 第{fi}帧 占{pct:.2f}% -> {name}")
+        jobs.append(name); print(f"[{w}#{oid}] 第{fi}帧 占{pct:.2f}% ({a}px) -> {name}")
 open(f"{R1}/logs/solo_jobs.txt","w").write("\n".join(jobs))
 print(f"\n[done] {len(jobs)} 个待单独生成")

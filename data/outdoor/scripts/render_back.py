@@ -25,7 +25,15 @@ for _f in os.environ.get("SCENE","07_scene.glb").split(","):
 _UP, _GH, _FB = load_up(f"{ROOT}/02_da3", "渲染回图")
 _INV = inverse_T(_UP)
 sc_tm.apply_transform(_INV)
-W,H=1280,720
+# ★ 画布比例必须跟着素材走, 不能写死 16:9。竖屏素材(realstreet 2160x3840)上写死 1280x720 的后果:
+#   下面 sx=W/(cx*2)、sy=H/(cy*2) 会一横一纵两个不同的系数, 渲出来的重建被横向拉扁,
+#   左边的真实帧也被 resize 成横屏 —— 两栏一起扁, 看着像"物体被压扁了", 其实盒子没问题。
+#   取相机内参的主点推图像比例(和深度图同源), 长边固定 1280。
+_CX, _CY = np.array(cams[sorted(cams)[0]]["intrinsic_3x3"])[0, 2], np.array(cams[sorted(cams)[0]]["intrinsic_3x3"])[1, 2]
+_AR = (_CX * 2) / (_CY * 2)                       # 宽/高
+W, H = (1280, max(2, int(round(1280 / _AR)))) if _AR >= 1 else (max(2, int(round(1280 * _AR))), 1280)
+W, H = W - W % 2, H - H % 2
+print(f"[画布] 素材比例 {_AR:.3f} -> {W}x{H}")
 # FRAMES 空字符串要当"没设"处理 —— 驱动里 RB_FRAMES 默认是 "", 直接 split 会得到 [''],
 # int('') 抛 ValueError。空了就按帧数均匀取 5 帧, 比硬编码那串更适应短视频。
 _fr=[int(x) for x in os.environ.get("FRAMES","").split(",") if x.strip()]
@@ -62,7 +70,7 @@ for fi in FRAMES:
     real=cv2.cvtColor(cv2.imread(f"{FR}/{fn}"),cv2.COLOR_BGR2RGB)
     real=cv2.resize(real,(W,H))
     blend=(0.5*real+0.5*col).astype(np.uint8)
-    SZ=int(os.environ.get("TILE","426")); row=np.hstack([cv2.resize(x,(SZ,int(SZ*9/16))) for x in (real,col,blend)])
+    SZ=int(os.environ.get("TILE","426")); row=np.hstack([cv2.resize(x,(SZ,int(round(SZ*H/W)))) for x in (real,col,blend)])
     cv2.putText(row,f"{fn}   real | rebuilt | 50/50",(8,20),0,0.5,(255,255,0),1)
     tiles.append(row)
 r.delete()

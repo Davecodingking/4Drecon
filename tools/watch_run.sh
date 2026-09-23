@@ -1,46 +1,51 @@
 #!/usr/bin/env bash
-# 实时看流水线在跑什么。用法:  tools/watch_run.sh [场景] [轮次]
+# 实时看流水线在跑什么。
 #
-# ★ 为什么需要它: drive.py 的输出一旦被管道接走(| tail、> 文件)就会被 stdio 缓冲吃掉,
-#   等它吐出来的时候活早干完了。所以别去追进程的 stdout —— 追**每一步自己写的日志文件**,
-#   那些是无缓冲落盘的, 而且步骤换了文件名就换, 天然告诉你"现在在跑哪一步"。
+#   tools/watch_run.sh                      <- 看"当前正在跑的那一轮"(常用)
+#   tools/watch_run.sh <场景> <轮次> [--indoor]   <- 指定看哪一轮
+#
+# 真正的实现在 watch_run.py(rich 看板): 段 / 步骤耗时 / 当前物体进度 / 显卡 / 闸口。只读, 随时开关。
+#
+# ★ 不带参数时看哪一轮: 读 tools/.last_run —— drive.py 每次 --go 会把
+#   "场景 轮次 室内还是室外" 写进去。以前这里写死默认 pedestrian r2, 结果人跑着 office
+#   却看到 pedestrian 的板子, 而且不会报错, 只会显示一堆"earlier"。
+#
+# ★ 自己挂进 tmux(会话名 watch)。为什么由这里做而不是 drive.py:
+#   drive.py 每跑完一段就退出, 看板的命比它长 —— 塞进驱动会变成"跑一段重启一次看板"。
+#   会话已存在就换掉里面的窗口(不新开, 也不会留着盯旧场景)。
 set -u
-SC=${1:-pedestrian}; RUN=${2:-r2}
-R1=$HOME/sam3d/data/outdoor/result/$SC/$RUN
-[ "${3:-}" = "--once" ] || exec watch -n2 -t "$0" "$SC" "$RUN" --once
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SESSION="${WATCH_SESSION:-watch}"
+PY="$HOME/miniforge3/envs/sam3d/bin/python"
+APP="$HERE/watch_run.py"
+LAST="$HERE/.last_run"
 
-hr(){ printf '%.0s─' $(seq 1 72); echo; }
-
-# --- 驱动器还在不在 ---
-if pgrep -f "[d]rive.py.*--scene $SC" >/dev/null; then
-  ST="running"
+if [ $# -ge 1 ]; then
+  SCENE="$1"; RUN="${2:-r1}"; EXTRA="${3:-}"
+elif [ -r "$LAST" ]; then
+  IFS=$'\t' read -r SCENE RUN KIND < "$LAST"
+  EXTRA=""; [ "${KIND:-}" = "indoor" ] && EXTRA="--indoor"
+  echo "看板: 当前这轮 = $SCENE $RUN ${EXTRA:-(室外)}   (来自 tools/.last_run)"
 else
-  ST="not running  (结束了, 或者根本没起来)"
-fi
-S=$R1/logs/.drive_state.json
-SEG=$( [ -f "$S" ] && tr -d ' "' < "$S" | grep -E '段|停在闸口' | tr '\n' ' ' )
-echo "$SC/$RUN   driver: $ST"
-echo "state: $SEG"
-hr
-
-# --- 逐实例生成的进度条(solo 那一步最慢, 值得单独算) ---
-JOBS=$R1/logs/solo_jobs.txt
-if [ -f "$JOBS" ]; then
-  N=$(grep -c . "$JOBS")
-  D=$(cd "$HOME/sam3d/sam-3d-objects/outputs" 2>/dev/null &&
-      grep -c . <(for j in $(cat "$JOBS"); do [ -d "$j" ] && echo "$j"; done))
-  W=$(( D * 40 / (N>0?N:1) ))
-  printf 'solo mesh  '
-  printf '%.0s#' $(seq 0 $W); printf '%.0s.' $(seq $W 39)
-  printf '  %d/%d\n' "$D" "$N"
-  hr
+  echo "还没有跑过任何一轮 —— 先 drive.py --go, 或者自己指定:"
+  echo "  tools/watch_run.sh <场景> <轮次> [--indoor]"
+  exit 1
 fi
 
-# --- 最新的那个日志 = 正在跑的那一步 ---
-L=$(ls -t "$R1"/logs/*.log 2>/dev/null | head -1)
-if [ -n "$L" ]; then
-  echo "step: $(basename "$L")   ($(( $(date +%s) - $(stat -c %Y "$L") ))s 前写过)"
-  hr
-  # 只留有信息的行: 进度百分比和 kaolin 的 warning 刷屏没意义
-  grep -vE '% done|UserWarning|warnings.warn|^\s*$' "$L" | tail -14
+run_it() { exec "$PY" "$APP" --scene "$SCENE" --run "$RUN" ${EXTRA:+"$EXTRA"}; }
+
+# 已经在 tmux 里(或者没装 tmux / 不是交互终端)就直接跑, 不套娃
+if [ -n "${TMUX:-}" ] || ! command -v tmux >/dev/null 2>&1 || [ ! -t 1 ]; then
+  run_it
 fi
+
+CMD="$(printf '%q ' "$PY" "$APP" --scene "$SCENE" --run "$RUN")"
+[ -n "$EXTRA" ] && CMD="$CMD$(printf '%q' "$EXTRA")"
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  tmux respawn-window -k -t "$SESSION" "$CMD" 2>/dev/null || tmux new-window -t "$SESSION" "$CMD"
+else
+  tmux new-session -d -s "$SESSION" "$CMD"
+fi
+echo "已挂进 tmux 会话 '$SESSION'   重新连: tmux attach -t $SESSION   脱离: Ctrl-b d"
+exec tmux attach -t "$SESSION"

@@ -22,7 +22,7 @@
 | `tools/gate_ui.py` | 176 KB 单文件服务。`PAGE` 是 1800 多行的 HTML 大字符串。路由 `/img/word｜inst｜cand｜pick｜recall` 全部返回 `cutout_rgb()` 出的灰底特写(灰 210、pad 12%、缩到 size 见方居中)。帧走 `Store._frame()` 的 LRU,不直接 imread |
 | `tools/box_fit_view.py` + `box_fit_view_template.html` | 把一个 `data` dict `json.dumps` 进模板的 `<script id="data" type="application/json">__DATA__</script>`,出 `<r1>/10_box_fit_view.html`。office r6 实测 **17.7 秒 / 6.9 MB**(7 个人、140000 背景点) |
 | 物体的键 | 两边天然一致:3D 页是 `word + id`,闸口是 `word + oid`。**不需要新的 id 体系** |
-| 闸 | 室外六道闸在 `drive.py`;**室内链没有闸**(`pipeline/indoor_pipeline.py:1328`:"物体链没有闸门,一路跑到底"),只读 `05_review_applied.json` |
+| 闸 | 六道闸在 `drive.py`,**室内室外同一套**(`--indoor` 只是多带 `--chain obj`),闸口网页也有 `--indoor`。(`indoor_pipeline.py:1328` 那句"物体链没有闸门"说的是**默认跑到哪一步停**,和人工闸无关 —— 别再读错一次)|
 
 ## 做什么
 
@@ -61,8 +61,8 @@
    - 3D → 闸口:选中时顶上出现"回闸口看这个",链接 `/?sel=<词>#<实例>`;`PAGE` 启动读它,
      展开那个词、滚到那一行。同一个端口,所以跳得动。
 6. **自动生成**(17.7 秒,前台跑,不用后台):
-   - 室外 `drive.py`:第 3 段(量完盒子)、第 4 段(召回合并)、第 5 段(组装 + 物理)各跑一次。
-   - 室内 `indoor_pipeline.py` 步骤表加一步 `boxview`,在 `boxfix`、`merge`、`phys` 之后各跑一次。
+   - 挂在 `drive.py`:第 3 段(量完盒子)、第 4 段(召回合并)、第 5 段(组装 + 物理)各跑一次。
+     **室内室外同一条规则**,不分两套。
    - 输入都比产物旧就跳过。
    - 闸 6 不重复生成:闸 5 到闸 6 之间场景没有变化。
    - 闸 2 不出:那时还没量盒子(`box_fit_view.py` 会退回读 `06_all_boxes.json`,但闸 2 时它也还没有)。

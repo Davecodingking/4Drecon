@@ -96,7 +96,12 @@ _enum = set()          # 逐实例枚举覆盖到的词。类候选只补它没�
 # 这道闸在生成之前, 拿不到。但实例号 03_masks 里本来就有, 挑帧的打分公式也照抄得过来,
 # 所以这里直接从 mask 枚举一遍 —— 数量可能和最终的差几个(盒子那步还会按点数和跨词去重再滤),
 # 但"会生成哪些东西"这件事看得全, 不至于让整支逐实例生成绕过人工。
-SOLO_TH  = float(os.environ.get("SOLO_TH", "0.5"))
+# 门槛按像素, 定义在 data/outdoor/scripts/solo_gate.py(和 pick / verify / gen_per_instance 同一份)。
+# realpath 找仓库根, 同 reuse_table.py。
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                                "data", "outdoor", "scripts"))
+from solo_gate import min_px                                         # noqa: E402
+SOLO_MIN_PX = min_px()
 SOLO_CFG = os.environ.get("SOLO", "")
 KEEP     = {w.strip() for w in os.environ.get("SOLO_KEEP","").split(",") if w.strip()}
 EXCL     = {w.strip() for w in os.environ.get("EXCLUDE","").split(",") if w.strip()}
@@ -139,7 +144,7 @@ if SOLO_CFG:
         for o, (sc, a, fi) in sorted(per.items()):
             if o in _dead_inst.get(w, ()): continue      # 这个实例由同组另一个词代表
             pct = 100*a/(int(H)*int(W))
-            if pct < SOLO_TH: continue
+            if a < SOLO_MIN_PX: continue
             cands.append(dict(词=w, 来源="逐实例",
                               生成名=f"{TAG}_{w.replace(' ','_')}_{o}",
                               目录=None, 实例=o, 帧=fi, 面积占比=round(pct, 3), 待生成=True,
@@ -222,7 +227,7 @@ for _q in _chain:
     if _AFTER and _q == DEC_PRE:
         print(f"[打底] 先读闸 2 那份 {os.path.basename(_q)} ({len(_prev['候选'])} 个候选)")
     for r in _prev["候选"]:
-        old[r["生成名"]] = {k: r[k] for k in ("决定", "改用", "备注", "复用组", "改类别") if k in r}
+        old[r["生成名"]] = {k: r[k] for k in ("决定", "改用", "备注", "复用组", "改类别", "VLM放行") if k in r}
         _wmap[r["生成名"]] = (r["词"], r["实例"])
     HIST.update(_prev.get("历史决定") or {})
 # pre 比 post 新 = 人回头改过闸 2 那份。上面的叠加保证"只在 pre 里的行"不丢,
@@ -242,7 +247,7 @@ if _prev:
     _w = _wmap
     for k, v in old.items():
         _live = (v.get("决定", "keep") != "keep" or v.get("改用")
-                 or v.get("复用组") or v.get("改类别"))
+                 or v.get("复用组") or v.get("改类别") or v.get("VLM放行"))
         if _live:
             HIST[k] = dict(v, 词=_w.get(k, (None, None))[0], 实例=_w.get(k, (None, None))[1])
         else:
@@ -256,7 +261,7 @@ for i, c in enumerate(cands):
     # ★ 候选可能因为自己的决定退出过表(标了 shared 就不在逐实例清单里), 回来时
     #   如果不把历史决定贴回去, 它会显示成默认的 keep, 而实际决定还在别处生效, 两边打架。
     _d = old.get(c["生成名"]) or {k: v for k, v in HIST.get(c["生成名"], {}).items()
-                                  if k in ("决定", "改用", "备注", "复用组", "改类别")}
+                                  if k in ("决定", "改用", "备注", "复用组", "改类别", "VLM放行")}
     r.update(_d)
     # ★ 已经落地的"共用词"要反映回表上。派生子类(umbrella~1)是上一次 --apply 展开出来的
     #   新词, 它的行是这一次才第一次出现 —— 不回写的话会显示成默认 keep, 而实际已经在
@@ -302,11 +307,21 @@ if "--apply" in sys.argv:
         raise SystemExit(f"[失败] 还没有决策文件 {DEC}, 先不带 --apply 跑一次")
     # ★ 和出图那边走**同一条链**: pre 打底, post 覆盖。只读 post 的话,
     #   人后来在闸 2 那份里新加的决定会被这一次 --apply 覆写掉(两道闸写同一个 applied)。
+    #   ★ 每一份里要先铺"历史决定"再铺"候选行", 两层都参与覆盖。
+    #     只铺候选行的话, **后一份**把决定存在历史里(判掉之后那行就从表上消失了)时,
+    #     压不过**前一份**表上同名的那行, 前一份的 keep 会赢。
+    #     实测 office 2026-09-20: 5 个召回物体在闸 4 判了 drop(所以只剩在闸 4 的历史决定里),
+    #     后来闸 2 重出了一次表, 它们又作为新候选回到闸 2 的表上、默认 keep ——
+    #     落地时取了那个 keep, 5 个判掉的物体照样摆进了场景, 而且一声不吭。
+    #     这和注释里那个"决定自我抹除"是同一个病根, 只是入口换成了"重出表把旧决定顶掉"。
+    #   同一份里候选行压历史: 表是人正在看的那个, 它说了算。
     _rows, _hist = {}, {}
     for _q in [q for q in (([DEC_PRE] if _AFTER else []) + [DEC]) if os.path.exists(q)]:
         _d = json.load(open(_q))
+        _h = _d.get("历史决定") or {}
+        for _k, _v in _h.items(): _rows[_k] = dict(_v, 生成名=_k)
         for r in _d["候选"]: _rows[r["生成名"]] = r
-        _hist.update(_d.get("历史决定") or {})
+        _hist.update(_h)
     _doc = dict(候选=list(_rows.values()), 历史决定=_hist)
     saved = list(_doc["候选"])
     # 把已经从表里消失、但当初做过决定的那些补回来一起算 —— 否则决定会自己蒸发。
@@ -418,9 +433,25 @@ if "--apply" in sys.argv:
         raise SystemExit(f"[失败] 这几行同时填了\"改用\"和\"改类别/复用组\": {', '.join(_both)}\n"
                          f"       搬家会重新编实例号, 两件事一起做, 换抠图会套到别的物体上。\n"
                          f"       先只填搬家的那一项跑一轮, 在新表上看到新实例号之后再填改用。")
+    # ★ 共用词的"改用"不管写在哪一行都塌成同一个键(裸词)。两行各写各的值, 字典里后者静默压掉前者,
+    #   谁赢看行的先后 —— 人以为钉的是 #4, 实际生成用的是 #7。前端切模式时会把另一种模式的
+    #   改用收起来, 这里是最后一道: 撞了就停, 不替人挑。
+    _ovs = {}
+    for r in saved:
+        if r.get("改用"):
+            _ovs.setdefault(_ov_key(r), {})[r["生成名"]] = list(r["改用"])
+    _clash = {k: v for k, v in _ovs.items() if len({tuple(x) for x in v.values()}) > 1}
+    if _clash:
+        raise SystemExit("[失败] 同一个共用 mesh 被指定了不同的样本:\n" + "\n".join(
+            f"       {k}: " + ", ".join(f"{g} -> 实例{a}/第{b}帧" for g, (a, b) in v.items())
+            for k, v in _clash.items()) + "\n       一个词只有一个整类样本, 在闸口界面上重新选一次再保存。")
     override  = {_ov_key(r): r["改用"] for r in saved if r.get("改用")}
+    # VLM 说"不是它"、人看过还是要的。drop 掉的不算(人最后的决定是不要)。
+    vlm_release = sorted(r["生成名"] for r in saved
+                         if r.get("VLM放行") and r["决定"] not in ("drop", "drop-word"))
     out = dict(排除词=drop_word, 逐实例词=solo_word, 共用词=shared_word,
-               不生成=drop_one, 指定样本=override, 改类别={**relabel, **relabel_extra})
+               不生成=drop_one, 指定样本=override, 改类别={**relabel, **relabel_extra},
+               VLM放行=vlm_release)
     json.dump(out, open(f"{R1}/05_review_applied.json", "w"), ensure_ascii=False, indent=1)
     print(f"[决策] 共 {len(saved)} 个候选")
     print(f"  整个词作废 : {drop_word or '无'}")
@@ -431,6 +462,7 @@ if "--apply" in sys.argv:
         print(f"  分组->子类 : {len(relabel_extra)} 个实例挪进派生子类(然后整词复用)")
     if relabel: print(f"  挪类别     : {relabel}")
     print(f"  换候选     : {override or '无'}")
+    print(f"  VLM放行    : {vlm_release or '无'}")
     print(f"\n下游用这些环境变量:")
     if drop_word: print(f"  EXCLUDE=\"$EXCLUDE,{','.join(drop_word)}\"")
     if solo_word: print(f"  SOLO=\"{','.join(solo_word)}\"")

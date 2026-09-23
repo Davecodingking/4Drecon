@@ -137,7 +137,69 @@ def sam_masks(fi):
     _by[fi] = out
     return out
 
-new = []
+# ★ 2026-09-22 新加一条判据: 和"已有实例的三维盒子投影到这一帧"也比一次。
+# 起因(office 的急救箱): 它在第 39~54 帧还没有自己的编号 —— 那几帧它被圈在柱子的抠图里, 而柱子的
+#   外接框是一整根柱子那么大, 框 vs 外接框只有 0.06, 于是被当成漏检补了一份; 到第 58 帧跟踪才给它
+#   开编号, 一个急救箱成了两份(补出来的那份位置还偏了 1 m)。跟踪那份的盒子是拿它自己的 mask 量的,
+#   是准的, 投影回第 39 帧正好落在检测框上。
+# ★ 为什么不改成"被别的东西的 mask 包住就算已经有了": 那几帧急救箱确实还没有自己的编号, 它是被柱子
+#   包着的 —— 那样改会把所有挂在墙上/柱子上的东西都当成已有的漏掉。
+# 用 IoU 不用包含: 杯子落在桌子的投影框里这种框差太多, IoU 很小, 不会误判。
+# 盒子或相机缺了就跳过这一条 —— 只少一道过滤, 不把召回硬绑死在量盒子那一步后面。
+_CAMS = f"{R1}/02_da3/cameras.json"
+_PBOX, _KJ, _IMWH, _DEP = [], {}, [None], {}
+DEP_TOL = float(os.environ.get("RECALL_DEPTH_TOL", "0.3"))   # 检测框的距离和盒子的距离差多少还算同一个(米)
+if MATCH_2D and os.path.exists(SAM) and os.path.exists(_CAMS):
+    _PBOX = [dict(b, 词=w) for w, bs in json.load(open(SAM)).items() for b in bs]
+    _KJ = json.load(open(_CAMS))["cameras"]
+    print(f"[SAM3] 已有 {len(_PBOX)} 个盒子, 也投影到检测那一帧比一次(认出'那几帧还没被跟踪到'的同一个东西)")
+
+def _img_wh():
+    if _IMWH[0] is None:
+        for fn in sorted(os.listdir(MK)):
+            if fn.endswith(".npz"):
+                H_, W_ = np.load(f"{MK}/{fn}", allow_pickle=True)["hw"]; _IMWH[0] = (int(W_), int(H_)); break
+    return _IMWH[0]
+
+# ★ 光比画面上的框不够: 投影不管远近, 同一条视线上远处的另一张桌子, 投影框照样能对上
+#   (office 实测: 只比框会把 59 个补漏压掉 17 个, 里面有真漏掉的椅子和架子)。
+#   所以还要拿那一帧的深度图量一下检测框里的东西有多远, 和盒子的距离对不上就不算同一个。
+def det_depth(fi, box):
+    """检测框里的中位深度(米); 没深度图或点太少返回 None。"""
+    if fi in _DEP: dep = _DEP[fi]
+    else:
+        fp = f"{R1}/02_da3/depth/{fi:04d}_depth.npy"
+        dep = _DEP[fi] = (np.load(fp) if os.path.exists(fp) else None)
+    if dep is None: return None
+    ih_, iw_ = _img_wh()[1], _img_wh()[0]
+    h_, w_ = dep.shape
+    x0_, y0_, x1_, y1_ = [int(round(v)) for v in (box[0]*w_/iw_, box[1]*h_/ih_, box[2]*w_/iw_, box[3]*h_/ih_)]
+    x0_, y0_ = max(x0_, 0), max(y0_, 0); x1_, y1_ = min(x1_, w_), min(y1_, h_)
+    if x1_ - x0_ < 2 or y1_ - y0_ < 2: return None
+    d = dep[y0_:y1_, x0_:x1_].ravel(); d = d[np.isfinite(d) & (d > 0)]
+    return float(np.median(d)) if len(d) >= 12 else None
+
+def proj_box(b, fi):
+    """已有实例的三维盒子投影到第 fi 帧, 返回 (原图像素的外接框, 最近距离, 最远距离); 在相机后面返回 None。"""
+    cam = _KJ.get(f"{fi:04d}.jpg")
+    if cam is None: return None
+    c = np.array(b["中心"], float); a1 = np.array(b["长轴"], float)
+    a1 = a1 - UP*(a1@UP); n1 = float(np.linalg.norm(a1))
+    if n1 < 1e-6: return None
+    a1 /= n1; a2 = np.cross(UP, a1)
+    L_, W_, H_ = b["尺寸"]; bot = float(b["底高"]); base = c - UP*(c@UP)
+    P = np.array([base + sx*L_/2*a1 + sy*W_/2*a2 + UP*z
+                  for sx in (-1, 1) for sy in (-1, 1) for z in (bot, bot+H_)])
+    K = np.array(cam["intrinsic_3x3"], float); w2c = np.array(cam["extrinsic_w2c_4x4"], float).reshape(4, 4)
+    Pc = P @ w2c[:3, :3].T + w2c[:3, 3]
+    if (Pc[:, 2] < 0.05).any(): return None
+    iw, ih = _img_wh()                       # 内参在深度图分辨率上, 框2d 在原图上, 按主点换算
+    fx_, fy_ = iw/(2*K[0, 2]), ih/(2*K[1, 2])
+    u = (Pc[:, 0]/Pc[:, 2]*K[0, 0] + K[0, 2]) * fx_
+    v = (Pc[:, 1]/Pc[:, 2]*K[1, 1] + K[1, 2]) * fy_
+    return [float(u.min()), float(v.min()), float(u.max()), float(v.max())], float(Pc[:, 2].min()), float(Pc[:, 2].max())
+
+new = []; byproj = 0
 for a in keep:
     if MATCH_2D:
         fi = int(a["最佳帧"]); x0,y0,x1,y1 = [float(v) for v in a["框2d"]]
@@ -150,8 +212,19 @@ for a in keep:
             if len(u) == 0: continue
             s_ = box_iou([x0,y0,x1,y1], [float(u.min()), float(v.min()), float(u.max()), float(v.max())])
             if s_ > best_iou: best_iou, m = s_, dict(词=w, obj_id=oid)
+        _bp = False
+        if best_iou < IOU_SAM and _PBOX:             # 抠图比不出来, 再拿已有盒子的投影比(还要对得上距离)
+            _dd = det_depth(fi, [x0,y0,x1,y1])
+            for b in (_PBOX if _dd is not None else []):
+                pb = proj_box(b, fi)
+                if pb is None: continue
+                bb, z0_, z1_ = pb
+                if not (z0_ - DEP_TOL <= _dd <= z1_ + DEP_TOL): continue      # 一个在前一个在后, 不是同一个
+                s_ = box_iou([x0,y0,x1,y1], bb)
+                if s_ > best_iou: best_iou, m, _bp = s_, dict(词=b["词"], obj_id=b["obj_id"]), True
         a["二维IoU"] = round(best_iou, 3)
         if best_iou < IOU_SAM: m = None
+        elif _bp: a["对上方式"] = "盒子投影"; byproj += 1
     else:
         ca = np.array(a["中心"]); r = MATCH_F*max(np.mean(a["尺寸"]),0.3)
         m = None
@@ -162,7 +235,8 @@ for a in keep:
     else: a["对上SAM3"] = f"{m['词']}#{m['obj_id']}"
 matched = len(keep)-len(new)
 print(f"[合并] {matched} 个和 SAM3 对得上 (用 SAM3 的 mask), {len(new)} 个是 SAM3 漏掉的"
-      f"  判定方式: {'二维 IoU > ' + str(IOU_SAM) if MATCH_2D else '三维距离'}")
+      f"  判定方式: {'二维 IoU > ' + str(IOU_SAM) if MATCH_2D else '三维距离'}"
+      + (f"; 其中 {byproj} 个是靠已有盒子的投影认出来的(那几帧它还没被跟踪到)" if byproj else ""))
 for i,a in enumerate(new): a["obj_id"] = 10000+i          # 召回实例的 ID 从 10000 起, 不和 SAM3 撞
 print("  漏检按词:", dict(Counter(a["词"] for a in new).most_common(10)))
 json.dump(dict(召回=new, 对上=matched, 总实例=len(keep)), open(OUT,"w"),

@@ -17,6 +17,7 @@ import os, sys, json, numpy as np, cv2
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from imgio import imwrite_stable
 from word_rank import base_word
+import review_decisions as review
 from pycocotools import mask as mask_util
 TAG=os.environ.get("TAG","ts_r1")
 
@@ -52,8 +53,16 @@ if DEDUP and os.path.exists(DEDUP):
 # "这里以为逐实例所以不写, 那边以为共用所以也不写" —— 那个词就整个消失了。
 SOLO_CFG = {x.strip() for x in os.environ.get("SOLO","").split(",") if x.strip()}
 KEEP     = {x.strip() for x in os.environ.get("SOLO_KEEP","").split(",") if x.strip()}
-SOLO_TH  = float(os.environ.get("SOLO_TH","0.5"))
+from solo_gate import min_px            # 门槛按像素, 定义在 solo_gate.py
+SOLO_MIN_PX = min_px()
 HAVE = {int(f[:4]) for f in os.listdir(f"{ROOT}/02_da3/depth") if f.endswith("_depth.npy")}
+
+# ★ 整类共用一个 mesh 时, 样本从谁身上抠, 决定了这一类所有物体长什么样。
+#   VLM 判"不是它"而人没放行的、人在闸口 drop 掉的、去重判给别的词的, 都不许当样本 —— 否则一块
+#   被判"不是树"的白卡车碎片会成为整类树的模型来源(pedestrian r2 的 tree #1)。
+#   规则只有一份, 在 class_sample.py: verify_picks 的 VLM 复核、闸口前端都用它。
+import class_sample
+_banned = class_sample.banned_fn(ROOT, TAG)
 
 picked={}; skipped_solo=[]
 for fn in sorted(os.listdir(MK)):
@@ -65,38 +74,32 @@ for fn in sorted(os.listdir(MK)):
     if word in DUPOUT:
         print(f"[{word}] 跨词去重判为重复(同组里没赢), 不挑图不生成"); continue
     if len(meta)==0 or meta["area"].max()==0: continue
-    live={}
     _dead = DUPINST.get(word, ())
-    for i,(oid,fi,a,e) in enumerate(meta):
-        if a==0 or int(fi) not in HAVE: continue
-        if int(oid) in _dead: continue      # 这个实例由同组另一个词代表, 别再送一份去生成
-        live.setdefault(int(oid),[]).append((i,int(fi),int(a),float(e)))
-    best=None
-    for oid,rows in live.items():
-        if len(rows)<MIN_FRAMES: continue
-        nf=min(len(rows)/FRAME_SAT, 1.0)                     # 帧数因子, 10 帧封顶
-        for i,fi,a,e in rows:
-            s = a * (1-min(e*4,0.9)) * nf
-            if best is None or s>best[0]: best=(s,oid,fi,a,e,i,len(rows))
-    if best is None:
+    cands, _ban, live = class_sample.ranked(meta, HAVE, word, dead=_dead, banned=_banned,
+                                            min_frames=MIN_FRAMES, frame_sat=FRAME_SAT)
+    if not cands:
         # 这一支原来是静默 continue, 于是这个词既不写类目录也不上逐实例名单, 从场景里
         # 无声消失(beach 的 planter 只活在第 312 帧、traffic cone 同理, 都在深度覆盖之外)。
         # 一个词落空和被人排除掉的排查方向完全不同, 得让它在日志里留下一行。
-        print(f"[{word}] {'实例都不在有深度的帧上' if not live else f'剩下的实例都活不满 {MIN_FRAMES} 帧'}"
-              f", 不挑图不生成" + (f" (去重先判掉了 {len(_dead)} 个实例)" if _dead else ""))
+        _why = (f'剩下的实例都活不满 {MIN_FRAMES} 帧' if live
+                else f'能当样本的实例都被 VLM 否决(没放行)或被人 drop 了: {sorted(_ban)}' if _ban
+                else '实例都不在有深度的帧上')
+        print(f"[{word}] {_why}, 不挑图不生成" + (f" (去重先判掉了 {len(_dead)} 个实例)" if _dead else ""))
         continue
-    s,oid,fi,a,e,i,nfr = best
+    s, oid, i, fi, a, e, nfr = cands[0]
     # 这个词会走逐实例吗? 走的话这里不写类目录, 交给 gen_per_instance.py。
     # 但要确认它至少有一个实例够大 —— 一个都不够大的话逐实例那边什么都不会生成,
     # 那就还得由这里写一个类目录兜底, 否则这个词从场景里消失。
     _solo = (word not in KEEP) and (("*" in SOLO_CFG) or (word in SOLO_CFG))
     if _solo:
+        # ★ 比的是 gen_per_instance 真正会挑的那一帧(面积 x 贴边惩罚 最高)的面积, 不是最大面积 ——
+        #   两边拿的帧不同, 就可能这里以为"那边会生成"而那边其实不生成, 词整个消失。
         _big = any(len(rows) >= MIN_FRAMES and
-                   100*max(r[2] for r in rows)/(H*W) >= SOLO_TH
+                   max(rows, key=lambda r: r[2]*(1-min(r[3]*4,0.9)))[2] >= SOLO_MIN_PX
                    for rows in live.values())
         if _big:
             skipped_solo.append(word); continue
-        print(f"[{word}] 逐实例词, 但没有实例过 {SOLO_TH}% 门槛, 由这里写一个类目录兜底")
+        print(f"[{word}] 逐实例词, 但没有实例过 {SOLO_MIN_PX} 像素门槛, 由这里写一个类目录兜底")
     if 100*a/(H*W) < MIN_AREA_PCT: 
         print(f"[{word}] 最好的也只占 {100*a/(H*W):.3f}% 画面, 太小, 跳过"); continue
     m=mask_util.decode({"counts":counts[i],"size":[int(H),int(W)]}).astype(bool)
@@ -108,7 +111,8 @@ for fn in sorted(os.listdir(MK)):
     ov=img.copy(); ov[m]=(0.5*ov[m]+0.5*np.array([60,60,230])).astype(np.uint8)
     cv2.imwrite(f"{OUT}/{name}.jpg", ov, [cv2.IMWRITE_JPEG_QUALITY,88])
     picked[word]=dict(obj_id=oid, frame=fi, 面积占比=round(100*a/(H*W),3), 活帧数=nfr,
-                      贴边=round(e,3), 候选数=len(live), 目录=d)
+                      贴边=round(e,3), 候选数=len(live), 目录=d,
+                      **{class_sample.BANNED_KEY: sorted(_ban)})   # 按哪些排除挑的, 闸口据此判过没过时
     print(f"[{word}] 实例#{oid} 第{fi}帧 占{100*a/(H*W):.2f}% 活{nfr}帧 贴边{e:.3f} ({len(live)}个候选)")
 json.dump(picked, open(f"{OUT}/picks.json","w"), ensure_ascii=False, indent=1)
 if skipped_solo:

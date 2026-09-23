@@ -52,6 +52,10 @@ def _gen_name(w, oid=None):
     return s.replace(" ", "_")
 if SKIP_NAMES:
     print(f"[人工闸] 人工否掉 {len(SKIP_NAMES)} 个, 不摆进场景: {', '.join(sorted(SKIP_NAMES))}", flush=True)
+VLM_REJ = _review.vlm_rejected(ROOT)
+VLM_REL = _review.vlm_released(ROOT)
+if VLM_REJ:
+    print(f"[VLM否决] {sum(len(v) for v in VLM_REJ.values())} 个实例被否决, 人工放行 {len(VLM_REL)} 个", flush=True)
 # 自动扫描 outputs/。ts_r1_<词> = 该类共用的 mesh; ts_r1_<词>_<实例号> = 这个实例专属的
 AVAIL={d for d in os.listdir(OUTS) if d.startswith(TAG+"_") and os.path.exists(f"{OUTS}/{d}/{d}.glb")}
 MESH={d[len(TAG)+1:].replace("_"," "):d for d in AVAIL}
@@ -140,14 +144,245 @@ for h0 in cand:                                  # 盒底本身就是最好的�
     if n_in > best_n: best_n, best_h = n_in, h0
 inl = np.abs(hh - best_h) < 0.5
 best_h = float(hh[inl].mean())                   # 用内点精修
-if _gh is not None:
+# ★★ 有房间壳的时候, 地面以**壳的地板**为准, 不用 ground_h。
+#   为什么翻过来(2026-09-20 office 实测):
+#     ground_h = -0.41, world_up.json 自己记着 "相机离地 0.222 m"、"内点比例 0.378"。
+#     手持拍摄不可能离地 22 厘米; 38% 内点说明那个平面本来就没拟稳。
+#     用壳的地板 -1.95 算, 相机离地 1.75 m —— 手持正好。
+#   物理解释: 办公室里**面积最大的水平面是桌面, 不是地板** —— 地板被桌椅和走动的人挡住了,
+#   露出来的点还不如桌面多。world_up.py 那次平面拟合多半拟到了桌面上, 整整高了 1.53 m。
+#   (同一份数据的第三个证据: 盒底反推给 -0.88, 在壳地板上方 1.07 m, 正是升降桌的高度 ——
+#    因为检测到的绝大多数是桌上的东西, 它们的底本来就该在桌面上。)
+#   壳的地板来自 zup 在 03_点云_z朝上.ply 上的拟合, 那条路吃的是完整点云, 更可信。
+#   ★ 这只在有壳的时候成立(室内)。室外没有壳, 照旧用 ground_h ——
+#     室外马路是画面里最大的一块, 那次拟合本来就稳。
+_shell_h = None
+if ROOM_SHELL and os.path.exists(ROOM_SHELL):
+    try:
+        _sh0 = trimesh.load(ROOM_SHELL, force="scene")
+        for _nd in _sh0.graph.nodes_geometry:
+            if _nd == "floor":
+                _T0, _g0 = _sh0.graph[_nd]
+                _m0 = _sh0.geometry[_g0].copy(); _m0.apply_transform(_T0)
+                # 壳已经是最终 glTF 系(UP 对准 +y), 所以 y 就是沿 UP 的高度, 和 best_h 同一把尺子
+                _shell_h = float(np.median(_m0.vertices[:, 1])); break
+    except Exception as _e:
+        print(f"[地面] 读不出房间壳的地板高度({_e}), 退回 ground_h")
+if _shell_h is not None:
+    print(f"[地面] 用房间壳的地板 {_shell_h:.2f} m "
+          f"(ground_h 给 {_gh:.2f} m, 但它记着相机离地只有 0.22 m、内点 38% —— 多半拟到桌面上了; "
+          f"盒底反推给 {best_h:.2f} m)")
+    best_h = _shell_h
+elif _gh is not None:
     print(f"[地面] 用点云拟合的高度 {_gh:.2f} m (盒底反推会给出 {best_h:.2f} m, 不用它)")
     best_h = float(_gh)
 else:
     print(f"[地面] {len(pts)} 个盒底中 {int(inl.sum())} 个在地面上, "
           f"残差中位 {np.median(np.abs(hh[inl]-best_h)):.2f} m (水平面, 高度 {best_h:.2f} m)")
 
+# ---- 立在地上的东西: 盒子补到地面 (2026-09-21) ----
+# ★ 盒子只量得到拍到的部分。办公室的桌子腿被椅子和人挡住, 盒子只剩桌面一片薄板
+#   (office: table_0 量到 0.83~1.21 m, 厚 0.38 m, 悬在半空), 按这个高度缩 mesh 就是一张 38cm 高的
+#   迷你桌; 物理一看悬空, 整张扔到地上, 桌面从 1.2 m 掉到 0.35 m, 桌上的显示器杯子跟着掉。
+#   量到的桌面是准的(物理之前渲染回原镜头能对上), 该补的是被挡住的腿: 顶不动, 底放到地面。
+#   只补 VLM 说"立在地上"的类 (01_vlm_rest.json), 而且逐个实例再看两道:
+#     1. 脚下已经有别的盒子托着(那个盒子的顶就在它底下 EXT_SUP_TOL 内, 它的中心落在那个盒子
+#        的水平范围里) -> 它是搁在上面的(桌上的盆栽), 不补。
+#     2. 补完的高度超过常识高度(01_vlm_sizes.json)的 EXT_MAX_RATIO 倍 -> 多半不是腿被挡住,
+#        是它本来就不在地上(挂墙的、柜顶的), 或者 VLM 判错了类。不补, 交给物理原地不动。
+#   室外不给 FLOOR_EXTEND, 整段不走, 逐位不变 (室外靠 SNAP_GROUND 整体落地)。
+FLOOR_EXTEND = os.environ.get("FLOOR_EXTEND", "0") == "1"
+REST_P = os.environ.get("REST", "")
+# 补过地面的, 如果 mesh 自己也是照着"只看得到桌面"那张图生成的(矮桌, 高只有长的 0.24),
+# 按补完的高度等比缩会把桌面撑到 5 m 长 —— 这种改成"按量到的那截缩 + 腿往下拉到地面", 见摆放循环。
+FOOT_RATIO = float(os.environ.get("FOOT_RATIO", "1.5"))   # 等比缩完水平边超过量到的这么多倍 = mesh 是矮的
+LEG_KEEP = float(os.environ.get("LEG_KEEP", "0.2"))       # 拉腿时 mesh 顶上这一截(桌面)原样不变形
+_legged = []
+if FLOOR_EXTEND and REST_P and os.path.exists(REST_P):
+    EXT_MAX_RATIO = float(os.environ.get("EXT_MAX_RATIO", "2.0"))
+    EXT_MIN = float(os.environ.get("EXT_MIN", "0.05"))           # 底离地不到这么多, 不用补
+    EXT_SUP_TOL = float(os.environ.get("EXT_SUP_TOL", "0.15"))   # 托着它的顶面离它的底要这么近
+    _REST = json.load(open(REST_P))
+    _szp = f"{ROOT}/01_vlm_sizes.json"; _REAL = json.load(open(_szp)) if os.path.exists(_szp) else {}
+    _look = lambda d, w: d.get(w) if d.get(w) is not None else d.get(base_word(w))
+    def _bot(b):
+        return float(b["底高"]) if "底高" in b else float(np.array(b["中心"]) @ UP - b["尺寸"][2]/2)
+    def _rect(b):
+        """盒子的水平矩形: 中心, 长轴, 短轴, 两个半长。"""
+        c = np.array(b["中心"], float); a = np.array(b["长轴"], float); a = a - UP*(a @ UP)
+        a /= max(np.linalg.norm(a), 1e-9)
+        return c, a, np.cross(UP, a), b["尺寸"][0]/2, b["尺寸"][1]/2
+    _all = [(w, b) for w, bs in boxes.items() if not (w in EXCLUDE or base_word(w) in EXCLUDE) for b in bs]
+    # 人工改判成"挂着的"(HUNG_LABELS)压过 VLM: 垂到地面的灯管 VLM 会判成落地灯
+    _HUNG = {x.strip().replace("_", " ") for x in os.environ.get("HUNG_LABELS", "").split(",") if x.strip()}
+    _ext, _no = [], []
+    for w, b in _all:
+        if _look(_REST, w) != "floor" or w in _HUNG or base_word(w) in _HUNG: continue
+        bot = _bot(b); top = bot + b["尺寸"][2]; gap = bot - best_h
+        if gap <= EXT_MIN: continue
+        c0 = np.array(b["中心"], float); on = None
+        for w2, b2 in _all:
+            if b2 is b: continue
+            t2 = _bot(b2) + b2["尺寸"][2]                     # 顶不会被补地面改掉, 顺序无关
+            if not (bot - EXT_SUP_TOL <= t2 <= bot + 0.05): continue
+            c2, a1, a2, h1, h2 = _rect(b2); q = c0 - c2
+            if abs(q @ a1) <= h1 and abs(q @ a2) <= h2:
+                on = f"{w2}#{b2['obj_id']}"; break
+        if on:
+            _no.append(f"{w}#{b['obj_id']} 搁在 {on} 上"); continue
+        real = _look(_REAL, w); newh = top - best_h
+        if real is None or newh > EXT_MAX_RATIO*float(real):
+            _no.append(f"{w}#{b['obj_id']} 补完会有 {newh:.2f} m" +
+                       (f", 超过常识 {float(real):.2f} m 的 {EXT_MAX_RATIO:g} 倍" if real else ", 没有常识高度可比"))
+            continue
+        b["_量到尺寸"] = list(b["尺寸"]); b["_量到底高"] = bot     # 摆放时判断要不要改成拉腿
+        b["中心"] = (c0 - UP*gap/2).tolist(); b["尺寸"] = [b["尺寸"][0], b["尺寸"][1], newh]; b["底高"] = best_h
+        _ext.append((w, b["obj_id"], gap, top - bot, newh))
+    print(f"[补到地面] 立在地上的类里 {len(_ext)} 个底没量到(腿被挡住), 顶不动、底补到地面:")
+    for w, i, g_, h0, h1 in sorted(_ext, key=lambda x: -x[2]):
+        print(f"    {w}#{i}: 底离地 {g_:.2f} m, 高 {h0:.2f} -> {h1:.2f} m")
+    if _no:
+        print(f"[没补] {len(_no)} 个: " + "; ".join(_no))
+
+# ---- 桌子/柜子这类: 去重 + 按"相机看到的空地"缩 (2026-09-22) ----
+# ★ 这一步所有别的物体都等比缩, 原因见 o_assemble 的注释: 点云量出来的长宽不可信, 逐轴拉伸
+#   吃过亏(吧凳量成 0.94x0.31 的板子被压扁)。可等比有反向的坑: 生成的 mesh 比例不对时照样
+#   原样放大 —— office table_8 量到的是 1.25x0.58 的窄长站立桌, 生成的是方桌, 按高度等比
+#   放成 1.46x1.46, 桌沿往人站的地方多伸出 0.44 m, 把站在桌前的人整个吞进桌面里。
+#   所以只对"长宽比本来就千差万别、拉一拉看不出来"的方盒子家具(FIT_WORDS), 而且只做两件
+#   有证据的事:
+#     去重(DEDUP_BOX): 同一个词两个盒子, 水平重叠超过小的那个的 DUP_OVERLAP、顶面高差在
+#       DUP_DH 以内 = 同一件被量了两遍(office table_7/8: 重叠 72%, 顶面 1.11/1.15 m), 留点数多的。
+#     缩(FREE_TRIM): mesh 超出量到的盒子边的那一片, 投到每一帧相机里比深度 —— 相机明确
+#       "看穿过去"(那里更远处有东西)才说明那片是空地, 多数点被看穿才往回缩到盒子边;
+#       被挡住、出了画面、没看到的一律不缩。量到的盒子被截短(遮挡/出画)的时候, 截掉的那段
+#       本来就没被看到, 所以不会被误缩 —— 这正是逐轴拉伸当年栽的地方。
+#   只缩不拉: 盒子比 mesh 大的方向不动(可能是 mask 抠多了)。
+#   人也算证据(BODY_RUN, 给了才用): 深度图里那一点拍到的是人(body4d 的人物抠图), 说明人站在那,
+#   家具就不可能在那 —— 算"看穿"。不这么做的话, 人站在桌前的那一片恰好全是"看到表面", 人越贴着
+#   桌子站, 那张桌子越缩不回去(office table_7: 超出的那片 604 个点只有 84 个被看穿)。
+FIT_WORDS = {x.strip().replace("_", " ") for x in os.environ.get(
+    "FIT_WORDS", "desk,table,dining table,side table,coffee table,counter,cabinet,file cabinet,"
+                 "shelf,shelf unit,bookcase,credenza").split(",") if x.strip()}
+_fit_word = lambda w: w in FIT_WORDS or base_word(w) in FIT_WORDS
+DEDUP_BOX = os.environ.get("DEDUP_BOX", "0") == "1"
+FREE_TRIM = os.environ.get("FREE_TRIM", "0") == "1"
+DUP_OVERLAP = float(os.environ.get("DUP_OVERLAP", "0.5"))
+DUP_DH = float(os.environ.get("DUP_DH", "0.12"))
+TRIM_OVER = 0.05      # mesh 超出盒子边这么多以上才看
+TRIM_EMPTY = 0.6      # 那一片里被看穿的点占有观测的点的比例
+TRIM_MIN_OBS = 30     # 有观测的点至少这么多才下结论
+TRIM_KEEP = 0.02      # 缩到盒子边外 2cm
+TRIM_MIN_W = 0.35     # 缩完不能窄过这个
+def _box_rc(b):
+    c = np.array(b["中心"], float); a = np.array(b["长轴"], float); a = a - UP*(a @ UP)
+    a /= max(np.linalg.norm(a), 1e-9)
+    return c, a, np.cross(UP, a), b["尺寸"][0]/2, b["尺寸"][1]/2
+def _box_top(b):
+    return (float(b["底高"]) if "底高" in b else float(np.array(b["中心"]) @ UP - b["尺寸"][2]/2)) + b["尺寸"][2]
+def _in_share(b1, b2):
+    """b1 的水平矩形有多大比例落在 b2 里 (24x24 网格采样)。"""
+    c1, a1, s1, h1, k1 = _box_rc(b1); c2, a2, s2, h2, k2 = _box_rc(b2)
+    g = (np.arange(24) + 0.5)/24*2 - 1
+    U_, V_ = np.meshgrid(g*h1, g*k1); q = c1 + U_.ravel()[:, None]*a1 + V_.ravel()[:, None]*s1 - c2
+    return float(((np.abs(q @ a2) <= h2) & (np.abs(q @ s2) <= k2)).mean())
+_DUP = {}
+if DEDUP_BOX:
+    for w, bs in boxes.items():
+        if not _fit_word(w) or w in EXCLUDE or base_word(w) in EXCLUDE: continue
+        order = sorted(bs, key=lambda b: -(b.get("点数") or 0))
+        for i, bi in enumerate(order):
+            if (w, bi["obj_id"]) in _DUP: continue
+            for bj in order[i+1:]:
+                if (w, bj["obj_id"]) in _DUP or abs(_box_top(bi) - _box_top(bj)) > DUP_DH: continue
+                small, big = (bj, bi) if bj["尺寸"][0]*bj["尺寸"][1] <= bi["尺寸"][0]*bi["尺寸"][1] else (bi, bj)
+                ov = _in_share(small, big)
+                if ov >= DUP_OVERLAP:
+                    _DUP[(w, bj["obj_id"])] = (f"{w}#{bi['obj_id']}", ov)
+    if _DUP:
+        print(f"[去重] {len(_DUP)} 个盒子和同类另一个是同一件(水平重叠 >= {DUP_OVERLAP:.0%}, 顶面高差 <= {DUP_DH:.2f} m), 留点数多的: "
+              + "; ".join(f"{w}#{i} 并进 {k} (重叠 {ov:.0%})" for (w, i), (k, ov) in _DUP.items()))
+_FS = None
+def _people_masks():
+    """{相机帧名: 人物抠图的路径}。body4d 和场景用的是同一套帧: 相机帧名 -> 原视频帧号(02_da3/frame_map.json)
+    -> body4d 的帧序号(00_frames/frames.json 的 kept_indices) -> <mesh 轮>/masks/<序号>.png (值 = 人的 id)。"""
+    br = os.environ.get("BODY_RUN", "").strip()
+    if not br: return {}
+    run = next((f"{br}/{d}" for d in ("04_mesh_occ1", "04_mesh_occ0") if os.path.isdir(f"{br}/{d}/masks")), None)
+    da3 = f"{ROOT}/02_da3" if os.path.isdir(f"{ROOT}/02_da3") else f"{ROOT}/02_DA3点云"
+    if not run or not os.path.exists(f"{da3}/frame_map.json"): return {}
+    fmap = json.load(open(f"{da3}/frame_map.json"))["frames"]
+    kept = {v: i for i, v in enumerate(json.load(open(f"{br}/00_frames/frames.json"))["kept_indices"])}
+    return {k: f"{run}/masks/{kept[v]:08d}.png" for k, v in fmap.items()
+            if v in kept and os.path.exists(f"{run}/masks/{kept[v]:08d}.png")}
+def _fs_load():
+    """每一帧: (w2c, 内参, 深度图, 人在哪些像素上 或 None)。内参和深度图是同一个分辨率(DA3 处理分辨率)。"""
+    global _FS
+    if _FS is None:
+        da3 = f"{ROOT}/02_da3" if os.path.isdir(f"{ROOT}/02_da3") else f"{ROOT}/02_DA3点云"
+        cams = json.load(open(f"{da3}/cameras.json"))["cameras"]; _FS = []; pm = _people_masks()
+        for k, cm in sorted(cams.items()):
+            dp = f"{da3}/depth/{k.rsplit('.', 1)[0]}_depth.npy"
+            if os.path.exists(dp):
+                D = np.load(dp); M = None
+                if k in pm:
+                    import cv2
+                    from PIL import Image
+                    M = cv2.resize((np.array(Image.open(pm[k])) > 0).astype(np.uint8), (D.shape[1], D.shape[0]),
+                                   interpolation=cv2.INTER_NEAREST).astype(bool)
+                _FS.append((np.array(cm["extrinsic_w2c_4x4"], float), np.array(cm["intrinsic_3x3"], float), D, M))
+        if pm: print(f"[按看到的空地缩] {sum(f[3] is not None for f in _FS)}/{len(_FS)} 帧有人物抠图: 拍到人的地方算空地")
+    return _FS
+def _seen(P):
+    """每个点: 被相机看穿(视线上那一点是空的, 更远处才有东西)的帧数, 和看到表面就在这里的帧数。"""
+    em = np.zeros(len(P), int); su = np.zeros(len(P), int)
+    for w2c, K, D, M in _fs_load():
+        X = P @ w2c[:3, :3].T + w2c[:3, 3]; z = X[:, 2]; ok = z > 0.3; zz = np.maximum(z, 1e-6)
+        u = np.round(K[0, 0]*X[:, 0]/zz + K[0, 2]).astype(int); v = np.round(K[1, 1]*X[:, 1]/zz + K[1, 2]).astype(int)
+        ok &= (u >= 0) & (u < D.shape[1]) & (v >= 0) & (v < D.shape[0])
+        d = np.zeros(len(P)); d[ok] = D[v[ok], u[ok]]; ok &= np.isfinite(d) & (d > 0)
+        tau = 0.08 + 0.03*z
+        here = ok & (np.abs(z - d) <= tau)
+        onp = np.zeros(len(P), bool)
+        if M is not None: onp[ok] = M[v[ok], u[ok]]
+        em += (ok & (z < d - tau)) | (here & onp)                  # 看到的表面是人 = 人站在这, 家具不在这
+        su += here & ~onp
+    return em, su
+_trimmed = []
+def free_trim(m, b, w):
+    """mesh 超出量到的盒子边、而相机明确看到那里是空的 -> 那一侧缩回盒子边。只缩不拉。"""
+    c, a, sd, ha, hs = _box_rc(b)
+    hgt = m.vertices @ UP; lo, hi = float(hgt.min()), float(hgt.max())
+    P, _ = trimesh.sample.sample_surface(m, 6000, seed=0)
+    P = P[(P @ UP) > lo + 0.5*(hi - lo)]                # 上半截(桌面、柜顶): 最常被看到的部分
+    V = m.vertices.copy(); notes = []
+    for nm, e, h in (("长", a, ha), ("宽", sd, hs)):
+        t = (V - c) @ e; t0, t1 = float(t.min()), float(t.max()); n0, n1 = t0, t1; tp = (P - c) @ e
+        for sg in (1, -1):
+            if (t1 if sg > 0 else -t0) <= h + TRIM_OVER: continue
+            sel = sg*tp > h + TRIM_OVER
+            if sel.sum() < TRIM_MIN_OBS: continue
+            em, su = _seen(P[sel]); emp = (em >= 2) & (em >= 2*su); srf = (su >= 2) & (su > em)
+            nobs = int(emp.sum() + srf.sum())
+            tag = f"{nm}{'+' if sg > 0 else '-'}侧 超出 {(t1 if sg > 0 else -t0) - h:.2f} m, 看穿 {int(emp.sum())}/{nobs}"
+            if nobs < TRIM_MIN_OBS or emp.sum() < TRIM_EMPTY*nobs:
+                notes.append(tag + " -> 证据不够, 不缩"); continue
+            if sg > 0: n1 = h + TRIM_KEEP
+            else: n0 = -(h + TRIM_KEEP)
+            notes.append(tag + " -> 缩")
+        if (n0, n1) != (t0, t1):
+            if n1 - n0 < TRIM_MIN_W:
+                notes.append(f"{nm}: 缩完只剩 {n1 - n0:.2f} m < {TRIM_MIN_W} m, 不缩"); continue
+            V = V + np.outer(n0 + (t - t0)*(n1 - n0)/(t1 - t0) - t, e)
+            P = P + np.outer(n0 + (tp - t0)*(n1 - n0)/(t1 - t0) - tp, e)
+    if notes:
+        ext3 = lambda X: [round(float(np.ptp(X @ ax)), 2) for ax in (a, UP, sd)]   # 沿它自己的 长/高/宽
+        e0 = ext3(m.vertices); m.vertices = V
+        _trimmed.append((w, b["obj_id"], e0, ext3(m.vertices), notes))
+    return m
+
 scene=trimesh.Scene(); n=0; skipped=[]
+_snapped = []                    # 朝向被吸到房间网格上的: (词, 实例, 转了几度)
 # ---- 每类一个统一缩放 ----
 # 基准 = 生成这个类 mesh 时用的那个实例。它是 VLM 校验过、抠得最完整的那一个,
 # 拿它定尺寸和 mesh 本身自洽。查不到(被去重合并了)就退回"剔掉离群后的中位数"。
@@ -183,6 +418,85 @@ def ruler(ext):
 # 只对确实细长的做(长宽比 > YAW_MIN_AR); 接近方的物体长轴是噪声, 转了反而乱。
 # 这解决的是 90°, 解决不了 180° 正反 —— 那个还是没解。
 YAW_MIN_AR = float(os.environ.get("YAW_MIN_AR","1.15"))
+
+# --- 朝向吸附到房间网格 ---
+# ★ 先例: LM 链早就有这一步 —— pipeline/layout_boxfix.py 的 boxfix, 算法是 SpatialGen
+#   prepare_spatiallm_scene_5090.py 里的 fix_boxes(snap_deg=30): "水平转角离 0/90 的倍数
+#   <= snap_deg 就吸附"。物体链一直没有, 所以物体链摆出来才是歪的。
+#   两处差别: LM 链敢直接吸 0/90, 因为它在 zup(墙对齐坐标轴) 之后的系里跑;
+#   这里跑在**未旋转的 DA3 系**(load_up 读 02_da3), 坐标轴和墙没关系, 只能从墙线里数。
+#   改其中一处的时候想想另一处。
+# 盒子的长轴来自点云拟合。桌面这种"只拍到一个薄片"的东西, 长轴基本是噪声 ——
+# 实测 office 2026-09-20: 39 个物体离房间网格中位偏 15°, 5 个偏 30° 以上,
+# 摆出来整片桌子朝向乱七八糟, 而物理那步只平移不旋转, 治不了。
+# 房间壳的墙线给了建筑自己的方向, 贴着建筑摆的东西(桌/柜/窗/显示器)可以吸附过去。
+# ★ 默认关。椅子被人转出来是**真实的**, 无差别吸附会把真信息抹掉;
+#   室外更不能开(车爱朝哪朝哪)。所以按词开, 而且只吸附偏得不多的 ——
+#   偏 40° 那种要么是另一套朝向, 要么盒子彻底错了, 硬掰过去是假装修好了。
+YAW_SNAP     = {w.strip() for w in os.environ.get("YAW_SNAP","").split(",") if w.strip()}
+YAW_SNAP_MAX = float(os.environ.get("YAW_SNAP_MAX", "25"))   # 偏超过这个角度就不动它
+_GRID = None                      # [主方向, 主方向+90°] 的水平单位向量; None = 没网格
+
+
+def _room_grid(shell_path, up):
+    """从房间壳的墙线里数出建筑的主方向。按墙长加权, ±5° 聚合取最高的那一档。
+    取不到就返回 None —— 没有网格就不吸附, 别瞎猜一个方向出来。"""
+    jp = os.path.splitext(shell_path)[0] + "_墙线.json"
+    if not (shell_path and os.path.exists(jp)):
+        return None
+    try:
+        segs = json.load(open(jp)).get("墙线") or []
+    except Exception:
+        return None
+    # 墙线是平面坐标, up 轴被抽掉了。把它铺回三维: 找 up 最小的那一维当"被抽掉的轴"。
+    ax = int(np.argmax(np.abs(up)))                  # up 在哪个轴上
+    o1, o2 = [i for i in range(3) if i != ax]        # 平面的两个轴, 顺序和墙线一致
+    hist = np.zeros(180)
+    for sg in segs:
+        try:
+            a_, b_ = np.array(sg["a"], float), np.array(sg["b"], float)
+        except Exception:
+            continue
+        v = b_ - a_; L = float(np.linalg.norm(v))
+        if L < 1e-6: continue
+        hist[int(round(np.degrees(np.arctan2(v[1], v[0])) % 180)) % 180] += L
+    if hist.sum() <= 0: return None
+    sm = np.array([hist[(np.arange(i-5, i+6)) % 180].sum() for i in range(180)])
+    _c = int(np.argmax(sm))
+    # ★ 用这一档里的**按长度加权圆均值**, 不要用档的中心角。
+    #   直方图是 1° 一格、±5° 聚合, 取 argmax 等于拿格子编号当答案 —— 墙长在档内不对称时
+    #   就会系统性偏掉。实测 office 2026-09-20: 档中心给 89°, 而墙的真实主方向是 91.3°,
+    #   物体整体比墙歪 2.3°, 看上去"互相平行了但和房间不正交"。
+    #   圆均值要按 2θ 算(方向是 mod 180° 的, 0° 和 179° 是邻居, 直接平均会跑到 90°)。
+    _idx = (np.arange(_c - 5, _c + 6)) % 180
+    _w = hist[_idx]
+    _a2 = np.radians(2.0 * _idx)
+    th = float(np.arctan2((_w * np.sin(_a2)).sum(), (_w * np.cos(_a2)).sum())) / 2.0 % np.pi
+    g = []
+    for t in (th, th + np.pi/2):
+        v = np.zeros(3); v[o1] = np.cos(t); v[o2] = np.sin(t)
+        v = v - up*(v@up); g.append(v/np.linalg.norm(v))
+    print(f"[网格] 墙的主方向 {np.degrees(th):.0f}° (±5° 内总长 {sm.max():.1f} m), "
+          f"吸附目标 2 个方向, 阈值 {YAW_SNAP_MAX}°", flush=True)
+    return g
+
+
+def snap_yaw(fwd, word):
+    """把水平朝向吸到最近的网格方向。返回 (新朝向, 转了多少度)。不吸就原样返回。"""
+    if _GRID is None or not YAW_SNAP or not (word in YAW_SNAP or "*" in YAW_SNAP):
+        return fwd, 0.0
+    best, bd = fwd, 1e9
+    for g in _GRID:
+        for cand in (g, -g):                       # 180° 这里不解, 取近的那头
+            d = np.degrees(np.arccos(np.clip(fwd @ cand, -1, 1)))
+            if d < bd: bd, best = d, cand
+    return (best, bd) if bd <= YAW_SNAP_MAX else (fwd, 0.0)
+
+
+# ★ 网格必须在**摆放循环之前**算出来 —— 第一版放在下面"用房间壳代替大方片"那句旁边,
+#   那已经是循环跑完之后了, _GRID 永远还是 None, 吸附一个都不生效而且不报错。
+if YAW_SNAP:
+    _GRID = _room_grid(ROOM_SHELL, UP)
 YAW_FIX    = os.environ.get("YAW_FIX","1")=="1"
 _yaw_n=[0,0]
 def yaw_to_z(m):
@@ -276,8 +590,20 @@ for w,bs in boxes.items():
         # 人在闸口否掉的: 类名被否 = 整个词不要, 实例名被否 = 只这一个不要
         if _gen_name(w) in SKIP_NAMES or _gen_name(w, b["obj_id"]) in SKIP_NAMES:
             skipped.append((w,b["obj_id"],[],"人工否掉")); continue
+        if (w, b["obj_id"]) in _DUP:
+            skipped.append((w,b["obj_id"],[],f"重复: 和 {_DUP[(w, b['obj_id'])][0]} 是同一件")); continue
+        # ★ VLM 否决只是提醒。没被人放行 -> 不摆; 放行了 -> 只许用它自己的 mesh
+        #   (或人判了共用的类 mesh), 不许按名字借同词别人的 —— 那就是 8 米长的 car_0。
+        _vetoed = b["obj_id"] in VLM_REJ.get(w, ())
+        if _vetoed and _gen_name(w, b["obj_id"]) not in VLM_REL:
+            skipped.append((w,b["obj_id"],[],"VLM否决(人没放行)")); continue
         mk=pick_mesh(w, b["obj_id"])
-        if mk is None: continue
+        if mk is None:
+            # ★ 以前这里一声不吭地 continue, 跳过名单里没有它, 查"为什么没进场景"时查不到。
+            skipped.append((w,b["obj_id"],[],"没有 mesh")); continue
+        if _vetoed and mk != _gen_name(w, b["obj_id"]) and not (
+                (w in KEEP_W or base_word(w) in KEEP_W) and mk == MESH.get(w)):
+            skipped.append((w,b["obj_id"],[],"VLM否决已放行, 但还没有自己的 mesh(不借别人的)")); continue
         # ★ 还要拿**实际用上的那个 mesh** 再比一次。pick_mesh 的第三条退路会借同词
         #   另一个实例的 mesh —— 人否掉了 be_r2_w_0, 实例 1 没有自己的 mesh, 于是借了
         #   be_r2_w_0 摆出来: 名义上的名字不在名单里, 被否掉的东西照样出现在场景里。
@@ -323,9 +649,35 @@ for w,bs in boxes.items():
         else:
             s = CLASS_SCALE.get(w)
             if s is None: continue
+        # ★ 补过地面的: 生成 mesh 的时候腿也被挡着, office 一半的桌子被生成成矮桌(高只有长的
+        #   0.24, 腿很短)。按补完的高度等比缩, 桌面会被撑到 3~4 m 长, 而量到的桌面才 1 m。
+        #   这种就按量到的桌面大小缩(水平最长边对上盒子的长边 —— 从上往下拍, 桌面是量得最准的),
+        #   摆好以后把下面的腿往下拉到地面, 顶上 LEG_KEEP 不动。
+        #   (第一版按"量到的那截高度"缩: 矮桌碰巧也对, 但完整的高柜只露出顶上一截时会被缩成
+        #    0.37 m 宽, 比它自己的盒子 0.7 m 还窄。按桌面大小缩两种都对。)
+        #   mesh 本来就完整的(椅子)等比缩完水平边和量到的对得上, 照旧等比。
+        _legs = None
+        if "_量到尺寸" in b:
+            _foot = float(max(me[0], me[2]) * s)
+            if _foot > FOOT_RATIO * float(max(ext[0], ext[1])):
+                _s0 = float(max(ext[0], ext[1])) / max(float(max(me[0], me[2])), 1e-6)
+                _legs = (_foot, float(max(me[0], me[2]) * _s0)); s = _s0
+        # ★ 守门要再查一次**摆出来的尺寸**, 不能只查盒子。
+        #   one_scale 是拿盒子**高度**去缩 mesh 的, 所以最终多大 = mesh 自己的比例 x 高度 ——
+        #   mesh 比例和盒子比例对不上的时候, 一个过了 MAX_D 的盒子照样能摆出个超标的东西。
+        #   实测 office 2026-09-20 的 ventilation duct: 盒子 8.97x1.65x1.52(最长边 8.97 < 15,
+        #   放行), 而 mesh 是根细管(归一化 0.105 x 0.087 x 1.0), 按高度 1.52 缩 = 17.5 倍,
+        #   长轴被拉成 17.5 m, 飞到离场景中心 27 m 的地方, 一声不吭。
+        _placed = float(np.max(np.asarray(me, float) * s))
+        if _placed > MAX_D:
+            skipped.append((w, b["obj_id"],
+                            f"摆出来 {_placed:.1f}m > MAX_D={MAX_D} (盒子最长边才 {float(np.max(ext)):.1f}m, "
+                            f"mesh 比例和盒子对不上)", "摆出来超上限")); continue
         m.apply_scale(s)
         m.apply_transform(yaw_to_z(m))                   # ★ 先把 mesh 自己的长轴摆到 +Z
         fwd=np.array(b["长轴"]); fwd=fwd-UP*(fwd@UP); fwd/=np.linalg.norm(fwd)
+        fwd, _sn = snap_yaw(fwd, w)
+        if _sn > 0: _snapped.append((w, b["obj_id"], round(_sn)))
         rgt=np.cross(UP,fwd)
         R=np.eye(4); R[:3,0],R[:3,1],R[:3,2]=rgt,UP,fwd  # mesh X->右 Y->上 Z->前
         m.apply_transform(R)
@@ -338,10 +690,28 @@ for w,bs in boxes.items():
             bottom = bottom - UP*((bottom@UP) - best_h)
         # 精确落地: 把 mesh 最低点对到盒底
         h_now=(m.vertices@UP); m.apply_translation(UP*((bottom@UP)-h_now.min()))
+        if _legs:                                        # 拉腿: 底已在地面, 把顶拉到量到的桌面高度
+            h=m.vertices@UP; lo=float(h.min()); H0=float(h.max()-lo); T=lo+float(ext[2])
+            if T > lo+H0+1e-3:
+                cut=lo+(1-LEG_KEEP)*H0                   # cut 以上(桌面)整体平移, 以下(腿)线性拉长, 两段在 cut 处接上
+                nh=np.where(h>=cut, h+(T-lo-H0), lo+(h-lo)*(T-LEG_KEEP*H0-lo)/max(cut-lo,1e-9))
+                m.vertices=m.vertices+np.outer(nh-h, UP)
+                _legged.append((w, b["obj_id"], _legs[0], _legs[1], H0, T-lo))
         # 水平对中
         d=c-m.bounds.mean(0); d=d-UP*(d@UP); m.apply_translation(d)
+        if FREE_TRIM and _fit_word(w):
+            m = free_trim(m, b, w)
         scene.add_geometry(m, node_name=f"{w.replace(' ','_')}_{b['obj_id']}")
         n+=1
+
+if _trimmed:
+    print(f"[按看到的空地缩] 查了 {len(_trimmed)} 个超出量到的盒子的方盒子家具 (沿它自己的 长/高/宽, 米):")
+    for w, i, e0, e1, notes in _trimmed:
+        print(f"    {w}#{i}: {e0} -> {e1}; " + "; ".join(notes))
+if _legged:
+    print(f"[拉腿] {len(_legged)} 个补过地面的 mesh 是矮的, 按量到的桌面大小缩、腿拉到地面 (顶上 {LEG_KEEP:.0%} 不变形):")
+    for w, i, f_, f0, h0, h1 in _legged:
+        print(f"    {w}#{i}: 等比缩会有 {f_:.2f} m 长 -> 按量到的桌面 {f0:.2f} m; 高 {h0:.2f} -> {h1:.2f} m")
 
 # --- 地面片: 覆盖所有物体的范围 (没有房间壳时才铺) ---
 allp=np.array([b["中心"] for bs in boxes.values() for b in bs])
@@ -385,21 +755,57 @@ print(f"[转正] 把真实的天转到 +y, 相对老写法差 {deviation_deg(UP)
 scene.apply_transform(FLIP)
 
 # --- 房间壳: FLIP 之后并进来 (它自己已经是最终 glTF 系) ---
-nw=0
+nw=0; npl=0
 if ROOM_SHELL:
     if not os.path.exists(ROOM_SHELL): sys.exit(f"[失败] 找不到房间壳 {ROOM_SHELL}")
     shl=trimesh.load(ROOM_SHELL, force="scene")
+    # ★ 把壳整体挪到"物体站的那个地面高度"上。
+    #   地面其实被独立算了两遍, 而且从来没人核对过:
+    #     物体 -> 底部被强制放到 best_h (= world_up.json 的 ground_h, 见上面 SNAP_GROUND 那段)
+    #     壳   -> shell 那步从 03_点云_z朝上.ply 自己建的, zup 在那份点云上**另外**拟了
+    #             一次地板并压到 z=0, 带着那个高度进来
+    #   两个数差多少, 物体就悬空/陷进地板多少。实测 office 2026-09-20 就是这个毛病:
+    #   54 个物体彼此齐平(都绑在 best_h 上), 但整体和壳的地板不在一个平面。
+    #   ★ 以物体为准, 不是以壳为准: 物体的位置、尺寸、落地、支撑面判定全都已经绑死在
+    #     best_h 上, 动它等于动 54 个物体; 壳只是个外框, 平移它代价最小、影响面最窄。
+    #     (这不解决"地面高度准不准" —— ground_h 本身就偏高, 实测相机离地只有 0.34m。
+    #      那是 world_up.py 的地面拟合问题, 另算。这里只保证两边用**同一个**数。)
+    #   这段在 FLIP 之后, UP 已经对准 +y, 所以"高度"就是 y。
+    _dy, _fl = 0.0, None
+    for node in shl.graph.nodes_geometry:
+        if node == "floor":
+            _T,_gn = shl.graph[node]; _g = shl.geometry[_gn].copy(); _g.apply_transform(_T)
+            _fl = float(np.median(_g.vertices[:, 1])); break
+    if _fl is None:
+        print("[房间壳] ★ 壳里找不到 floor 节点, 没法对齐地面 —— 按原高度并入, "
+              "物体可能悬空或陷进地板。去看 room_shell.py 的节点命名。")
+    else:
+        _dy = float(best_h) - _fl
+        if abs(_dy) > 3.0:
+            print(f"[房间壳] ★ 壳的地板 {_fl:+.2f} m 和物体的地面 {best_h:+.2f} m 差了 {_dy:+.2f} m。"
+                  f"差这么多说明两次地面拟合里至少有一次彻底错了 —— 照样对齐, 但值得人看一眼。")
+        elif abs(_dy) > 1e-6:
+            print(f"[房间壳] 壳整体平移 {_dy:+.2f} m: 地板 {_fl:+.2f} -> {best_h:+.2f} m (物体站的高度)")
     for node in shl.graph.nodes_geometry:
         T,gn=shl.graph[node]; g=shl.geometry[gn].copy(); g.apply_transform(T)
+        if _dy: g.apply_translation([0.0, _dy, 0.0])
         # 节点名要保住 floor / wall_N —— 下游 scene_phys 靠名字区分"地面/静态墙/可动物体"
         scene.add_geometry(g, node_name=node)
-        nw += node.startswith("wall")
-    print(f"[房间壳] 并入 floor + {nw} 面墙")
+        nw += node.startswith("wall"); npl += node.startswith("pillar")
+    print(f"[房间壳] 并入 floor + {nw} 面墙" + (f" + {npl} 根柱子(pillar_N, 物理当钉死的)" if npl else ""))
 
 dst=f"{ROOT}/"+os.environ.get("SCENE_OUT","07_scene.glb"); scene.export(dst)
 print(f"[组装] {n} 个物体 + {'房间壳(floor+%d墙)'%nw if ROOM_SHELL else '地面'} -> {dst}"
       f"  (其中 {solo_used} 个用了实例专属 mesh, 排除了 {sorted(EXCLUDE)})")
 print(f"[朝向] 把 mesh 自身长轴对齐到盒子长轴: 其中 {_yaw_n[0]} 个原本歪了 45°以上, {_yaw_n[1]} 个太方没动")
+if YAW_SNAP:
+    if _snapped:
+        _d = sorted(x[2] for x in _snapped)
+        print(f"[朝向] 吸到房间网格 {len(_snapped)} 个, 转了 {_d[0]}~{_d[-1]}° (中位 {_d[len(_d)//2]}°): "
+              + ", ".join(f"{w}#{i}+{d}°" for w, i, d in sorted(_snapped, key=lambda x: -x[2])[:8]))
+    else:
+        print(f"[朝向] 开了吸附(YAW_SNAP={sorted(YAW_SNAP)}) 但一个都没吸 —— "
+              f"要么没有墙线算不出网格, 要么都偏超过 {YAW_SNAP_MAX}°")
 if skipped:
     # 按原因分开报 —— 混在一起的话, 排查时分不清是"阈值定错了"还是"盒子本身量错了",
     # 而这两件事的修法完全相反。
@@ -408,3 +814,8 @@ if skipped:
     print(f"[跳过] 共 {len(skipped)} 个:")
     for why,items in sorted(_by.items()):
         print(f"   {why:14s} {len(items):3d} 个: {items[:5]}")
+# ★ 完整的跳过名单落盘。日志里每条原因只打前 5 个, 查"这个实例为什么没进场景"时拿不全。
+#   只写一个旁路文件, 不影响任何下游; 查看页(tools/box_fit_view.py)会读它。
+json.dump(dict(scene=os.path.basename(dst), exclude=sorted(x for x in EXCLUDE if x),
+               skipped=[dict(word=w, obj_id=int(oid), why=why, ext=ext) for w, oid, ext, why in skipped]),
+          open(dst[:-4] + "_skipped.json", "w"), ensure_ascii=False, indent=1)

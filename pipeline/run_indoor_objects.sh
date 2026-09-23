@@ -24,7 +24,7 @@ export TORCH_CUDA_ARCH_LIST=12.0
 # ---- 阈值 (室内, 依据见 plan; 街景那套在密集摆放下会把一桌四椅并成一个) ----
 export MIN_POINTS=120 CONF_MIN=1.2 VOX=0.06 DUP_TH=0.70 PART_TH=0.70 SAMPLE_FRAMES=8
 export MIN_AREA_PCT=0.05 MIN_FRAMES=2 TOPK=8
-export SOLO="grand piano,bar counter,sofa,potted palm,shelf" SOLO_KEEP="" TH=0.1
+export SOLO="grand piano,bar counter,sofa,potted palm,shelf" SOLO_KEEP="" SOLO_MIN_PX=256   # 门槛按像素, 见 data/outdoor/scripts/solo_gate.py (以前是 TH=0.1 百分比)
 export SCENE_DESC="photo of an indoor bar lounge"
 LAYOUT_EXCLUDE="screen"     # 贴墙的平面, 当独立物体摆必错 (同 outdoor 排 sign/billboard)
 

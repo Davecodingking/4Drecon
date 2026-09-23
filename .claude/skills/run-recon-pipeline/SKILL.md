@@ -311,7 +311,7 @@ eval $(~/miniforge3/envs/sam3d/bin/python pipeline/outdoor_pipeline.py \
         --scene beach --run r2 --dump-cfg | \
         ~/miniforge3/envs/sam3d/bin/python -c "
 import json,sys,shlex; d=json.load(sys.stdin)
-for k in ('SOLO','SOLO_KEEP','SOLO_TH','EXCLUDE'): print(f'export {k}={shlex.quote(str(d[k]))}')")
+for k in ('SOLO','SOLO_KEEP','SOLO_MIN_PX','EXCLUDE'): print(f'export {k}={shlex.quote(str(d[k]))}')")
 R1=$PWD/$R TAG=be_r2 FR=$PWD/data/outdoor/dataset/beach/frames \
   ~/miniforge3/envs/sam3d/bin/python tools/review_gate.py
 ```

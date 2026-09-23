@@ -38,7 +38,7 @@ WildDet3D 是学出来的先验: 输出带四元数的完整朝向, 和"含被�
 """
 import sys, os, json, glob, numpy as np, cv2, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from world_frame import load_up, export_T, inverse_T
+from world_frame import load_up, export_T, inverse_T, usable_frames
 from pycocotools import mask as mask_util
 
 R1   = os.environ.get("R1","/home/jincheng/sam3d/data/outdoor/result/timesquare/r1")
@@ -59,7 +59,7 @@ MK, DA3 = f"{R1}/03_masks", f"{R1}/02_da3"
 UP, _GH, _FB = load_up(DA3, "WD量盒子")
 
 cams = json.load(open(f"{DA3}/cameras.json"))["cameras"]
-HAVE = {int(f[:4]) for f in os.listdir(f"{DA3}/depth") if f.endswith("_depth.npy")}
+HAVE = usable_frames(DA3, "WD量盒子")          # 跳过位姿不可信的帧
 
 import sys; sys.path.insert(0, REPO)
 from wilddet3d import build_model, preprocess
