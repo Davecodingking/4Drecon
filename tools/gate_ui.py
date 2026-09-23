@@ -58,6 +58,16 @@ from pycocotools import mask as mask_util
 HOME  = os.path.expanduser("~")
 SAM3D = f"{HOME}/sam3d"
 MYIMG = f"{SAM3D}/sam-3d-objects/my_images"
+HERE  = os.path.dirname(os.path.realpath(__file__))   # realpath: 万一有软链接, abspath 会数错目录(见 tools/README)
+
+
+def box_view_state(R1):
+    """3D tab 的数据在不在。只查文件, 不 import scene_view —— 顶栏灰不灰要在 /api/state 里答,
+    而那时候人还没点 3D, 不该为它把 scene_view 拉进来。文件名和 scene_view.DATA_NAME 一致。"""
+    p = f"{R1}/10_box_fit_view.json"
+    if not os.path.exists(p):
+        return {"在": False, "生成于": None}
+    return {"在": True, "生成于": time.strftime("%m-%d %H:%M", time.localtime(os.path.getmtime(p)))}
 GEN_OUT = f"{SAM3D}/sam-3d-objects/outputs"     # assemble_scene.py 的 OUTS, 生成好的 glb 在这
 # 组装的绝对尺寸守卫, 抄 assemble_scene.py:28-29(流水线不传, 用的就是这两个默认值)。
 # 界面只拿它预告"这个会被组装扔掉", 不参与写入。
@@ -1147,6 +1157,15 @@ def make_handler(store):
                 if u.path == "/api/runs":
                     return self._json(run_dirs())
                 st = self._store(q)              # 下面每一条都用这个轮次
+                if u.path.startswith("/3d"):
+                    # 3D tab 住在 scene_view.py, 到这里才 import(懒加载): 不点它, 闸口不多读一个字节;
+                    # 它坏了只这条路 500(下面的 except 兜住), 决策台照常。
+                    if "scene_view" not in sys.modules:
+                        print("[3D] 挂载 scene_view.py", flush=True)
+                        if HERE not in sys.path: sys.path.insert(0, HERE)
+                    import scene_view
+                    if scene_view.handle(self, u.path, st.R1):
+                        return
                 if u.path == "/api/state":
                     d = st.load()
                     rows = d["候选"]
@@ -1170,6 +1189,7 @@ def make_handler(store):
                         盘上样本=st.disk_samples(),
                         配置指定样本=st.pipeline_cfg().get("配置指定样本") or {},
                         组装守卫=dict(MIN_H=ASM_MIN_H, MAX_D=ASM_MAX_D),
+                        场景查看=box_view_state(st.R1),
                         候选=rows))
                 if u.path == "/img/word":
                     # 只给词, 服务端自己挑"最有代表性的那个实例的代表帧" ——
@@ -1552,6 +1572,11 @@ PAGE = r"""<!doctype html>
         background:var(--sheet);border-color:var(--ink);color:var(--ink);font-weight:700;
         box-shadow:inset 0 0 0 1px var(--ink);position:relative;z-index:1}
  .gsw button.on,.gsw button.on:hover:not(:disabled){background:var(--ink);color:#fff}
+ #to3d{text-decoration:none;border:1px solid var(--ink);padding:4px 14px;font-size:12px;color:var(--ink)}
+ #to3d:hover{background:var(--ink);color:#fff}
+ #to3d.off{opacity:.4;cursor:not-allowed}
+ .im a.to3d{float:right;font-size:11px;text-decoration:none;border:1px solid var(--ink);padding:0 5px;color:var(--ink)}
+ .im a.to3d:hover{background:var(--ink);color:#fff}
  /* "不"是红的: drop / drop word 选中时实心红 */
  button.on[data-yn="drop-word"],button.on[data-yn="drop-word"]:not(:disabled),
  button.on[data-yn="drop-word"]:hover:not(:disabled),
@@ -1577,6 +1602,7 @@ PAGE = r"""<!doctype html>
   <span class="gsw" id="gsw"></span>
   <span id="gate" class="ghd"></span>
   <span class="gsw" id="rcw"></span>
+  <a id="to3d" class="ghd" target="_blank" hidden>3D ↗</a>
   <span id="stat" class="ghd dimly"></span>
   <span class="sp"></span>
   <span id="dec" class="path"></span>
@@ -2305,6 +2331,11 @@ async function boot(){
             闸:d.闸, 阶段:d.阶段, 决策文件:d.决策文件,
             solo门槛px:d.solo门槛px, 可追加行:d.可追加行,
             SOLO:d.SOLO, SOLO_KEEP:d.SOLO_KEEP};   // 配置默认要靠它俩推
+  S.meta.场景查看 = d.场景查看 || {在:false};
+  const v = document.getElementById("to3d");
+  v.hidden = false;
+  if (S.meta.场景查看.在){ v.href = U('/3d'); v.title = "3D view: point cloud, boxes, final placement (data " + S.meta.场景查看.生成于 + ")"; }
+  else { v.classList.add('off'); v.removeAttribute('href'); v.title = "No 3D data yet — it appears once gate 3 (boxes) has run"; }
   S.行 = d.候选; S.待删 = new Set();
   S.历史 = d.历史决定 || {};
   S.网格事实 = d.网格事实 || {};       // 盘上哪些 glb / 盒子在, 见后端 mesh_facts
@@ -2319,6 +2350,24 @@ async function boot(){
   写文件名(d.决策文件);
   重建索引();
   if (GATE === 'scale') scLoad(); else render();
+  const want = new URLSearchParams(location.search).get('sel');
+  if (want && GATE === 'review') 跳到实例(want);
+}
+
+// 从 3D 页跳回来: ?sel=词:实例 —— 打开那个词的弹层, 滚到那张卡, 黄框闪一下。
+// 实例列表要先从服务端拿(展开面板 里 取实例 是异步的), 所以轮询等卡片出现, 最多 4 秒。
+function 跳到实例(k){
+  const i = k.lastIndexOf(':'); if (i < 0) return;
+  const 词 = k.slice(0, i), oid = k.slice(i + 1);
+  if (!S.词.has(词)) return;
+  开弹层({view:'insts', 词, oid:null});
+  let n = 0;
+  const t = setInterval(() => {
+    const el = document.querySelector('.inst[data-key="' + CSS.escape(词 + ':' + oid) + '"]');
+    if (el){ clearInterval(t); el.scrollIntoView({block:'center'});
+      el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 2400); }
+    else if (++n > 40) clearInterval(t);
+  }, 100);
 }
 
 // 顶栏那行文件路径。目录暗、文件名亮 —— 一眼看出在编辑哪一份。
@@ -2611,6 +2660,9 @@ function 展开面板(w){
       (是代表 ? 样徽章(w, 样) : '')+
       '<div class="im">'+
         '<b>#'+r.oid+'</b><em>'+r.中位面积pct+'%</em>'+
+        (S.meta.场景查看 && S.meta.场景查看.在
+          ? '<a class="to3d" target="_blank" title="Open this object in the 3D view" href="'
+            +U('/3d')+'#sel='+encodeURIComponent(w.词+':'+r.oid)+'">3D ↗</a>' : '')+
         '<div class="bar"><s style="width:'+
            Math.round(100*r.中位面积pct/Math.max(ins[0].中位面积pct,1e-6))+'%"></s></div>'+
         '<div class="glyph"><u style="width:'+bw+'px;height:'+bh+'px"></u>'+
