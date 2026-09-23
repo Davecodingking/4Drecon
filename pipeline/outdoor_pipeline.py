@@ -55,6 +55,7 @@ from _common import (LOCK, GpuLock, wait_gpu, sh, envcmd, stamp_path,
 HOME   = os.path.expanduser("~")
 SAM3D  = f"{HOME}/sam3d"
 SCRIPTS= f"{SAM3D}/data/outdoor/scripts"
+PIPE   = f"{SAM3D}/pipeline"                 # 两条链共用的步骤(body_into_scene / body_video)
 TOOLS  = f"{SAM3D}/tools"      # 看结果的脚本都在这里, 常用的放一处好找
 GEN    = f"{SAM3D}/sam-3d-objects"          # SAM 3D Objects 仓库
 DA3REPO= f"{SAM3D}/Depth-Anything-3"
@@ -162,6 +163,15 @@ CFG = dict(
     SNAP        = "0.8",    # 落地: 底面离地在这个范围内才吸附, 超过视为本就悬空
     ITERS       = "12",     # 推开穿模的迭代轮数
     MARGIN      = "0.02",   # 推开后留的缝(米)
+    # 人的整个身体(整段扫过, 不含手)当空气墙, 替代只管脚下的脚印矩形。见 scene_phys 的 PEOPLE_BODY
+    BODY_WALL   = "1",
+    # 有人的场景填 body4d 那一轮的目录 (body4d_pipeline.py 的产物)。给了就
+    #   1) 尺度那步拿人当主尺子 —— 人从头到脚拍得全, 身高是真的; 家具/护栏被遮挡只会量矮, 把世界放大
+    #   2) people / people_glb 两步把人放进场景; 物理把人走过的路当路障
+    # ★ 和室内同一套写法(indoor_pipeline 的 BODY_RUN) —— 两条链的人线必须一致,
+    #   否则同一个 world_scale.py 在室外永远走不到"只用人"那个分支(soccer 踩过: 够格当
+    #   尺子的家具只有 1 类, 直接硬停, 而画面主角恰恰是人)。
+    BODY_RUN    = "",
     RB_FRAMES   = "0,40,88,120,160",   # 渲染回图用哪几个机位
     WD_FRAMES   = "5",      # WildDet3D 每个实例问几帧, 取中位数
     WD_MINPIX   = "400",    # 2D 框小于这么多像素就不问, 问了也是噪声
@@ -198,6 +208,11 @@ SCENE_TAG = {"timesquare": "ts", "warpengine": "we", "beach": "be", "carpark": "
 
 SCENES = {
     "timesquare": {},        # 基准场景 —— CFG 的默认值就是在它上面调的
+    # 足球场, 1280x720 / 205 帧。★ 人是这段素材的主角: 拿人当尺子, 再把人放进场景。
+    #   不配 BODY_RUN 的话 scale 那步会硬停 —— 够格当尺子的家具只有 fence post 一类
+    #   (球门/球网/围栏各只有 1 个实例, 袜子球鞋 0.15 m 太矮), 不够两类互相印证。
+    #   相机轨迹只有 4.2 m, 视差很小, 朝向和尺度本来就不可靠, 更要靠人这把尺子。
+    "soccer":     dict(BODY_RUN=f"{SAM3D}/sam-body4d/outputs/soccer/b1"),
     "warpengine": {},        # 还没跑过, 跑的时候把调出来的值填这里
     # 下面两个是 2026-09-07 新加的。素材 1920x1080, 比时代广场(1280x720)清晰但帧少
     # (beach 109 帧 / carpark 132 帧 vs 180)。阈值先沿用时代广场那套, 跑出来再按实际调。
@@ -717,7 +732,10 @@ def s_scale(c, dry):
     sh(envcmd(PY["sam3d"], f"{SCRIPTS}/world_scale.py",
               dict(R1=c.R1, MIN_POINTS=c.cfg["MIN_POINTS"], CONF_MIN=c.cfg["CONF_MIN"],
                    SAMPLE_FRAMES=c.cfg["SAMPLE_FRAMES"], VOX=c.cfg["VOX"],
-                   DUP_TH=c.cfg["DUP_TH"], PART_TH=c.cfg["PART_TH"])),
+                   DUP_TH=c.cfg["DUP_TH"], PART_TH=c.cfg["PART_TH"],
+                   # ★ 有人就拿人当主尺子(和室内同一套)。没有人、且够格的家具不足两类时,
+                   #   world_scale.py 会直接退非零码 —— 那是它在说"这段素材定不出尺度", 不是 bug。
+                   SCALE_PEOPLE=c.cfg["BODY_RUN"])),
        f"{c.LOG}/06_scale.log", dry)
 
 def s_solo(c, dry):
@@ -748,14 +766,54 @@ def s_assemble(c, dry):
     sh(envcmd(PY["sam3d"], f"{SCRIPTS}/assemble_scene.py",
               dict(R1=c.R1, TAG=c.tag, GEN_OUT=f"{GEN}/outputs", SOLO_KEEP=c.cfg.get("SOLO_KEEP",""), EXCLUDE=ex,
                    PER_INSTANCE=c.cfg["PER_INSTANCE"],
+                   BODY_RUN=c.cfg["BODY_RUN"],     # 有人就把人的身体当空气墙, 别往人身上推
                    **_boxes_arg(c))),
        f"{c.LOG}/07_assemble.log", dry)
 
 def s_phys(c, dry):
     """落地 + 推开穿模。纯几何不用物理引擎 —— 室外地面就是一个平面, 比室内简单。"""
     sh(envcmd(PY["sam3d"], f"{SCRIPTS}/scene_phys.py",
-              dict(R1=c.R1, SNAP=c.cfg["SNAP"], ITERS=c.cfg["ITERS"], MARGIN=c.cfg["MARGIN"])),
+              dict(R1=c.R1, SNAP=c.cfg["SNAP"], ITERS=c.cfg["ITERS"], MARGIN=c.cfg["MARGIN"],
+                   # 人走过的路当路障; 整个身体当空气墙(和室内同一套)
+                   PEOPLE=f"{c.R1}/10_people.json" if c.cfg["BODY_RUN"].strip() else "",
+                   PEOPLE_BODY=(f"{c.R1}/10_people_body.npz"
+                                if c.cfg["BODY_RUN"].strip() and c.cfg["BODY_WALL"] == "1" else ""))),
        f"{c.LOG}/07_phys.log", dry)
+
+
+def _body(c, dry):
+    """这个场景的人体那一轮。没配 = 没有人, 返回空; 配了但目录不在 = 直接失败, 不悄悄跳过。
+    (和 indoor_pipeline._body 逐行一致 —— 改一处要改两处。)"""
+    body = c.cfg["BODY_RUN"].strip()
+    if body and not os.path.isdir(body) and not dry:
+        raise SystemExit(f"[失败] BODY_RUN={body} 不存在 —— 先跑 body4d_pipeline.py 出人")
+    return body
+
+
+def s_people(c, dry):
+    """摆人(物理之前): 每人每帧的远近、脚着地、走过的路线 -> 10_people.json。
+    ★ 排在物理之前 —— 物理拿人走过的路当路障 (scene_phys 的 PEOPLE)。
+    远近按场景深度量。尺度那步已经拿人当尺子校准过, 这里每个人的比例都该在 1 附近。"""
+    body = _body(c, dry)
+    if not body:
+        print("    这个场景没配 BODY_RUN(没有人), 跳过"); return
+    sh(envcmd(PY["sam3d"], f"{PIPE}/body_into_scene.py", None,
+              ["--r1", c.R1, "--body", body, "--mode", "place", "--scene-in", "07_scene.glb"]),
+       f"{c.LOG}/10_people.log", dry)
+
+
+def s_people_glb(c, dry):
+    """合成(物理之后): 按 10_people.json 把会动的人放进 07_scene_phy.glb -> 09_scene_4d.glb,
+    再出验收视频 09_people_check.mp4 (原视频 | 同一个相机看到的重建+人 | 两者叠加)。"""
+    body = _body(c, dry)
+    if not body:
+        print("    这个场景没配 BODY_RUN(没有人), 跳过"); return
+    sh(envcmd(PY["sam3d"], f"{PIPE}/body_into_scene.py", None,
+              ["--r1", c.R1, "--body", body, "--mode", "compose", "--scene-glb", "07_scene_phy.glb",
+               "--out", "09_scene_4d.glb", "--render", "--fr", c.FR]), f"{c.LOG}/10_people_glb.log", dry)
+    sh(envcmd(PY["sam3d"], f"{PIPE}/body_video.py", None,
+              ["--r1", c.R1, "--body", body, "--scene", "07_scene_phy.glb", "--fr", c.FR]),
+       f"{c.LOG}/10_people_glb.log", dry)
 
 def s_render(c, dry):
     """从原视频的机位渲染重建结果, 和实拍并排比对。护栏和路灯杆应当重合。"""
@@ -977,7 +1035,9 @@ STEPS = [
     ("recall_gen","sam3d",    "召回4: 漏检实例生成mesh",          s_recall_gen),
     ("recall_merge","sam3d",  "召回5: 盒子并进主文件",            s_recall_merge),
     ("assemble", "sam3d",     "摆回街上 + 地面 -> 07_scene.glb",  s_assemble),
+    ("people",   "sam3d",     "摆人: 远近/脚着地/走过的路",        s_people),
     ("phys",     "sam3d",     "落地 + 推开穿模",                  s_phys),
+    ("people_glb","sam3d",    "人放进物理后的场景 + 验收视频",      s_people_glb),
     ("render",   "sam3d",     "渲染回图比对",                     s_render),
     ("building_scene","sam3d", "楼单独出 glb + 物理 + 渲染回图",    s_building_scene),
     ("assemble_wd","sam3d",   "WildDet3D版组装 -> 17_scene_wd.glb", s_assemble_wd),
@@ -1012,7 +1072,9 @@ ARTIFACTS = {
     "override": [],                       # 只改 my_images/ 里的抠图, R1 底下没有产物
     "relabel": ["03_relabel_done.json"],
     "assemble": ["07_scene.glb"],
+    "people":   [],                     # 没有人的场景这步是空的, 产物不能写死
     "phys":     ["07_scene_phy.glb"],
+    "people_glb": [],
     "render":   ["08_render_back.jpg", "08_render_back_phy.jpg"],
     "boxes_wd": ["06_all_boxes_wilddet.json"],
     "detect":   ["12_wd_detections.json"],
@@ -1042,7 +1104,8 @@ DEPS = {
     "boxes": ["track", "ratio", "up", "dedup", "relabel"],   # relabel 会搬 03_masks/*.npz, 而量盒子读的就是它
     "vlm_sizes": ["vlm"],       "scale": ["boxes", "vlm_sizes"],
     "solo": ["scale"],          "assemble": ["scale", "solo", "verify", "recall_merge", "boxes"],
-    "phys": ["assemble"],       "render": ["phys"],
+    "people": ["assemble"],     "people_glb": ["phys", "people"],
+    "phys": ["assemble", "people"],  "render": ["phys"],
     "boxes_wd": ["track", "da3", "up", "scale"],
     "compare": ["boxes", "boxes_wd", "up"],  "building_scene": ["assemble"],
     "assemble_wd": ["boxes_wd", "solo"], "phys_wd": ["assemble_wd"], "render_wd": ["phys_wd"],

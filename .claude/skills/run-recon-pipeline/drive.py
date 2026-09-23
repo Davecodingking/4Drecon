@@ -65,7 +65,10 @@ SEGMENTS = {
         #   两件事, 之所以同段: solo 要读 06_all_boxes.json 决定哪些实例值得单独生成,
         #   而那个文件是上一段 boxes 步才产的 —— 依赖关系决定的顺序。
         ("逐实例+召回", ["solo", "boxes_wd", "compare", "detect", "recall", "recall_mask"], "check_recall"),
-        ("验收",   ["recall_gen", "recall_merge", "assemble", "phys", "render"],       "check_scene"),
+        # people 排在 phys 之前(物理要拿人走过的路当路障), people_glb 在 phys 之后 —— 和室内同序。
+        # 没配 BODY_RUN 的场景这两步自己跳过, 不用分两张段表。
+        ("验收",   ["recall_gen", "recall_merge", "assemble", "people", "phys",
+                    "people_glb", "render"],                                    "check_scene"),
         ("收尾",   ["building_scene", "assemble_wd", "phys_wd", "render_wd"],          "check_final"),
     ],
     # 室内物体链: 多了提亮/抽帧/z朝上三步, 墙壳走 walls+shell, 没有 WD 对照那一支
