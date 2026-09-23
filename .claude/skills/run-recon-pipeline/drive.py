@@ -177,6 +177,26 @@ def run_steps(kind, scene, run, steps, dry):
     print(f"\n$ {' '.join(cmd)}\n", flush=True)
     return subprocess.run(cmd).returncode
 
+def ensure_box_view(R1, dry=False):
+    """闸口网页 3D tab 要的数据 <R1>/10_box_fit_view.json: 不在、或比产物旧, 就重算(office 实测 18 s);
+    否则跳过。判"旧"的规则在 tools/scene_view.py(闸口网页也用同一份报"过时"), 别在这再抄。
+    失败不挡闸 —— 3D 页是看的, 不是流程的一环。"""
+    if TOOLS not in sys.path: sys.path.insert(0, TOOLS)
+    import scene_view
+    p = scene_view.data_path(R1)
+    why = "还没有" if not os.path.exists(p) else scene_view.stale(R1)
+    if not why:
+        return "新鲜"
+    cmd = [PY, f"{TOOLS}/box_fit_view.py", "--r1", R1, "--out", "off"]
+    print(f"\n[3D 页] 数据{why if why == '还没有' else '比 ' + why + ' 旧'}, 重算 (~20 s): $ {' '.join(cmd)}", flush=True)
+    if dry:
+        return "干跑"
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print("[3D 页] 失败(不挡闸): " + (r.stderr or r.stdout).strip()[-400:]); return "失败"
+    print(f"[3D 页] {p}   闸口网页顶栏 3D 就是它")
+    return "重算"
+
 # ---------------- 每道闸的检查: 只报数和图, 不下结论 ----------------
 def _j(p, d=None):
     return json.load(open(p)) if os.path.exists(p) else d
@@ -382,6 +402,9 @@ def gate_report(i, R1, tag, scene, kind, run, last=False):
         lines, look = CHECKS[fn](R1, tag, scene, kind, run)
     except Exception as e:
         lines, look = [f"(检查本身出错了: {e})"], []
+    if 2 <= i <= 4:      # 闸 3/4/5: 盒子量完才有得看; 闸 6 和闸 5 之间场景没变, 不重算; 闸 1/2 没盒子
+        ensure_box_view(R1)
+        lines.append("3D: open the gate page (tools/gate_ui.py) and press 3D in the top bar")
     for l in lines: print("  " + l)
     exist = [p for p in look if os.path.exists(p)]
     if exist:
