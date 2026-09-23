@@ -46,13 +46,13 @@
 **Interfaces:**
 - Produces: `_gamma(img, m) -> float`、`_apply_gamma(img, g) -> ndarray`、`cutout_rgb(img, m, size, gamma=True)`、`locate_rgb(img, m, size=420, g=None) -> ndarray|None`、`Store._mask(word, oid, frame) -> uint8 mask|None`、`Store.locate(word, oid, frame, size=420)`、路由 `GET /img/frame?word=&oid=[&frame=][&size=]`。
 
-- [ ] **Step 1: 备份**
+- [x] **Step 1: 备份**
 
 ```bash
 cd ~/sam3d/tools && cp gate_ui.py gate_ui.py.bak_3dtab
 ```
 
-- [ ] **Step 2: 写失败的测试** `tools/tests/test_gate_locate.py`
+- [x] **Step 2: 写失败的测试** `tools/tests/test_gate_locate.py`
 
 ```python
 #!/usr/bin/env python
@@ -99,12 +99,12 @@ if __name__ == "__main__":
             f(); print("ok", k)
 ```
 
-- [ ] **Step 3: 跑,确认失败**
+- [x] **Step 3: 跑,确认失败**
 
 Run: `cd ~/sam3d && ~/miniforge3/envs/sam3d/bin/python tools/tests/test_gate_locate.py`
 Expected: `AttributeError: module 'gate_ui' has no attribute '_gamma'`
 
-- [ ] **Step 4: 实现**
+- [x] **Step 4: 实现**
 
 在 `cutout_rgb` 前面(第 77 行之前)加:
 
@@ -213,12 +213,12 @@ def locate_rgb(img, m, size=420, g=None):
                     return self._png(st.locate(q["word"], hit["oid"], fr, int(q.get("size", "420"))))
 ```
 
-- [ ] **Step 5: 跑测试,通过**
+- [x] **Step 5: 跑测试,通过**
 
 Run: `cd ~/sam3d && ~/miniforge3/envs/sam3d/bin/python tools/tests/test_gate_locate.py`
 Expected: 两行 `ok test_...`
 
-- [ ] **Step 6: 真轮次上 curl 一张**
+- [x] **Step 6: 真轮次上 curl 一张**
 
 ```bash
 cd ~/sam3d && PY=~/miniforge3/envs/sam3d/bin/python; SP=/tmp/claude-1004/-home-jincheng/92d1614a-64e3-41aa-9d0b-8592d431f8f9/scratchpad
@@ -228,7 +228,7 @@ $PY -c "import cv2;a=cv2.imread('$SP/frame_pipe0.png');print(a.shape)"; kill %1
 ```
 Expected: shape 长边 520,不是 200×200(那是 "mask empty" 占位)。用 Read 看两张 png:定位图里红框在通风管处、背景压暗;特写比之前亮。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 cd ~/sam3d && git add tools/gate_ui.py tools/tests/test_gate_locate.py && git commit -m "闸口: 暗抠图自动提亮 + 整帧定位图路由 /img/frame
@@ -247,7 +247,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: 路由 `/img/frame`(Task 1)。
 - Produces: 每张实例卡 `el.dataset.key = 词 + ':' + oid`(Task 6 的 `?sel=` 靠它滚动)。
 
-- [ ] **Step 1: CSS**
+- [x] **Step 1: CSS**
 
 把 `.insts{...minmax(150px,1fr)...}` 改成 `minmax(400px,1fr)`,并在 `.inst img{...}` 那条后面加:
 
@@ -259,7 +259,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
  .inst.flash{box-shadow:inset 0 0 0 3px var(--yellow);z-index:2}
 ```
 
-- [ ] **Step 2: 卡片**
+- [x] **Step 2: 卡片**
 
 `el.className = "inst" + ...;` 那句后面加一行:
 
@@ -278,14 +278,14 @@ innerHTML 开头那个 `<img loading="lazy" src="'+U('/img/inst', ...)+'">'+` �
         '</div>'; })()+
 ```
 
-- [ ] **Step 3: 起服务看一眼**
+- [x] **Step 3: 起服务看一眼**
 
 ```bash
 cd ~/sam3d && ~/miniforge3/envs/sam3d/bin/python tools/gate_ui.py --scene office --run r6_pillarfix --indoor --port 8799
 ```
 浏览器开 `http://localhost:8799`,点开 `pipe` 那个词:每张卡左特写、右整帧红框;点定位图开大图。`.inst.dropped` 的红斜线仍然盖在图上。关掉服务。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 cd ~/sam3d && git add tools/gate_ui.py && git commit -m "闸口: 实例卡并排整帧定位图, 卡片带 data-key
@@ -304,13 +304,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces: `--data <路径|off>`(默认 `<r1>/10_box_fit_view.json`)、`--out <路径|off>`;json 顶层多一个 `"页": {"title","eyebrow","notice"}`。
 
-- [ ] **Step 1: 备份**
+- [x] **Step 1: 备份**
 
 ```bash
 cd ~/sam3d/tools && cp box_fit_view.py box_fit_view.py.bak_3dtab
 ```
 
-- [ ] **Step 2: 写测试** `tools/tests/test_box_fit_view_data.sh`
+- [x] **Step 2: 写测试** `tools/tests/test_box_fit_view_data.sh`
 
 ```bash
 #!/bin/bash
@@ -331,12 +331,12 @@ $PY ~/sam3d/tools/box_fit_view.py --r1 $R1 --data off --out $SP/bfv.html > $SP/b
 grep -q '"insts"' $SP/bfv.html && ! grep -q '__DATA__' $SP/bfv.html && echo "html ok"
 ```
 
-- [ ] **Step 3: 跑,确认失败**
+- [x] **Step 3: 跑,确认失败**
 
 Run: `bash ~/sam3d/tools/tests/test_box_fit_view_data.sh`
 Expected: `error: unrecognized arguments: --data`
 
-- [ ] **Step 4: 实现**
+- [x] **Step 4: 实现**
 
 参数(`--out` 那行改、加 `--data`):
 
@@ -377,12 +377,12 @@ if OUT:
 drive.py 在闸 3/4/5 自动跑 --out off; 手动要单文件就自己跑。
 ```
 
-- [ ] **Step 5: 跑测试,通过**
+- [x] **Step 5: 跑测试,通过**
 
 Run: `bash ~/sam3d/tools/tests/test_box_fit_view_data.sh`
 Expected: `json ok: ... insts; office/r6_pillarfix · N measured ...` 和 `html ok`
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd ~/sam3d && git add tools/box_fit_view.py tools/tests/test_box_fit_view_data.sh && git commit -m "box_fit_view: 出口拆成 --data json 和 --out html, 页面标题存进 json
@@ -401,7 +401,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces: `DATA_NAME = "10_box_fit_view.json"`、`INPUTS`、`data_path(R1) -> str`、`stale(R1) -> str|None`、`state(R1) -> {"在","生成于","过时"}`、`handle(h, path, R1) -> bool`(h 要有 `_send(code, ctype, body)`、`_json(obj, code)`、`send_response/send_header/end_headers/wfile`)。
 
-- [ ] **Step 1: 写测试** `tools/tests/test_scene_view.py`
+- [x] **Step 1: 写测试** `tools/tests/test_scene_view.py`
 
 ```python
 #!/usr/bin/env python
@@ -449,12 +449,12 @@ if __name__ == "__main__":
             f(); print("ok", k)
 ```
 
-- [ ] **Step 2: 跑,确认失败**
+- [x] **Step 2: 跑,确认失败**
 
 Run: `cd ~/sam3d && ~/miniforge3/envs/sam3d/bin/python tools/tests/test_scene_view.py`
 Expected: `ModuleNotFoundError: No module named 'scene_view'`
 
-- [ ] **Step 3: 实现** `tools/scene_view.py`
+- [x] **Step 3: 实现** `tools/scene_view.py`
 
 ```python
 #!/usr/bin/env python
@@ -545,12 +545,12 @@ def handle(h, path, R1):
     return False
 ```
 
-- [ ] **Step 4: 跑测试,通过**
+- [x] **Step 4: 跑测试,通过**
 
 Run: `cd ~/sam3d && ~/miniforge3/envs/sam3d/bin/python tools/tests/test_scene_view.py`
 Expected: `ok test_state_and_stale`、`ok test_routes`
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd ~/sam3d && git add tools/scene_view.py tools/tests/test_scene_view.py && git commit -m "scene_view: 闸口 3D tab 的服务端, 只标准库, 端 box_fit_view 的 json
@@ -569,13 +569,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: `/3d/data`(Task 4)、`D.页`(Task 3)。
 - Produces: 页面读 `location.hash` 里的 `sel=<词:实例>`;选中时 `#gatelink` 指向 `/?<原 query>&sel=<词:实例>`。
 
-- [ ] **Step 1: 备份**
+- [x] **Step 1: 备份**
 
 ```bash
 cd ~/sam3d/tools && cp box_fit_view_template.html box_fit_view_template.html.bak_3dtab
 ```
 
-- [ ] **Step 2: 侧栏加回闸口链接**
+- [x] **Step 2: 侧栏加回闸口链接**
 
 第 105 行 `__NOTICE__` 后面加:
 
@@ -583,7 +583,7 @@ cd ~/sam3d/tools && cp box_fit_view_template.html box_fit_view_template.html.bak
       <p class="note" id="gatelink-wrap" hidden><a id="gatelink" href="/">‹ Back to the gate — this object</a></p>
 ```
 
-- [ ] **Step 3: 数据来源**
+- [x] **Step 3: 数据来源**
 
 180-181 行
 
@@ -614,7 +614,7 @@ if (SERVED && D.页){
   '<p style="margin:24px;font:15px ui-sans-serif,system-ui">' + String(e.message || e) + '</p>'); });
 ```
 
-- [ ] **Step 4: `select` 更新回闸口链接**
+- [x] **Step 4: `select` 更新回闸口链接**
 
 `function select(ob, doFocus=true){` 后第一行 `S.sel = ob; ...` 之后加:
 
@@ -623,7 +623,7 @@ if (SERVED && D.页){
     $('gatelink').href = '/?' + q.toString(); $('gatelink-wrap').hidden = false; }
 ```
 
-- [ ] **Step 5: 初选按 `#sel=`**
+- [x] **Step 5: 初选按 `#sel=`**
 
 结尾 `select(objs.filter(visible).sort((a,b)=>sortKey(b.o)-sortKey(a.o))[0] || objs[0]);` 换成:
 
@@ -635,7 +635,7 @@ select(objs.find(ob => key(ob.o) === want) || objs.filter(visible).sort((a,b)=>s
 
 `key` 在 380 行定义(`const`),在 `select` 和这里用之前已经定义 —— 不用挪。
 
-- [ ] **Step 6: 单文件模式没坏**
+- [x] **Step 6: 单文件模式没坏**
 
 ```bash
 cd ~/sam3d && SP=/tmp/claude-1004/-home-jincheng/92d1614a-64e3-41aa-9d0b-8592d431f8f9/scratchpad
@@ -644,7 +644,7 @@ grep -c "SERVED" $SP/bfv2.html
 ```
 Expected: 计数 ≥ 3。浏览器开 `$SP/bfv2.html`(或发成 artifact):列表、点云、盒子照常;侧栏**没有**"Back to the gate"。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 cd ~/sam3d && git add tools/box_fit_view_template.html && git commit -m "box_fit_view 模板: 数据标签空就 fetch /3d/data, #sel 初选, 回闸口链接
@@ -664,7 +664,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: `scene_view.handle/state`(Task 4)、卡片 `data-key`(Task 2)、模板 `#sel=`(Task 5)。
 - Produces: `/api/state` 多字段 `场景查看 = {在, 生成于, 过时}`;`GET /3d*` 转 scene_view;首次 import 打印 `[3D] 挂载 scene_view.py`;页面 `?sel=词:实例` 打开那个词的弹层并滚到那张卡。
 
-- [ ] **Step 1: 写测试** `tools/tests/test_gate_3d.sh`
+- [x] **Step 1: 写测试** `tools/tests/test_gate_3d.sh`
 
 ```bash
 #!/bin/bash
@@ -691,12 +691,12 @@ mv $R1/10_box_fit_view.json.hidden $R1/10_box_fit_view.json
 echo ALL OK
 ```
 
-- [ ] **Step 2: 跑,确认失败**
+- [x] **Step 2: 跑,确认失败**
 
 Run: `bash ~/sam3d/tools/tests/test_gate_3d.sh`
 Expected: 第一条 `assert d['场景查看']` 处 `KeyError: '场景查看'`
 
-- [ ] **Step 3: 后端**
+- [x] **Step 3: 后端**
 
 常量区(`MYIMG = ...` 后)加:
 
@@ -733,7 +733,7 @@ def box_view_state(R1):
                         return
 ```
 
-- [ ] **Step 4: 顶栏**
+- [x] **Step 4: 顶栏**
 
 header 里 `<span class="gsw" id="rcw"></span>` 后面加:
 
@@ -761,7 +761,7 @@ CSS(`.gsw button.on` 那条附近)加:
   else { v.classList.add('off'); v.removeAttribute('href'); v.title = "No 3D data yet — it appears once gate 3 (boxes) has run"; }
 ```
 
-- [ ] **Step 5: 卡片 3D 链接 + `?sel=`**
+- [x] **Step 5: 卡片 3D 链接 + `?sel=`**
 
 实例卡 innerHTML 里 `'<b>#'+r.oid+'</b><em>'+r.中位面积pct+'%</em>'+` 改成:
 
@@ -799,19 +799,19 @@ function 跳到实例(k){
 }
 ```
 
-- [ ] **Step 6: 跑测试,通过**
+- [x] **Step 6: 跑测试,通过**
 
 Run: `bash ~/sam3d/tools/tests/test_gate_3d.sh`
 Expected: `state ok ... lazy ok: not imported yet / /3d ok / lazy ok: imported on first /3d / /3d/data ok N / /3d/state ok / greyed ok / /3d without data ok / gate still serves N rows / ALL OK`
 
-- [ ] **Step 7: 浏览器走一遍两边跳**
+- [x] **Step 7: 浏览器走一遍两边跳**
 
 ```bash
 cd ~/sam3d && ~/miniforge3/envs/sam3d/bin/python tools/gate_ui.py --scene office --run r6_pillarfix --indoor --port 8799
 ```
 `http://localhost:8799`:顶栏有 `3D ↗`;点开 `table` 的弹层,某张卡点 `3D ↗` → 新标签页 3D 视图选中的是 `Table #N`,镜头飞过去,侧栏有 "‹ Back to the gate";点它 → 回到闸口,`table` 的弹层自动开着,那张卡黄框闪。改 `/runs` 换到 r5_columns(没有 json 的话)→ 顶栏 3D 变灰。关服务。
 
-- [ ] **Step 8: 提交**
+- [x] **Step 8: 提交**
 
 ```bash
 cd ~/sam3d && git add tools/gate_ui.py tools/tests/test_gate_3d.sh && git commit -m "闸口: 挂 /3d(懒加载 scene_view), 顶栏和卡片的 3D 链接, ?sel= 跳回实例
@@ -831,13 +831,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: `scene_view.data_path/stale`(Task 4)、`box_fit_view.py --out off`(Task 3)。
 - Produces: `ensure_box_view(R1, dry=False) -> "新鲜"|"干跑"|"重算"|"失败"`。
 
-- [ ] **Step 1: 备份**
+- [x] **Step 1: 备份**
 
 ```bash
 cd ~/sam3d/.claude/skills/run-recon-pipeline && cp drive.py drive.py.bak_3dtab
 ```
 
-- [ ] **Step 2: 写测试** `tools/tests/test_drive_box_view.py`
+- [x] **Step 2: 写测试** `tools/tests/test_drive_box_view.py`
 
 ```python
 #!/usr/bin/env python
@@ -858,12 +858,12 @@ if __name__ == "__main__":
     test_missing_stale_fresh(); print("ok test_missing_stale_fresh")
 ```
 
-- [ ] **Step 3: 跑,确认失败**
+- [x] **Step 3: 跑,确认失败**
 
 Run: `cd ~/sam3d && ~/miniforge3/envs/sam3d/bin/python tools/tests/test_drive_box_view.py`
 Expected: `AttributeError: module 'drive' has no attribute 'ensure_box_view'`
 
-- [ ] **Step 4: 实现**
+- [x] **Step 4: 实现**
 
 `run_steps` 后面加:
 
@@ -897,17 +897,17 @@ def ensure_box_view(R1, dry=False):
         lines.append("3D: open the gate page (tools/gate_ui.py) and press 3D in the top bar")
 ```
 
-- [ ] **Step 5: 跑测试,通过**
+- [x] **Step 5: 跑测试,通过**
 
 Run: `cd ~/sam3d && ~/miniforge3/envs/sam3d/bin/python tools/tests/test_drive_box_view.py`
 Expected: `ok test_missing_stale_fresh`
 
-- [ ] **Step 6: 真的 drive 一下(只读)**
+- [x] **Step 6: 真的 drive 一下(只读)**
 
 Run: `cd ~/sam3d && ~/miniforge3/envs/sam3d/bin/python .claude/skills/run-recon-pipeline/drive.py --scene office --run r6_pillarfix --indoor --status`
 Expected: 照旧打印段表(这条不调 gate_report,只是确认 import 没坏)。再跑一次没有 `--go` 的 `drive.py --scene office --run r6_pillarfix --indoor`:如果它停在闸 ≥3,会看到 `[3D 页]` 那行(数据新鲜就是不打印、直接列 `3D: open the gate page`);如果它没停在闸口,跳过这步。**不要加 `--go`**。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 cd ~/sam3d && git add .claude/skills/run-recon-pipeline/drive.py tools/tests/test_drive_box_view.py && git commit -m "drive: 闸 3/4/5 自动出 3D 页数据(不在或过时才重算, 失败不挡闸)
@@ -923,7 +923,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Create: `tools/tests/run.sh`
 - Modify: `tools/README.md`(两张表)、`devLog/devlog_9.21.md`(加一节)
 
-- [ ] **Step 1: `tools/tests/run.sh`**
+- [x] **Step 1: `tools/tests/run.sh`**
 
 ```bash
 #!/bin/bash
@@ -936,7 +936,7 @@ echo "== tools/tests 全过 =="
 
 Run: `bash ~/sam3d/tools/tests/run.sh` → 以 `== tools/tests 全过 ==` 结束。
 
-- [ ] **Step 2: README**
+- [x] **Step 2: README**
 
 "流程自动调的"表加一行:
 
@@ -957,15 +957,15 @@ Run: `bash ~/sam3d/tools/tests/run.sh` → 以 `== tools/tests 全过 ==` 结束
 mask 内中位亮度 < 110 才动)。改一个的亮度就是改两个。测试在 `tests/`(`bash tests/run.sh`, 没有 pytest)。
 ```
 
-- [ ] **Step 3: 日志**
+- [x] **Step 3: 日志**
 
 `devLog/devlog_9.21.md` 末尾加一节 `## 11. 9.23 闸口看得清 + 3D 页搬进闸口`,写:问题(灰底抠图看不出在哪/是什么、3D 页手敲 + 7 MB artifact)、做法(定位图 + 提亮;json 出口 + `/3d` 懒加载;闸 3/4/5 自动出)、进流水线的开关(`drive.py ensure_box_view`;`box_fit_view.py --data/--out off`)、验收结果(测试全过;浏览器两边跳的结果)。
 
-- [ ] **Step 4: 对 spec 的"怎么验"逐条打勾**
+- [x] **Step 4: 对 spec 的"怎么验"逐条打勾**
 
 1. 看得清:Task 2 Step 3 ✔ 2. 懒加载:`test_gate_3d.sh` ✔ 3. 两边定位:Task 6 Step 7 ✔ 4. 坏了不连累:`test_gate_3d.sh` ✔ 5. 单文件还能出:`test_box_fit_view_data.sh` + Task 5 Step 6 ✔ 6. 自动出:`test_drive_box_view.py` + Task 7 Step 6 ✔
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd ~/sam3d && git add tools/tests/run.sh tools/README.md devLog/devlog_9.21.md && git commit -m "文档: 闸口定位图 / 3D tab / 测试入口

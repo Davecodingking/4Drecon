@@ -27,6 +27,7 @@ import 算法模块的脚本会找不到路。引用方改代码指过来,一份
 | `topview.py` | pipeline 的 `merge` 步 | 俯视图:相机轨迹 + 楼 + 物体 |
 | `pcd_layers.py` | `indoor_pipeline.py:408`(`zup` 步) | 点云按高度分层的俯视图(桌面层 / 椅背层 / 墙层),看点云成不成团 |
 | `box_health.py` | `indoor_pipeline.py:454`(`boxfix` 步);`run_indoor_objects.sh`(已弃用) | 每个盒子的点密度和长轴铺满度,判真/存疑/空。**闸口要看的那张体检表** |
+| `box_fit_view.py --out off` | `drive.py` 闸 3 / 4 / 5(`ensure_box_view`,不在或过时才重算,失败不挡闸) | `10_box_fit_view.json` —— 闸口网页 3D tab 的数据 |
 
 ★ `render_meshes.py` 和 `topview.py` **在步骤表里注册着**(`meshes` / `merge` 两步),
 所以它们既是"可视化"也是"链上的一步"。放这里是因为它们只出图不影响下游产物 ——
@@ -37,7 +38,8 @@ import 算法模块的脚本会找不到路。引用方改代码指过来,一份
 | 脚本 | 看什么 |
 |---|---|
 | `watch_run.py`(`watch_run.sh` 包一层) | **跑的时候开在另一个终端/tmux**:段、每步耗时、当前第几个物体和生成阶段、显卡占用、停在哪道闸。只读盘上日志,随时开关,流水线不用停。`--scene X --run rN [--indoor]` |
-| `box_fit_view.py`(模板 `box_fit_view_template.html`) | **量盒子那步的 3D 查看页**:场景点云 + 每个实例的逐帧点 / 逐帧盒子(橙)/ 流水线的合并盒子(蓝),按 spread(8 帧质心最大水平距离)排序,静止物体 spread 大 = 深度漂或跟踪串号。读 `06_all_boxes_merged.json`,召回补回来的实例画虚线盒子(没有 mask 所以没点)。视窗里点盒子选物体,同一处再点轮换重叠的盒子。开关切"最终进 `07_scene_phy.glb` 的"、"物理之后"(绿框, 直接量最终 glb 里那块网格, 和量出来的盒子并排看, 列表里标物理把它挪了多远)和"全部盒子";没进场景的标原因(EXCLUDE / 人工否掉 / VLM 否决 / 尺寸门槛 / 没有 mesh,读组装落的 `07_scene_skipped.json`,老轮次从日志+闸口决策补)。有 SAM 3D Body 的轮次(`09_body4d_report.json` + `10_people.json`,或 `--body <body4d轮次>`)会把人画成逐视频帧的盒子+人体点,位置和进 4D glb 的那份一致;相机轨迹和视锥也画出来,和人共用一根时间轴。`--r1 <轮次目录>` 室内外都行,出 `<r1>/10_box_fit_view.html` |
+| `box_fit_view.py`(模板 `box_fit_view_template.html`) | **量盒子那步的 3D 查看页**:场景点云 + 每个实例的逐帧点 / 逐帧盒子(橙)/ 流水线的合并盒子(蓝),按 spread(8 帧质心最大水平距离)排序,静止物体 spread 大 = 深度漂或跟踪串号。读 `06_all_boxes_merged.json`,召回补回来的实例画虚线盒子(没有 mask 所以没点)。视窗里点盒子选物体,同一处再点轮换重叠的盒子。开关切"最终进 `07_scene_phy.glb` 的"、"物理之后"(绿框, 直接量最终 glb 里那块网格, 和量出来的盒子并排看, 列表里标物理把它挪了多远)和"全部盒子";没进场景的标原因(EXCLUDE / 人工否掉 / VLM 否决 / 尺寸门槛 / 没有 mesh,读组装落的 `07_scene_skipped.json`,老轮次从日志+闸口决策补)。有 SAM 3D Body 的轮次(`09_body4d_report.json` + `10_people.json`,或 `--body <body4d轮次>`)会把人画成逐视频帧的盒子+人体点,位置和进 4D glb 的那份一致;相机轨迹和视锥也画出来,和人共用一根时间轴。`--r1 <轮次目录>` 室内外都行。★ 09-23 起出口是两份:`10_box_fit_view.json`(闸口网页顶栏 `3D` 直接看,不用再手敲、不用发 artifact)+ `10_box_fit_view.html`(单文件,要发给人才用);`--out off` 只出 json,`--data off` 只出 html |
+| `scene_view.py` | 闸口网页 3D tab 的服务端(`/3d` 模板壳、`/3d/data` gzip 的 json、`/3d/state`)。只标准库,`gate_ui.py` 碰到 `/3d` 才 import(懒加载)。**不是**独立命令 |
 | `steptime.py` | 事后从各步日志的分隔线估每步耗时(`timing.tsv` 出现之前的老轮次用它) |
 | `viz_word_candidates.py` | 某个词的全部候选 + 最终选中,轮廓画在原帧上、局部放大。**判断"抠的是不是这个东西"用这个** |
 | `viz_recall_candidates.py` | 召回实例的抠图,绿框=被派去生成 mesh 的代表 |
@@ -67,3 +69,7 @@ sys.path.insert(0, os.path.join(
 **画到图上的文字一律 ASCII。** cv2 的默认字体画不出中文,会变成一排问号而且不报错。
 `review_gate.py` 的 `_SRC`、`reuse_table.py` 的 `_TY` 两张映射表负责中文→英文,
 加新标签必须同步加进去 —— 这个坑踩过三次。
+
+**闸口网页(`gate_ui.py`)里的图:** 特写(`cutout_rgb`)和整帧定位图(`locate_rgb`,路由 `/img/frame`)共用一个提亮
+gamma(`_gamma`:mask 内亮度中位数 < 110 才动)。改一个的亮度就是改两个。3D tab 的代码在 `scene_view.py`,
+不往 `gate_ui.py` 里加。测试在 `tests/`(`bash tests/run.sh`,没有 pytest,都是带 assert 的脚本;后两个要 office r6 在盘上)。
