@@ -157,7 +157,7 @@ class Ctx:
         return f"{self.R1}/04_mesh_occ{1 if self.cfg['OCC'] == '1' else 0}"
 
 
-GPUENV = dict(CUDA_HOME="/usr/local/cuda-12.8", TORCH_CUDA_ARCH_LIST="12.0",
+GPUENV = dict(CUDA_HOME="/usr/local/cuda-12.8", TORCH_CUDA_ARCH_LIST="8.6",
               PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
 
 

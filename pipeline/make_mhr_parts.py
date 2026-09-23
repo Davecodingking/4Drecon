@@ -1,0 +1,90 @@
+#!/usr/bin/env python
+"""从 MHR 模型文件里取身体分区, 给 body_into_scene.py 摆"坐着的人"用。一次性, body4d 环境:
+
+  ~/miniforge3/envs/body4d/bin/python ~/sam3d/pipeline/make_mhr_parts.py
+
+产出 pipeline/mhr_parts.npz (body_into_scene.py 只用 numpy 读, sam3d 环境不用装 torch):
+  lower_w      每个顶点在"骨盆 + 两条腿"上的蒙皮权重之和, 0~1。腰部是软过渡, 拼上下身时直接当权重
+  pelvis_idx   主权重在骨盆上的顶点。每帧拿它们做刚体对齐, 求骨盆的位置和朝向
+  rest_pelvis  这些顶点的静止姿势坐标 (米, y 朝上, 人面朝 +z)
+  seat_idx     坐下时贴椅面的顶点: 骨盆 + 大腿靠近胯的那一半
+  low_idx      lower_w > 0.5 的顶点 (下半身本体, 量"最低点"和比较腿的姿势用)
+  hand_w       每个顶点在两只手(手腕往下)上的权重之和。物理拿人身体当空气墙时手不算 ——
+               手搭在桌面、键盘上是正常接触, 不是穿模
+  joints       [骨盆, 左腿根, 右腿根, 上身根] 的关节号; src / sha256 记模型文件来源
+
+★ 关节号是从骨架结构认出来的, 不靠记名字: 世界根下面唯一的孩子是骨盆; 骨盆的三个孩子里
+  顶点最低的两棵子树是腿, 最高的那棵是上身。腿根下面顶点最多的孩子是膝盖(往下是小腿和脚),
+  其余几个是大腿上的扭转关节, 按高低取靠胯的两个。手 = 上身子树里, 离身体中线最远的、
+  关节数在 20 个以上的最小子树(手腕 + 五根手指, 左右各一)。结构对不上就直接报错, 不会静默出错。
+"""
+import hashlib, os
+import numpy as np
+import torch
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.expanduser("~/sam3d/sam-body4d/checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt")
+OUT = f"{HERE}/mhr_parts.npz"
+
+m = torch.jit.load(SRC, map_location="cpu")
+buf = {k: v.detach().cpu().numpy() for k, v in m.named_buffers()}
+g = lambda k: buf["character_torch." + k]
+rest = g("mesh.rest_vertices").astype(np.float64) / 100.0          # 厘米 -> 米
+par = g("skeleton.joint_parents").astype(int)
+NV, NJ = len(rest), len(par)
+W = np.zeros((NV, NJ), np.float64)
+np.add.at(W, (g("linear_blend_skinning.vert_indices_flattened"),
+              g("linear_blend_skinning.skin_indices_flattened")),
+          g("linear_blend_skinning.skin_weights_flattened"))
+dom = W.argmax(1)
+kids = {j: [k for k in range(NJ) if par[k] == j] for j in range(NJ)}
+
+
+def sub(j):
+    out = [j]
+    for k in kids[j]:
+        out += sub(k)
+    return out
+
+
+def verts_of(js):
+    return np.isin(dom, js)
+
+
+roots = [j for j in range(NJ) if par[j] < 0]
+assert len(roots) == 1 and len(kids[roots[0]]) == 1, f"世界根下面应该只有骨盆: {roots}"
+PELVIS = kids[roots[0]][0]
+ch = sorted(kids[PELVIS], key=lambda k: rest[verts_of(sub(k)), 1].mean())
+assert len(ch) == 3, f"骨盆应该有 3 个孩子(两条腿 + 上身), 实际 {len(ch)}"
+LEGS, UPPER = ch[:2], ch[2]
+thigh = []
+for hip in LEGS:
+    knee = max(kids[hip], key=lambda k: verts_of(sub(k)).sum())
+    twist = [k for k in kids[hip] if k != knee and verts_of([k]).any()]
+    twist.sort(key=lambda k: -rest[verts_of([k]), 1].mean())        # 从胯往膝盖排
+    assert len(twist) >= 2, f"腿根 {hip} 下面找不到大腿的扭转关节"
+    thigh += twist[:2]
+
+hands = []
+for side in (-1, 1):                                                 # 左右各找一只手
+    c = [k for k in sub(UPPER) if len(sub(k)) >= 20 and verts_of(sub(k)).any()
+         and side * rest[verts_of(sub(k)), 0].mean() > 0.3]
+    assert c, "上身子树里找不到手"
+    hands.append(min(c, key=lambda k: len(sub(k))))
+hand_w = W[:, sub(hands[0]) + sub(hands[1])].sum(1)
+lower_w = W[:, [PELVIS] + sub(LEGS[0]) + sub(LEGS[1])].sum(1)
+pelvis_idx = np.where(dom == PELVIS)[0]
+seat_idx = np.where(verts_of([PELVIS] + thigh))[0]
+low_idx = np.where(lower_w > 0.5)[0]
+sha = hashlib.sha256(open(SRC, "rb").read()).hexdigest()
+np.savez(OUT, lower_w=lower_w.astype(np.float32), pelvis_idx=pelvis_idx.astype(np.int32),
+         rest_pelvis=rest[pelvis_idx].astype(np.float32), seat_idx=seat_idx.astype(np.int32),
+         low_idx=low_idx.astype(np.int32), joints=np.array([PELVIS] + LEGS + [UPPER], np.int32),
+         hand_w=hand_w.astype(np.float32), hand_joints=np.array(hands, np.int32),
+         src=SRC, sha256=sha)
+band = int(((lower_w > 0.05) & (lower_w < 0.95)).sum())
+print(f"[done] {OUT}")
+print(f"  顶点 {NV}, 关节 {NJ}; 骨盆 j{PELVIS}, 腿 j{LEGS[0]}/j{LEGS[1]}, 上身 j{UPPER}, 贴椅面的大腿关节 {thigh}")
+print(f"  骨盆顶点 {len(pelvis_idx)}, 贴椅面顶点 {len(seat_idx)}, 下半身顶点 {len(low_idx)}, 腰部过渡顶点 {band}")
+print(f"  手 j{hands[0]}/j{hands[1]}: {int((hand_w > 0.5).sum())} 个顶点")
+print(f"  sha256 {sha[:16]}…")

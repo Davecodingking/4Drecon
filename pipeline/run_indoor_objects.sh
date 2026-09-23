@@ -19,7 +19,7 @@ L=$R1/logs; mkdir -p "$L"
 P3=~/miniforge3/envs/sam3;      P3D=~/miniforge3/envs/sam3d
 PT2=~/miniforge3/envs/trellis2; PLM=~/miniforge3/envs/spatiallm
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_HOME=/usr/local/cuda-12.8
-export TORCH_CUDA_ARCH_LIST=12.0
+export TORCH_CUDA_ARCH_LIST=8.6
 
 # ---- 阈值 (室内, 依据见 plan; 街景那套在密集摆放下会把一桌四椅并成一个) ----
 export MIN_POINTS=120 CONF_MIN=1.2 VOX=0.06 DUP_TH=0.70 PART_TH=0.70 SAMPLE_FRAMES=8

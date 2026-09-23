@@ -1,0 +1,1440 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""室内整屋三维重建 —— 全流程调度脚本。两条链, 用 --chain 切。
+
+这个文件不实现算法, 只做三件散在别处、丢了就没人记得的事:
+  1. 步骤的先后顺序 (依赖关系不是直觉上的顺序)
+  2. 每一步该用哪个 conda 环境 (跨了六个环境, 用错就 import 失败)
+  3. 每一步的参数取值, 以及这些取值是怎么来的 (注释里写清楚)
+
+================================================================== 两条链
+  --chain obj   物体链 (默认)。Qwen 列词 -> SAM3 跟踪 -> 反投影量盒子 -> SAM3D 生成
+                -> 摆回去; WildDet3D 并行检测捡回 SAM3 漏掉的。墙只在最后贴一层灰壳。
+  --chain lm    SpatialLM 链。点云 -> LLM 直接出布局 -> 按盒子抠图生成 -> 归位。
+
+两条链的根本区别在"在哪儿找物体":
+  SpatialLM 在**无标注的 3D 点云**里找 —— 那一层是糊的, 而且它的词表是 59 类住宅家具,
+            钢琴/吧台/发光栏杆结构上表达不了。cyberpunk 上 all 模式出了 54 面碎墙 +
+            20 curtain + 12 plants, 零家具。封闭住宅房间才用它。
+  物体链    在**2D 画面**里找 —— 那一层是清晰的, 只用深度把找到的东西抬起来, 而且每个
+            实例只取面积最大的 8 帧 (近处深度最准)。开放式/非住宅场景用它。
+
+产物不通用, 别混着跑。两条链共用 frames/bright/da3/zup 四步的产物, 之后各走各的。
+
+★ 物体链和 data/outdoor 是**同一套脚本** (SCRIPTS 指向 data/outdoor/scripts), 不是抄一份。
+  这样一边改了另一边不会悄悄漂移。漂移过一次, 代价很大 —— 见 o_assemble 的注释:
+  室内曾把组装换成 hybrid_place_5090.py (逐轴拉伸填满盒子), 而 outdoor 是 assemble_scene.py
+  (按高度算标量、等比缩放)。物体链的盒子长宽不可信, 逐轴拉伸把吧凳压成了 0.94x0.31 的板子。
+  只有 bright / zup / walls / vlm 四步是室内独有, 其余一律调 outdoor 的文件。
+
+================================================================== 用法
+  python3 indoor_pipeline.py --chain obj --list                    # 看步骤
+  python3 indoor_pipeline.py --chain obj --scene cyberpunk --run o2 --check
+  python3 indoor_pipeline.py --chain obj --scene cyberpunk --run o2 -n      # 干跑
+  python3 indoor_pipeline.py --chain obj --scene cyberpunk --run o2         # 跑全链
+  python3 indoor_pipeline.py --chain obj --run o2 --from assemble --to render
+  python3 indoor_pipeline.py --chain lm  --run w1 --only walls
+
+------------------------------------------------------------------ 依赖顺序
+抽帧 -> 提亮 -> DA3深度/位姿 -> 转z朝上 -> SpatialLM布局 -> 盒子修复
+     -> 配图 -> 生成计划 -> 抠图 -> 生成 -> 地板 -> 归位组装 -> 渲染回图
+
+反直觉的三处:
+  * 提亮 要在 DA3 之前, 而且 DA3/SpatialLM/抠图/生成 全都吃提亮帧。原素材 55~82% 的
+    像素低于 25/255, DA3 在纯黑区出不了可信深度。提亮只做 gamma 0.45, 不做 CLAHE
+    (CLAHE 在这种带体积雾的素材上会造出噪点和光晕)。
+  * 地板(floor) 要在 归位组装(place) 之前。place 的 --floor-glb 直接并入地板, 没有
+    地板就得再组装一次。
+  * 盒子修复(boxfix) 不能省。下游每一个消费者 (hybrid_match / hybrid_place /
+    floor_texture / wall_texture) 读的都是"修复后"的布局, 不是 SpatialLM 原始输出。
+    这一步原先藏在 SpatialGen/prepare_spatiallm_scene_5090.py 里面, 去掉 SpatialGen
+    就一起丢了, 所以 pipeline/layout_boxfix.py 把它单拎出来复用。
+
+------------------------------------------------------------------ 这台机器上的坑
+  * 没装系统 ffmpeg (which ffmpeg 为空), 抽帧走 cv2, 不要照抄 outdoor 的 ffmpeg 命令。
+  * pick_mask_5090.py 的 --out 是名字不是路径, 硬编码写进
+    ~/sam3d/sam-3d-objects/my_images/<名字>/; run.py 也只能写进自己 cwd 下的
+    outputs/<名字>/。物体段两条腿都锁死在 sam-3d-objects 树里, 产物不在 R1 底下。
+  * da3_to_spatiallm.py 的 --out 必须 .ply 结尾 —— 变换记录 json 是靠
+    .replace(".ply", ".json") 派生的, 后缀不对会把 ply 覆盖掉。
+  * topview_da3.py 会额外吐一个 <out>_side.png, 同样是字符串替换派生的。
+  * SpatialLM inference.py 是 do_sample=True, 默认 --seed -1 不可复现。这里固定
+    --seed 0, 否则每次重跑布局都变, 下游全部作废。
+  * wall_texture_5090.py 收 --zup 但不收 --zup-ply; floor_texture/hybrid_match 两个都收。
+    别用统一 kwargs 字典。
+  * hybrid_match_5090.py 生成 00_配对一览.png 时对空 tiles 调 max() 会崩 —— 所有盒子
+    都 excluded/no_points 时触发。布局太差就是这个症状。
+  * 墙壳那条线 (wall_gen/ + wall_pipeline/) 里的 D/FRAMES 还硬编码着已经删掉的
+    data/test_noblur*, 是模块级常量没有 flag。这条 pipeline 暂时不接墙。
+
+"""
+import os, sys, json, glob, csv, argparse, subprocess, shlex, time
+
+# ★ 驱动层的公共件搬到 _common.py 了(见那个文件的文件头): GPU 锁、跑命令、配置解析、
+#   计时、帧号映射。留在本文件里的是室内真正独有的部分。
+#   sh 用偏函数固定住 GPUENV —— 室内所有命令都要带 CUDA_HOME 那一套, 室外不带。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import functools as _ft
+from _common import (LOCK, GpuLock, wait_gpu, envcmd, stamp_path,
+                     timing as _timing, resolve_cfg as _resolve_cfg,
+                     write_frame_map, load_frame_map)
+from _common import sh as _sh
+import _common as _cm          # 设 CUR_STEP 用 —— 必须改模块上的属性, from-import 进来的是副本
+
+HOME   = os.path.expanduser("~")
+SAM3D  = f"{HOME}/sam3d"
+PIPE   = f"{SAM3D}/pipeline"
+TOOLS  = f"{SAM3D}/tools"      # ★ pcd_layers.py / box_health.py 在这里, 不在 pipeline/
+                               #   写成 {PIPE}/ 时两条室内链跑到 zup / boxfix 必崩
+GEN    = f"{SAM3D}/sam-3d-objects"          # SAM 3D Objects 仓库
+DA3REPO= f"{SAM3D}/Depth-Anything-3"
+LMREPO = f"{SAM3D}/SpatialLM"
+
+# 每个 conda 环境的 python。装了什么 (2026-09-07 实测, 逐个 find_spec 查过):
+#   sam3      cv2 scipy PIL                                只跑 SAM3 抠图
+#   sam3d     trimesh cv2 pyrender scipy PIL               无 shapely / LaMa
+#   spatiallm trimesh cv2 scipy shapely PIL + DA3 + SpatialLM
+#   spatialgen 上面全部 + simple_lama_inpainting (LaMa)     地板补洞只能在这跑
+PY = {
+    "sam3":       f"{HOME}/miniforge3/envs/sam3/bin/python",
+    "sam3d":      f"{HOME}/miniforge3/envs/sam3d/bin/python",
+    "spatiallm":  f"{HOME}/miniforge3/envs/spatiallm/bin/python",
+    # 注意: 这里用 spatialgen 环境纯粹是因为 LaMa 只装在它里面, 不是要跑 SpatialGen 模型。
+    # 这条链没有 SpatialGen。
+    "spatialgen": f"{HOME}/miniforge3/envs/spatialgen/bin/python",
+    # ★ 2026-09-10: trellis2 环境被清理掉了。它在这条链上的唯一身份是"装了
+    #   transformers 4.57.1 的那个环境"(名字是历史遗留), 现在那套装进了 sam3d。
+    #   键保留、指向改掉, 免得步骤表和各处 envcmd 全要动。见 outdoor_pipeline.py 的长注释。
+    "trellis2":   f"{HOME}/miniforge3/envs/sam3d/bin/python",       # Qwen3-VL (原 trellis2)
+    # WildDet3D 走 vis4d, 钉 pydantic<2 + numpy<2, 塞进上面任何一个都会打架, 必须独立
+    "wilddet":    f"{HOME}/miniforge3/envs/wilddet/bin/python",
+    # VGGT-Ω 几何后端(GEOM != da3 时用), 环境和权重在 nvme; 它内部再调 metricdepth 环境跑 Metric3D
+    "vggt_omega": "/mnt/nvme/jincheng/envs/vggt_omega/bin/python",
+}
+
+# 物体链和 outdoor 共用同一套算法脚本。★ 这是"对齐"的实质: 不是把 outdoor 的逻辑
+# 抄一份到室内, 而是直接调同一个文件, 这样一边改了另一边不会悄悄漂移。
+# 曾经漂移过一次, 代价很大: 室内的组装换成了 hybrid_place_5090.py, 它是"逐轴拉伸填满
+# 盒子"(给 SpatialLM 那条链写的, 那里的长宽高可信), 而 outdoor 的 assemble_scene.py 是
+# "按高度算一个标量、等比缩放"。物体链的盒子是点云反投影量的, 长宽不可信 —— 喂给逐轴
+# 拉伸就把吧凳压成了 0.94x0.31 的板子, 而等比缩放根本不看长宽, 天然免疫。
+SCRIPTS = f"{SAM3D}/data/outdoor/scripts"
+WD3REPO = f"{SAM3D}/WildDet3D"
+
+# ------------------------------------------------------------------ 参数
+# 这些值都是调出来的或有先例的, 改之前先看注释里写的"为什么是这个数"。
+CFG = dict(
+    GAMMA       = "0.45",   # 提亮指数。素材帧均值只有 21~37/255, 0.45 之后桌椅/栏杆/
+                            # 盆栽/吧台都能辨认。别加 CLAHE, 会在体积雾上造噪点和光晕
+    MAX_FRAMES  = "40",     # DA3 用多少帧。ueindoor 上实测 134 帧反而漂移大, 40 帧合适
+    GEOM        = "vggt_da3", # 位姿+深度后端, 两条链(LM 链 s_da3 / 物体链 o_da3)一起切。产物格式一样, 下游不用改:
+                            #   vggt_da3 默认(09-17 起): 位姿+深度用 VGGT-Ω, DA3 只当"掩码 + 尺子"
+                            #            (置信度沿用 DA3 的 -> 黑区被剔; 米制尺度取自 DA3 深度)。
+                            #            DA3 跑完再跑一次 VGGT-Ω(80 帧约 +20 秒), DA3 原件备份在 _da3_orig/
+                            #   da3      纯 Depth Anything 3 Nested(09-17 之前的默认)
+                            #   vggt_l   VGGT-Ω + Metric3D v2 Large 定米制尺度(ithor312 尺度误差 0.6%)
+                            #   vggt_g2  VGGT-Ω + Metric3D v2 Giant2(2.2%), 和 vggt_l 互为对照
+                            # 为什么试 VGGT-Ω: ithor312 上 DA3 白墙帧位姿错 10–36°, VGGT-Ω 最差 3.1°
+                            # (devlog_9.16 第 9、10 节)。SpatialLM 要米制输入, 所以尺度这一步不能省。
+                            # ★ 为什么室内不用纯 VGGT-Ω(vggt_l): cyberpunk 实测位姿和 DA3 一致(朝向差 0.7°), 但黑区
+                            #   给出几十~几百米假深度且置信度不低, 门槛挡不住, 点云被撑到 170x90x220 m(DA3 12x6x15 m);
+                            #   DA3 会把这些区域置信度压到 1.0 剔掉。所以借 DA3 的置信度当掩码(>30 m 假深度盖掉 99.2%)。
+                            # ★ ithor312 对真值(点到真实表面距离, 中位/90 分位): 纯 DA3 6.1/20.3 cm 剔 15 帧;
+                            #   VGGT-Ω 位姿+DA3 深度 2.9/11.5 cm 剔 15 帧; vggt_da3(现做法) 1.9/4.6 cm 剔 1 帧。
+                            #   见 ithor312/analysis_9.17_vggt_omega/hybrid_vs_gt.py
+                            #   两把尺子(l / g2)在 cyberpunk 上也差 16%, 多半是被黑区带偏。
+                            # ★ 置信度换算成了 DA3 刻度(vggt-omega/tools/build_conf_ref.py), CONF_MIN/OBJ_CONF
+                            #   可照用但没按 VGGT-Ω 重调。室内不做天空分割(白天花板可能被当成天空)。
+    CONF_MIN    = "1.5",    # DA3 点云过滤用固定门槛, 不用百分比 —— 无纹理白墙置信度约
+                            # 2.0 比窗外还低, 按百分比丢会先把墙丢掉
+    MAX_POINTS  = "6000000",# 点全留不抽稀, SpatialLM 吃得下
+    FX          = "",       # 空 = 不给内参让 DA3 自估 (这段视频没有 EXIF)。给了就是
+                            # 原图宽度下的像素焦距, UE 那种已知镜头才填 (7mm/23.76 -> 565.66)
+    LM_MODEL    = "manycore-research/SpatialLM1.1-Qwen-0.5B",
+    LM_SEED     = "0",      # 必须固定, 见文件头
+    LM_DETECT   = "all",    # all=墙门窗+物体, arch=只墙门窗, object=只物体。
+                            # ★ 开放式空间要用 object: cyberpunk 上 all 模式把输出预算全
+                            # 烧在墙上 (54 面, conf 调高后 118 面), 一个家具都没剩;
+                            # 换 object 同一份点云立刻出 17 个 (7 coffee_table/3 chair/
+                            # 1 sofa/1 plants/5 curtain)。封闭住宅房间才用 all
+    LM_CATEGORY = "",       # 空 = 59 类全开。填了就只找这些类 (空格分隔)。
+                            # ★ 非住宅场景一定要填。SpatialLM 的词表是住宅家具表
+                            # (bed/wardrobe/toilet/stove/...), 场景里没有的类会变成
+                            # "逃生舱": cyberpunk 上不锁词表时, 垂挂的管道装饰全被判成
+                            # curtain、棕榈判成 plants, 桌椅一个不出; 锁到实际存在的
+                            # 10 类之后 22 个盒子里出了 bar + 3 bar_chair (正好落在
+                            # 弧形吧台上) + dining_table/dining_chair, 而且 coffee_table
+                            # 那种"等距复读阶梯"的幻觉也消失了
+    MATCH_EXCL  = "carpet,curtain",   # 软薄类不走物体链 (Lumera 同样踢出词表)
+    MIN_SCORE   = "0.45",   # 配图合格线。低于此判 weak, 但 weak 仍可用 (r2 的地毯 0.247 就用了)
+    SOLO_CLS    = "bar,sofa,tv,plants,potted_bonsai,bookcase",
+                            # 逐实例生成的"主体": 吧台/沙发/大盆栽形态各异, 复用会很假。
+                            # 其余 (dining_table/dining_chair/chair/stool/bar_chair ...)
+                            # 每类只生成一个 mesh 复用给同类所有实例 —— 这个场景十几组
+                            # 餐桌椅高度重复, 复用能把生成次数从几十次压到个位数
+    FLOOR_STYLE = "uniform",# photo 模式(投影原样+LaMa)在 r2 被用户否掉了: 俯视五颜六色
+    RB_FRAMES   = "",       # 渲染回图用哪几帧, 空 = 自动均匀取 4 帧
+
+    # ---------------- 物体链 (--chain obj) ----------------
+    # 阈值和 outdoor 的差别都在这里, 每条都写了为什么。没列出来的一律沿用脚本默认值,
+    # 那就是 outdoor 的值 —— 默认相同, 只在有理由时才分叉。
+    OBJ_FRAMES  = "120",    # 物体链的 DA3 帧数。该对齐的是"基线间距"不是帧数:
+                            # 这段是 12 米长的推轨, 120 帧 ≈ 10cm/帧, 和 timesquare
+                            # 的 11cm 相当 (那边 185 个实例); 40 帧是 31cm, 太稀
+    MIN_POINTS  = "120",    # outdoor 300。室内物体在画面里小得多
+    OBJ_CONF    = "1.2",    # outdoor 2.0。暗 + 体积雾, 属 beach 那一档 (beach 降到 1.0)
+    VOX         = "0.06",   # outdoor 0.15。街上车距 2m, 酒吧椅子紧挨着桌子
+    # 二维跨词去重(dedup 那步)。全部沿用 outdoor 的默认值 —— 下面 DUP_TH 之所以
+    # 从 0.55 提到 0.70, 是因为三维反投影后椅子和桌子的点云会糊在一起; 二维没有
+    # 这个病 (像素上它们是两块不重叠的区域), 所以不跟着分叉。
+    DW_DUP_TH   = "0.55",
+    DW_PART_TH  = "0.70",
+    DW_PART_RATIO="0.55",
+    DW_FRAME_FRAC="0.50",
+    DW_WORD_FRAC= "0.60",
+    DUP_TH      = "0.70",   # outdoor 0.55。0.55 在密集摆放下会把一桌四椅并成一个
+    PART_TH     = "0.70",
+    SAMPLE_FRAMES = "8",
+    MIN_AREA_PCT= "0.05",
+    MIN_FRAMES  = "2",
+    BAKE_WORKERS = "2",     # 生成 mesh 时另开几个进程烘焙贴图(run.py --bake-workers); 0 = 不拆。
+                            # 32G 卡实测(8 个物体): 0 -> 257s, 2 -> 165s, 3 -> 180s 且有一个显存不够要重烘
+    TOPK        = "8",
+    # ★ 命名注意: 这里的 SOLO = "逐实例生成", 每个物体各做一个自己的 mesh。
+    # 和图形学里的 "instancing"(一个 mesh 摆很多份) 正好相反 —— 不在这个名单里的词
+    # 才是 instancing。踩过一次沟通事故, 写清楚。
+    # 名单里的是形态各异、复用会很假的: 钢琴/吧台/沙发 各一个;
+    # potted palm 逐实例 (实测 _1 是阔叶植物, 和 _0 的棕榈不是一个种, 共用会变成棕榈)。
+    # shelf 不在名单里 = 一个 mesh 复用 (用户拍板)。
+    # ★ 2026-09-20 默认从"点名制"改成 "*"(除白名单外全部逐实例) —— 和室外对齐, 室外一直是 "*"。
+    #   用户的判断是"基本所有类都不能合并": 复用省 GPU, 但一屋子工位共用一个 mesh 就全变成
+    #   同一张桌子; 形态差异在室内比室外更明显(椅子有转椅有折叠椅, 植物品种各不相同)。
+    #   代价是生成次数上去了 —— office r1 实测复用 17 + 逐实例 23 = 40 次, 全 "*" 约 98 次。
+    #   要让某几类共用, 把它们填进 SOLO_KEEP 白名单, 别改这里。
+    SOLO        = "*",
+    SOLO_KEEP   = "",
+    SOLO_MIN_PX = "256",
+    # 把水平朝向吸到墙给出的建筑网格上。默认关 —— 见 assemble_scene.py 里的长注释:
+    # 椅子被人转出来是真实的, 无差别吸附会把真信息抹掉。按词开, 逗号分隔, "*" = 全部。
+    YAW_SNAP    = "",
+    YAW_SNAP_MAX= "25",     # 偏超过这个角度就不吸 —— 那种要么是另一套朝向, 要么盒子彻底错了    # 逐实例生成的面积下限(像素), 和 outdoor 同一个值、同一个键名, 见 solo_gate.py。
+                            # ★ 以前键叫 TH="0.1"(%) —— 和 outdoor 的 SOLO_TH 名字对不上, 传错就静默用 0.5;
+                            #   0.1% 在 cyberpunk(1920x1080)是 2073 像素, 在 ithor312(512x512)是 262。
+    SCENE_DESC  = "photo of an indoor bar lounge",     # verify_picks 的提示词
+    # screen 是贴墙平面, 当独立物体摆必错。
+    # sofa/couch: 这个场景里根本没有沙发, 只有高背卡座和餐椅。WildDet3D 硬要找 sofa,
+    #   就把最像的东西报出来 —— 实测两个 sofa 实例抠的都是餐桌桌面 (1.91x0.76x0.88m
+    #   是桌子的尺寸), couch 抠的是桌面+后面的座位。留着只会往场景里塞假沙发。
+    #   ★ 这类"场景里压根没有这个东西"的判断模型做不了, 属于必须人工接入的一环。
+    EXCLUDE     = "screen,person,pedestrian,sofa,couch",
+    EXTRA_WORDS = "",       # 追加给 SAM3 跟踪的词, 词表之外的。逗号分隔。
+                            # 室内同样需要: SAM3 对措辞极敏感, 双词短语常返回 0
+                            # (armchair/booth seat/bar counter 全是 0), 换个说法
+                            # 补一个词就能救回来 —— 但这个通道以前只能手敲, 没进配置。
+    PER_INSTANCE= "potted palm,tree",                  # 真实世界里本来就有大有小, 不统一
+    SNAP_GROUND = "0",      # ★ assemble_scene 默认 1 = 强制所有物体贴地。室内关掉,
+                            # 落地交给 phys 那步 —— 那里会先找支撑面再退回地面
+    SNAP        = "0.15",   # 只在没给 HUNG_LABELS 时当"太远就不落"的兜底; 室内给了,
+                            # 所以这里只用来管"推开之后回吸多少"
+    # 落地不再靠距离猜"是不是挂的" —— 按词点名。这两个都是垂到接近地面的发光灯管/灯柱,
+    # 盒子跨了整个层高, 强行落地会把它整根按到地上。
+    HUNG_LABELS = "lamp,floor_lamp,pendant_lamp,screen,ventilation_duct,duct",   # 风管在天花板上, 落地会从 4m 高砸到桌子上
+    # 可以被当成台面的类: 东西落在它们顶面上, 而不是一律落到地板
+    SUPPORT_LABELS = "table,dining_table,side_table,bar_counter,counter,bar,"
+                     "booth_seat,shelf,planter,grand_piano",
+    SUPPORT_OVERLAP = "0.35",   # 水平重叠要占自身面积的比例, 低于这个不算被托住
+    ITERS       = "24",
+    MARGIN      = "0.02",
+    # --- 房间壳 (room_shell.py) ---
+    WALL_THICK  = "0.10",   # SpatialLM 给的 thickness 恒为 0, 零厚度的墙物理推不动
+    WALL_ALPHA  = "140",    # 墙的不透明度 0-255。半透明才看得见屋里的物体
+    SHELL_CLOSE = "25",     # 形态学闭运算核(格, 5cm/格)。越大越能填掉窗洞和被家具挡出的缺口
+    SHELL_SIMPLIFY = "0.25",# 轮廓折线简化容差(m)。太小会把点云噪声也变成墙角
+    DET_STRIDE  = "3",      # 召回检测每隔几帧。只有 80 帧, 抽稀了凑不够 MIN_VIEWS
+    DET_SCORE   = "0.35",
+    MIN_VIEWS   = "3",
+    DIST_F      = "0.35",   # outdoor 0.5。街上车距 2m, 酒吧椅子间距 0.6m
+    MATCH_F     = "0.7",    # 只在 MATCH_2D=0 时用
+    MATCH_2D    = "1",      # 和 SAM3 比对走二维框 IoU。见 o_recall 的注释
+    IOU_SELF    = "0.5",    # WD 实例之间去重: 框 vs 框
+    IOU_SAM     = "0.3",    # WD 的框 vs SAM3 mask 的外接框
+    SELF_3D_F   = "0.8",    # 两个 WD 实例没有共同帧时的三维退路半径
+    REC_MIN_PCT = "0.15",
+    REC_MIN_IOU = "0.5",
+    WALL_DETECT = "arch",   # 墙那条只让 SpatialLM 标墙门窗, 不标家具 (家具走物体链)
+    WALL_SOURCE = "pcd",    # 房间壳的墙从哪来。pcd = 点云轮廓(默认; 开放式空间 cyberpunk 只能这样);
+                            # spatiallm = SpatialLM arch 模式出墙、家具仍走物体链 —— 封闭住宅房间用。
+                            # 地板两种都按点云轮廓铺 (SpatialLM 的墙不保证闭合)
+)
+
+# 阈值是在 cyberpunk 这一个素材上调的。换素材多半要重调, 所以每个场景可以在这里覆盖,
+# 不用去改 CFG 也不用每次敲环境变量。
+SCENE_TAG = {"cyberpunk": "cyb", "ueindoor": "ue", "ithor312": "ith", "office": "off"}
+
+SCENES = {
+    # 开放式酒廊, 墙是玻璃幕墙 + 中庭, all 模式会被碎墙淹掉 -> 只要物体;
+    # 词表锁到这个酒吧真实存在的东西 (钢琴/演奏台/发光栏杆 SpatialLM 表达不了, 认了)
+    "cyberpunk": {"LM_DETECT": "object",
+                  "LM_CATEGORY": "chair dining_chair bar_chair stool dining_table "
+                                 "coffee_table side_table desk bar sofa"},
+    # FIRE3D 官方示例同一个房间 (iTHOR FloorPlan312 卧室, 60 帧 512x512 合成图), 用来和 FIRE3D 对比。
+    # 帧直接拷进 indoorOutput/ithor312/frames/ (s_frames 见到 0000.jpg 就跳过), 不转视频, 少一次压缩。
+    # ★ 对比不完全公平: FIRE3D 那边吃的是数据集给的真值深度+相机; 我们照常用 DA3 自己估。
+    "ithor312": {"GAMMA": "1.0",          # 合成图本来就亮, 0.45 是给暗的 cyberpunk 调的, 这里不提亮
+                 "SCENE_DESC": "photo of a bedroom",
+                 "SOLO": "*",             # 每个物体各生成一个 mesh —— FIRE3D 也是逐物体生成, 对齐才好比
+                 "EXCLUDE": "person,pedestrian"},
+    # 开放式办公区, 18 秒连续手持镜头绕着一个人走 (YouTube 切片, 见
+    # data/indoor/dataset/_candidates_small/README.md)。拿来压"人走动造成的遮挡"。
+    "office": {
+        # 帧均值 154.7/255, 只有 4.9% 的像素低于 25 —— cyberpunk 是 21~37 均值、
+        # 55~82% 低于 25 才需要 gamma 0.45。这里提亮只会把画面推到全白, DA3 反而没深度。
+        "GAMMA": "1.0",
+        "SCENE_DESC": "photo of an open plan office",
+        # SOLO 不再覆盖 —— 跟 CFG 的新默认值 "*"(全部逐实例)。
+        "PER_INSTANCE": "potted plant,plant",
+        # ★ 这次压测里人是**遮挡物**不是重建对象: 人在走, 盒子必然沿行进方向拖影
+        #   (见 boxes_from_masks 的 SAMPLE_FRAMES —— 8 帧的点直接堆在一起)。
+        #   要改成"把人也摆进场景", 把 person 从这里删掉。
+        # screen 不排除: cyberpunk 的 screen 是贴墙平面, 这里是桌上的独立显示器。
+        "EXCLUDE": "person,pedestrian",
+        # 东西落在桌面上而不是地板上。desk 本来就在默认名单里, 这里补办公家具。
+        "SUPPORT_LABELS": "desk,table,dining_table,side_table,counter,shelf,bookcase,"
+                          "cabinet,credenza,planter",
+        # ★ 这几类贴着建筑走, 盒子长轴又最不可靠(桌面只拍到一个薄片, 长轴基本是噪声)。
+        #   实测偏离房间网格中位 15°, 摆出来整片桌子朝向乱七八糟。
+        #   desk chair 故意不在里面: 人把椅子转出来是真的, 吸附会把真信息抹平。
+        "YAW_SNAP": "table,desk,computer monitor,shelf unit,window,glass door,door,file cabinet",
+    },
+}
+# 生效顺序: CFG 默认值 <- 场景覆盖 <- 环境变量 (环境变量最大, 方便临时试一个值)
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("review_decisions", f"{SCRIPTS}/review_decisions.py")
+review = _ilu.module_from_spec(_spec); _spec.loader.exec_module(review)
+
+def resolve_cfg(scene, R1=None):
+    """本文件的 CFG/SCENES/闸决策接到共用实现上。生效顺序和为什么是这个顺序, 见 _common.py。"""
+    return _resolve_cfg(CFG, SCENES, scene, R1, review)
+
+
+class Ctx:
+    def __init__(self, scene, run):
+        self.scene = scene; self.run = run
+        self.tag = f"{SCENE_TAG.get(scene, scene[:3])}_{run}"     # cyberpunk+r1 -> cyb_r1
+        # 素材目录。★ 2026-09-20 从 data/<场景>/ 挪到这里 —— 原来室内场景直接堆在 data/
+        # 顶层(data/cyberpunk, data/ueindoor, ...), 和 data/outdoor/dataset/<场景>/ 不对称,
+        # 结果新下的素材放进 data/indoor/dataset/ 之后管线读不到, 同一个视频要存两份。
+        self.SRC = f"{SAM3D}/data/indoor/dataset/{scene}"         # 输入视频所在目录, 只读
+        self.OUT = f"{SAM3D}/data/indoorOutput/{scene}"
+        self.FR  = f"{self.OUT}/frames"                           # 原始帧
+        self.FRB = f"{self.OUT}/frames_bright"                    # 提亮帧, 全链都吃这个
+        # ★ 物体链专用: 从提亮帧里等间隔抽出来、**重新编号成 0000..N-1** 的一套。
+        # 为什么必须单独建一个目录, 而不是直接用 frames_bright ——
+        # DA3 出的 cameras.json 的键是 0000.jpg..0079.jpg, 指的是"它读到的第几张",
+        # 不是原视频帧号。SAM3 跟踪、量盒子、渲染回图全都按这个编号找图。
+        # 拿 frames_bright 去配这个编号, 就会用一帧的 mask 去另一帧上取像素 ——
+        # 症状是"轮廓对、里面的画面错位"(frames_o1 的 0071 其实是原视频第 226 帧)。
+        self.FRO = f"{self.OUT}/frames_{run}"
+        self.R1  = f"{self.OUT}/{run}"
+        self.cfg = resolve_cfg(scene, self.R1)   # R1 先算: 人工闸的决策文件在它下面
+        self.LOG = f"{self.R1}/logs"
+
+    @property
+    def VID(self):
+        v = sorted(glob.glob(f"{self.SRC}/*.mp4") + glob.glob(f"{self.SRC}/*.mov"))
+        if not v: raise SystemExit(f"[失败] {self.SRC} 下没有视频")
+        return v[0]
+
+    @property
+    def VID_OPT(self):
+        """没有视频就返回 None, 不抛。★ VID 会抛是对的 —— 抽帧那步没视频就该硬失败;
+        但 ithor312 这种"帧是直接拷进来的、根本没有视频"的场景, 只是想记一下 fps 的
+        地方不能被它打断(踩过: frame_map 里直接用 c.VID, 把 ithor312 的 da3 步弄崩了)。"""
+        v = sorted(glob.glob(f"{self.SRC}/*.mp4") + glob.glob(f"{self.SRC}/*.mov"))
+        return v[0] if v else None
+
+
+# env_*.sh 里 export 的那几个变量。这里是直接调各环境的 python, 没有 source 那些脚本,
+# 所以必须自己补上 —— 少了 expandable_segments 那条, DA3 会因为显存碎片在
+# custom_interpolate 里 OOM (实测: 报"reserved but unallocated 2.32 GiB")。
+GPUENV = {
+    "CUDA_HOME": "/usr/local/cuda-12.8",
+    "TORCH_CUDA_ARCH_LIST": "12.0",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+}
+
+def sh(cmd, log=None, dry=False, cwd=None, sep=None):
+    """室内所有命令都要带 CUDA_HOME 那一套环境变量, 所以在这里固定住再转给共用实现。"""
+    return _sh(cmd, log=log, dry=dry, cwd=cwd, sep=sep, env=GPUENV)
+
+
+# ------------------------------------------------------------------ 各步骤
+def s_frames(c, dry):
+    """抽帧。文件名必须补零成 0000.jpg —— 这是 outdoor 那边踩过的最大的坑:
+    0.jpg/1.jpg/... 按字典序排是 0,1,10,100,...,2,20, DA3 拿到的就是乱序的视频,
+    相机位姿会塌成一个点, 而且不报错。
+    这台机器没有系统 ffmpeg, 用 cv2 抽 (imageio_ffmpeg 也有, 但 cv2 少一层依赖)。"""
+    if glob.glob(f"{c.FR}/0000.jpg") and not dry:
+        print("    帧已存在, 跳过"); return
+    code = f'''
+import os, cv2
+os.makedirs({c.FR!r}, exist_ok=True)
+cap = cv2.VideoCapture({c.VID!r}); i = 0
+while True:
+    ok, f = cap.read()
+    if not ok: break
+    cv2.imwrite(f"{{{c.FR!r}}}/{{i:04d}}.jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 95]); i += 1
+print("[done]", i, "帧")
+'''
+    sh([PY["sam3d"], "-c", code], f"{c.LOG}/01_frames.log", dry)
+
+def s_bright(c, dry):
+    """gamma 提亮。全链 (DA3/SpatialLM/抠图/生成) 都吃提亮帧, 不是只给几何用 ——
+    用户拍板要一套帧目录, 代价是 SAM3D 生成出来的物体贴图会整体偏亮一档。
+    只做 gamma, 不做 CLAHE: CLAHE 在这种带体积雾的暗素材上会造出噪点和光晕。"""
+    if glob.glob(f"{c.FRB}/0000.jpg") and not dry:
+        print("    提亮帧已存在, 跳过"); return
+    code = f'''
+import os, glob, cv2, numpy as np
+os.makedirs({c.FRB!r}, exist_ok=True)
+g = {c.cfg["GAMMA"]}
+lut = np.clip(((np.arange(256) / 255.0) ** g) * 255, 0, 255).astype(np.uint8)
+fs = sorted(glob.glob({c.FR!r} + "/*.jpg"))
+for p in fs:
+    cv2.imwrite(os.path.join({c.FRB!r}, os.path.basename(p)),
+                cv2.LUT(cv2.imread(p), lut), [cv2.IMWRITE_JPEG_QUALITY, 95])
+print("[done]", len(fs), "帧 gamma", g)
+'''
+    sh([PY["sam3d"], "-c", code], f"{c.LOG}/01_bright.log", dry)
+
+def _geom_vggt(c, dry, frames, out, max_frames, conf_min, extra):
+    """GEOM = vggt_l / vggt_g2 时两条链共用的 VGGT-Ω 调用(深度和位姿全用 VGGT-Ω), 参数和
+    da3_to_ply.py 那边一一对应。--no-sky: 室内没有天空, 外挂的天空分割只会误伤白天花板。
+    ★ 室内不推荐: cyberpunk 黑区出几百米假深度, 见 CFG 里 GEOM 的注释。"""
+    scale = {"vggt_l": "metric3d_l", "vggt_g2": "metric3d_g2"}[c.cfg["GEOM"]]
+    sh([PY["vggt_omega"], f"{SAM3D}/vggt-omega/tools/vggt_omega_geom.py", "--images", frames, "--out", out,
+        "--max-frames", max_frames, "--scale", scale, "--no-sky",
+        "--conf-min", conf_min, "--max-points", c.cfg["MAX_POINTS"], *extra],
+       f"{c.LOG}/02_da3.log", dry)
+
+def _geom_pose_swap(c, dry, frames, out, conf_min):
+    """GEOM = vggt_da3(室内默认): DA3 已经把 out 写好之后调用, 位姿/深度/内参换成 VGGT-Ω 的,
+    置信度和米制尺度沿用 DA3。帧列表读 out/cameras.json, 保证一帧对一帧。
+    DA3 原件(cameras.json + depth/)备份在 out/_da3_orig/。原理见 vggt_omega_geom.py 的 pose_into()。"""
+    sh([PY["vggt_omega"], f"{SAM3D}/vggt-omega/tools/vggt_omega_geom.py", "--images", frames, "--out", out,
+        "--pose-into", "--conf-min", conf_min, "--max-points", c.cfg["MAX_POINTS"]],
+       f"{c.LOG}/02_da3.log", dry)
+
+def _frame_map(c, dry, frames_dir, out):
+    """在 cameras.json 旁边写一份"帧 -> 原视频帧号 + fps"。两条链同一个路径、同一份格式,
+    下游一律查它, 谁也不准自己从键名解析。为什么需要它见 _common.py 里 FRAME_MAP 那段。
+    ★ frames_dir 必须是这一轮 da3 **真正吃的**那个目录, 两条链不是同一个:
+        SpatialLM 链吃 frames_bright/  —— 和原视频 1:1, 恒等
+        物体链    吃 frames_<run>/     —— 抽稀+重编号, 原号在它的 映射.json 里
+      光看目录里有没有 映射.json 去猜, 在 SpatialLM 链上会"碰巧蒙对", 靠的是巧合不是逻辑。"""
+    write_frame_map(out, frames_dir, c.VID_OPT, dry)
+
+
+def s_da3(c, dry):
+    """DA3 出米制深度 + 相机位姿。产物 02_DA3点云/ 里的 cameras.json 是后面所有步骤的
+    坐标系锚点 (images_used 的顺序 = 后面所有"帧号"的含义)。
+    --use-ray-pose 比默认位姿准 (实测 8.8cm/3° vs VGGT 14.9cm/4.7°), 稍慢。
+    不给 --intrinsics-json = 让 DA3 自估内参: 这段视频没有 EXIF。代价是整体米制尺度
+    可能偏 (ueindoor 上不给内参偏大 27%), 但物体之间的相对比例仍然对。
+    显存实测峰值 ~14GB (40 帧 / process-res 504)。"""
+    wait_gpu(16000, dry)
+    if c.cfg["GEOM"] in ("vggt_l", "vggt_g2"):
+        # VGGT-Ω 不收内参, FX 只交给 Metric3D 定尺度用(已知焦距比估的准)
+        _geom_vggt(c, dry, c.FRB, f"{c.R1}/02_DA3点云", c.cfg["MAX_FRAMES"], c.cfg["CONF_MIN"],
+                   ["--fx", c.cfg["FX"]] if c.cfg["FX"] else [])
+        sh([PY["spatiallm"], "topview_da3.py", "--pred", f"{c.R1}/02_DA3点云",
+            "--out", f"{c.R1}/02_DA3点云_俯视.png"], f"{c.LOG}/02_da3.log", dry, cwd=DA3REPO)
+        _frame_map(c, dry, c.FRB, f"{c.R1}/02_DA3点云"); return
+    cmd = [PY["spatiallm"], "da3_to_ply.py", "--images", c.FRB, "--out", f"{c.R1}/02_DA3点云",
+           "--max-frames", c.cfg["MAX_FRAMES"], "--use-ray-pose",
+           "--conf-min", c.cfg["CONF_MIN"], "--max-points", c.cfg["MAX_POINTS"]]
+    if c.cfg["FX"]:
+        k = f"{c.R1}/02_相机内参_fx{c.cfg['FX']}.json"
+        if not dry:
+            os.makedirs(c.R1, exist_ok=True)
+            import PIL.Image as I
+            W, H = I.open(sorted(glob.glob(f"{c.FRB}/*.jpg"))[0]).size
+            fx = float(c.cfg["FX"])
+            json.dump(dict(fx=fx, fy=fx, cx=W / 2, cy=H / 2), open(k, "w"))
+        cmd += ["--intrinsics-json", k]
+    sh(cmd, f"{c.LOG}/02_da3.log", dry, cwd=DA3REPO)
+    if c.cfg["GEOM"] == "vggt_da3":     # 俯视图要画换过位姿的点云, 所以排在它前面
+        _geom_pose_swap(c, dry, c.FRB, f"{c.R1}/02_DA3点云", c.cfg["CONF_MIN"])
+    sh([PY["spatiallm"], "topview_da3.py", "--pred", f"{c.R1}/02_DA3点云",
+        "--out", f"{c.R1}/02_DA3点云_俯视.png"], f"{c.LOG}/02_da3.log", dry, cwd=DA3REPO)
+    _frame_map(c, dry, c.FRB, f"{c.R1}/02_DA3点云")
+
+def s_zup(c, dry):
+    """转成 z 朝上、地板 z=0、墙对齐坐标轴。--out 必须 .ply 结尾: 变换记录 json 是靠
+    .replace(".ply",".json") 派生的。那个 json 就是后面每一步的 --zup 参数。
+    yaw 用默认的 walls 方法 (墙面方向直方图), bbox 方法只适合干净的矩形房间。
+
+    ★ 顺手出一张分层俯视图 03_点云_分层.jpg —— 这是整条链最关键的一张体检图, 看一眼就
+      知道"桌椅到底有没有重建出来"。整体俯视图会被地板和墙淹掉, 什么都看不出来; 按高度
+      切成桌面层/椅背层/墙柱层就一目了然。前两层是一块块紧凑的团 = 能往下跑; 是从相机
+      向外辐射的扇形拖尾 = 各帧深度没配准上, 家具已经糊了, 再往下 SpatialLM 只能认出
+      恰好还成团的东西 (盆栽/垂挂物)。cyberpunk r1 就是后者。"""
+    _zup_impl(c, dry, f"{c.R1}/02_DA3点云")
+
+def _zup_impl(c, dry, pred):
+    sh([PY["spatiallm"], "da3_to_spatiallm.py", "--pred", pred,
+        "--out", f"{c.R1}/03_点云_z朝上.ply"], f"{c.LOG}/03_zup.log", dry, cwd=DA3REPO)
+    sh([PY["spatiallm"], f"{TOOLS}/pcd_layers.py", "--ply", f"{c.R1}/03_点云_z朝上.ply",
+        "--zup", f"{c.R1}/03_点云_z朝上.json", "--out", f"{c.R1}/03_点云_分层.jpg"],
+       f"{c.LOG}/03_zup.log", dry)
+
+def o_zup(c, dry):
+    """物体链自己的 z 朝上。★ 必须读 02_da3, 不是 LM 链的 02_DA3点云 ——
+    两条链各跑各的 DA3: LM 链吃 40 张提亮帧写 02_DA3点云, 物体链吃 120 张重编号帧写 02_da3。
+    以前物体链的 zup 绑的是 LM 链那个函数, 干净目录直接 FileNotFoundError;
+    现有那份数据是靠手工软链接 02_da3 -> 02_DA3点云 才碰巧没炸 —— 而那等于房间壳和物体
+    落在两次不同的 DA3 重建里, 差一个未知的米制倍数。"""
+    _zup_impl(c, dry, f"{c.R1}/02_da3")
+
+def s_lm(c, dry):
+    """SpatialLM 点云 -> 布局 (Wall/Door/Window/Bbox)。约 20~35s。
+    --seed 固定, 见文件头。rrd 用 Rerun 0.36 看。显存 ~3GB。"""
+    wait_gpu(6000, dry)
+    ply = f"{c.R1}/03_点云_z朝上.ply"
+    sh([PY["spatiallm"], "inference.py", "--point_cloud", ply, "--output", f"{c.R1}/04_布局.txt",
+        "--model_path", c.cfg["LM_MODEL"], "--seed", c.cfg["LM_SEED"],
+        "--detect_type", c.cfg["LM_DETECT"]]
+       + (["--category"] + c.cfg["LM_CATEGORY"].split() if c.cfg["LM_CATEGORY"] else []),
+       f"{c.LOG}/04_lm.log", dry, cwd=LMREPO)
+    sh([PY["spatiallm"], "layout_topview.py", "--pcd", ply, "--layout", f"{c.R1}/04_布局.txt",
+        "--save", f"{c.R1}/04_布局_俯视.png", "--cams", f"{c.R1}/03_点云_z朝上.json"],
+       f"{c.LOG}/04_lm.log", dry, cwd=LMREPO)
+    sh([PY["spatiallm"], "visualize.py", "--point_cloud", ply, "--layout", f"{c.R1}/04_布局.txt",
+        "--save", f"{c.R1}/04_布局.rrd", "--max_points", c.cfg["MAX_POINTS"]],
+       f"{c.LOG}/04_lm.log", dry, cwd=LMREPO)
+    if not dry:
+        t = open(f"{c.R1}/04_布局.txt").read()
+        print(f"    墙 {t.count('=Wall')} 门 {t.count('=Door')} 窗 {t.count('=Window')} "
+              f"物体 {t.count('=Bbox')}")
+
+def s_boxfix(c, dry):
+    """盒子修复两步走, 顺序不能反:
+      1) 掰正 + 去穿模 (layout_boxfix.py, 复用 SpatialGen prepare 脚本里的 fix_boxes)
+      2) 穿墙 clip     (layout_clash_fix_5090.py, 只砍墙外那截, 拿不准就只报告不动手)
+    先掰正再 clip: clip 靠盒子和墙平行才敢下手 (夹角 >18° 就放弃), 歪着的盒子先掰正
+    才有机会被修。"""
+    a = f"{c.R1}/05_布局_掰正.txt"
+    sh([PY["spatiallm"], f"{PIPE}/layout_boxfix.py", "--layout", f"{c.R1}/04_布局.txt", "--out", a],
+       f"{c.LOG}/05_boxfix.log", dry)
+    sh([PY["spatiallm"], f"{SAM3D}/layout_clash_fix_5090.py", "--layout", a,
+        "--pcd", f"{c.R1}/03_点云_z朝上.ply", "--out", f"{c.R1}/05_布局_修复后.txt"],
+       f"{c.LOG}/05_boxfix.log", dry)
+    # 体检: 哪些盒子里真有东西。闸门就看这张表, 别拿"空/存疑"的盒子去生成 (r2 obj9 教训)
+    sh([PY["spatiallm"], f"{TOOLS}/box_health.py", "--layout", f"{c.R1}/05_布局_修复后.txt",
+        "--pcd", f"{c.R1}/03_点云_z朝上.ply", "--csv", f"{c.R1}/05_盒子体检.csv"],
+       f"{c.LOG}/05_boxfix.log", dry)
+
+def s_match(c, dry):
+    """逐个盒子在所有真实帧里评分挑"最不被挡的一张"(Lumera 的 least occluded view)。
+    评分 = 可见比例(盒内点投影后深度吻合) x 完整度(投影点在画面内) x 像素面积因子。
+    不给 --gen-pools: 这条链没有 SpatialGen, 没有生成视角当备胎, 挑不到就留空。
+    产物 配对表.csv 的 crop_rect 列是下一步抠图的框。"""
+    sh([PY["sam3d"], f"{SAM3D}/hybrid_match_5090.py",
+        "--layout", f"{c.R1}/05_布局_修复后.txt", "--da3", f"{c.R1}/02_DA3点云",
+        "--zup", f"{c.R1}/03_点云_z朝上.json", "--zup-ply", f"{c.R1}/03_点云_z朝上.ply",
+        "--frames", c.FRB, "--out", f"{c.R1}/06_配对",
+        "--exclude", c.cfg["MATCH_EXCL"], "--min-score", c.cfg["MIN_SCORE"]],
+       f"{c.LOG}/06_match.log", dry)
+
+def s_plan(c, dry):
+    """定"谁单独生成、谁复用同一个 mesh"。SOLO_CLS 里的类逐实例生成, 其余每类只挑
+    分最高的一个实例生成 (proto), 同类其余实例复用它。
+    这一步能成立是因为 hybrid_place_5090.py 的 --map 本来就是逐条 idx:名字 加载再按
+    各自盒子缩放 —— 同一个名字出现多次天然就是复用, place 脚本一行都不用改。"""
+    sh([PY["sam3d"], f"{PIPE}/indoor_gen_plan.py", "--csv", f"{c.R1}/06_配对/配对表.csv",
+        "--tag", c.tag, "--solo-cls", c.cfg["SOLO_CLS"], "--out", f"{c.R1}/07_生成计划.json",
+        "--jobs-dir", c.LOG], f"{c.LOG}/07_plan.log", dry)
+
+def s_mask(c, dry):
+    """SAM3 文字提示出全部候选, 按"与盒子投影框 IoU"选 —— 别信 SAM 自己的置信度排序,
+    r1 上实测它会把地毯选成餐桌。产物强制写进 sam-3d-objects/my_images/<名字>/。"""
+    wait_gpu(10000, dry)
+    jobs = f"{c.LOG}/mask_jobs.txt"
+    if dry and not os.path.exists(jobs):
+        print("    (还没有 mask_jobs.txt, 干跑跳过)"); return
+    rows = [l.split("\t") for l in open(jobs).read().splitlines() if l.strip()]
+    failed = []
+    for i, (name, frame, cls, box) in enumerate(rows, 1):
+        if os.path.exists(f"{GEN}/my_images/{name}/mask.png"):
+            print(f"    [{i}/{len(rows)}] {name} 已有, 跳过"); continue
+        print(f"    [{i}/{len(rows)}] {name}", flush=True)
+        # ★ 一个抠不出来不能让整条链停下。09-15 ithor312: SpatialLM 把懒人沙发标成 sofa,
+        #   SAM3 按 "sofa" 在那一帧找不到候选, 退出码 1 —— 后面 10 个物体一个都没做。
+        #   跳过它继续; 组装那步本来就会跳过没有 glb 的物体。名单落盘, 不静默丢。
+        try:
+            sh([PY["sam3"], f"{SAM3D}/sam3/pick_mask_5090.py", "--image", f"{c.FRB}/{frame}",
+                "--text", cls.replace("_", " "), "--box", box, "--out", name],
+               f"{c.LOG}/08_mask.log", dry)
+        except SystemExit as e:
+            failed.append(f"{name}\t{cls}\t{frame}")
+            print(f"       ↑ 抠不出来, 这个物体跳过, 继续下一个 ({e})", flush=True)
+    if failed and not dry:
+        open(f"{c.LOG}/mask_failed.txt", "w").write("\n".join(failed) + "\n")
+        print(f"    [提示] {len(failed)} 个物体没抠出来, 不生成、组装时缺席 —— 名单 logs/mask_failed.txt")
+
+def s_gen(c, dry):
+    """SAM 3D Objects 逐个生成。--hq = 烘焙 1024 贴图 + 网格后处理, 慢 1-2 分钟但清晰
+    得多。注意它是"补全"式生成: 只看到沙发正面也会生成一个完整的沙发。
+    只生成 role=solo/proto 的, reuse 的实例共用 proto 的 glb。"""
+    wait_gpu(16000, dry)
+    jobs = f"{c.LOG}/gen_jobs.txt"
+    if dry and not os.path.exists(jobs):
+        print("    (还没有 gen_jobs.txt, 干跑跳过)"); return
+    names = open(jobs).read().split()
+    todo = []
+    for i, n in enumerate(names, 1):
+        if os.path.exists(f"{GEN}/outputs/{n}/{n}.glb"):
+            print(f"    [{i}/{len(names)}] {n} 已有, 跳过"); continue
+        # 抠图那步失败的物体没有 mask。不筛掉的话 run.py --dirs 会因为缺文件让**整批**退出。
+        if not os.path.exists(f"{GEN}/my_images/{n}/mask.png"):
+            print(f"    [{i}/{len(names)}] {n} 没有抠图(抠图那步失败了), 跳过"); continue
+        print(f"    [{i}/{len(names)}] {n}", flush=True)
+        todo.append(f"{GEN}/my_images/{n}")
+    if not todo:
+        print("    没有要生成的, 跳过"); return
+    # ★ 一批一次交给 run.py: 一个物体一个进程等于每个都重装一遍模型(约 40 秒),
+    #   而生成一个才 30 秒。--dirs 模式模型只装一次, 输出按目录名命名。
+    print(f"    [批量] {len(todo)} 个一起生成, 模型只装一次", flush=True)
+    sh([PY["sam3d"], f"{GEN}/run.py", "--dirs", *todo, "--hq"],
+       f"{c.LOG}/09_gen.log", dry, cwd=GEN)
+
+def s_floor(c, dry):
+    """地板。uniform 模式 = 去光照 -> 主材质投票 -> 补丁自清洁 -> 随机翻转平铺 ->
+    LaMa 只缝 tile 缝。photo 模式(投影原样+LaMa 补大洞)在 r2 被否掉了: 多材质+光斑
+    导致俯视五颜六色。
+    足迹只用墙线奇偶性判屋内 —— "拍到哪"只决定贴图来源, layout 才决定地板有多大。
+    在 spatialgen 环境跑纯粹是因为 LaMa 只装在那儿。"""
+    sh([PY["spatialgen"], f"{SAM3D}/floor_texture_5090.py",
+        "--layout", f"{c.R1}/05_布局_修复后.txt", "--da3", f"{c.R1}/02_DA3点云",
+        "--zup", f"{c.R1}/03_点云_z朝上.json", "--zup-ply", f"{c.R1}/03_点云_z朝上.ply",
+        "--frames", c.FRB, "--out", f"{c.R1}/10_地板", "--style", c.cfg["FLOOR_STYLE"]],
+       f"{c.LOG}/10_floor.log", dry)
+
+def s_place(c, dry):
+    """按盒子归位 + 组装整屋。归位全程在盒子局部系里做: 转 k*90°(挑横截面长宽比最像
+    盒子的) -> 逐轴缩放到盒尺寸 -> 最后才套盒 yaw + 平移。
+    ★ 在世界系做会把 yaw≠0 的盒子轴搞错, 这是 r1 修过的 bug。
+    --settle 把物体压到支撑面上, 消掉厘米级浮空/陷入。"""
+    mp = f"{c.LOG}/place_map.txt"
+    if dry and not os.path.exists(mp):
+        print("    (还没有 place_map.txt, 干跑跳过)"); return
+    floor = f"{c.R1}/10_地板/地板.glb"
+    cmd = [PY["sam3d"], f"{SAM3D}/hybrid_place_5090.py", "--layout", f"{c.R1}/05_布局_修复后.txt",
+           "--objdir", f"{GEN}/outputs", "--map", open(mp).read().strip(),
+           "--wall-r2", "", "--out", f"{c.R1}/11_整屋", "--settle"]
+    if os.path.exists(floor): cmd += ["--floor-glb", floor]
+    sh(cmd, f"{c.LOG}/11_place.log", dry)
+
+def s_render(c, dry):
+    """从真实机位渲染整屋, 和照片并排。桌角/栏杆/盆栽应当对得上位置。
+    看起来比照片"往前冲"通常是错觉 (没有天花板、没有盒子外的前景家具)。"""
+    cmd = [PY["sam3d"], f"{PIPE}/render_check_indoor.py", "--glb", f"{c.R1}/11_整屋/00_整屋.glb",
+           "--da3", f"{c.R1}/02_DA3点云", "--zup", f"{c.R1}/03_点云_z朝上.json",
+           "--frames", c.FRB, "--out", f"{c.R1}/12_照片对比.jpg"]
+    if c.cfg["RB_FRAMES"]: cmd += ["--frames-idx", c.cfg["RB_FRAMES"]]
+    sh(cmd, f"{c.LOG}/12_render.log", dry)
+
+
+# ================================================================== 物体链 (--chain obj)
+# Qwen 列词 -> SAM3 跟踪 -> 反投影量盒子 -> SAM3D 生成 -> 摆回去。
+# 和 outdoor 走的是同一套脚本 (SCRIPTS 指向 data/outdoor/scripts), 只有三步是室内独有:
+#   bright  暗素材要提亮才出得了深度
+#   zup     墙那条要 z 朝上的点云喂 SpatialLM
+#   walls   SpatialLM 只标墙门窗, 出灰墙壳
+# 其余每一步都直接调 outdoor 的文件, 参数差异全部集中在上面的 CFG 里。
+
+def _base(c):
+    """所有 outdoor 脚本都认这三个变量。
+    ★ FR 必须是 c.FRO (抽帧并重新编号过的那套), 不是 c.FRB —— 见 Ctx.FRO 的注释。"""
+    return dict(R1=c.R1, FR=c.FRO, TAG=c.tag)
+
+def o_sub(c, dry):
+    """等间隔抽帧 + 重新编号成 0000..N-1 -> frames_<run>/, 并记下到原视频帧号的映射。
+    整条物体链 (DA3 / SAM3 跟踪 / 量盒子 / 渲染回图) 之后都只认这个目录的编号。
+
+    帧数该对齐的是**基线间距**, 不是帧数本身: cyberpunk 是 12 米长的推轨, 120 帧 ≈
+    10cm/帧, 和 timesquare 的 11cm 相当 (那边出了 185 个实例); 40 帧是 31cm, 太稀。
+    按序号抽和按弧长抽的差别不大 (两个场景的帧间距变异系数 0.44 vs 0.49), 先不做弧长版。"""
+    import shutil
+    src = sorted(glob.glob(f"{c.FRB}/*.jpg"))
+    if not src and not dry: raise SystemExit(f"[失败] {c.FRB} 下没有提亮帧, 先跑 bright")
+    n = min(int(c.cfg["OBJ_FRAMES"]), len(src) or 1)
+    if glob.glob(f"{c.FRO}/0000.jpg") and not dry:
+        print(f"    {os.path.basename(c.FRO)} 已存在 ({len(glob.glob(f'{c.FRO}/*.jpg'))} 帧), 跳过")
+        return
+    print(f"    {len(src)} -> {n} 帧  {c.FRO}")
+    if dry: return
+    os.makedirs(c.FRO, exist_ok=True)
+    idx = [int(round(i)) for i in
+           (list(range(len(src))) if n >= len(src) else
+            [k * (len(src) - 1) / (n - 1) for k in range(n)])]
+    for k, j in enumerate(idx):
+        shutil.copyfile(src[j], f"{c.FRO}/{k:04d}.jpg")
+    # 映射写在帧目录**里面**, 不是和它并排 —— 它只对这批帧有意义, 散在外面容易和别的
+    # 轮次的搞混, 删帧目录时也该跟着一起走。
+    json.dump({str(k): j for k, j in enumerate(idx)},
+              open(f"{c.FRO}/映射.json", "w"), indent=1)
+    print(f"    [done] {len(idx)} 帧, 映射 -> frames_{c.run}/映射.json")
+
+def o_da3(c, dry):
+    """物体链的 DA3: 直接吃已经抽好的 frames_<run>/, 不再让 DA3 自己抽 ——
+    它内部抽帧会重新编号, 编号和目录对不上就是那个"轮廓对、画面错位"的坑。
+    --use-ray-pose 比默认位姿准 (实测 8.8cm/3° vs VGGT 14.9cm/4.7°)。"""
+    wait_gpu(20000, dry)
+    n = len(glob.glob(f"{c.FRO}/*.jpg")) or int(c.cfg["OBJ_FRAMES"])
+    if c.cfg["GEOM"] in ("vggt_l", "vggt_g2"):
+        _geom_vggt(c, dry, c.FRO, f"{c.R1}/02_da3", str(n), c.cfg["OBJ_CONF"],
+                   ["--fx", c.cfg["FX"]] if c.cfg["FX"] else [])
+        _frame_map(c, dry, c.FRO, f"{c.R1}/02_da3"); return
+    sh([PY["spatiallm"], "da3_to_ply.py", "--images", c.FRO, "--out", f"{c.R1}/02_da3",
+        "--max-frames", str(n), "--use-ray-pose",
+        "--conf-min", c.cfg["OBJ_CONF"], "--max-points", c.cfg["MAX_POINTS"]],
+       f"{c.LOG}/02_da3.log", dry, cwd=DA3REPO)
+    if c.cfg["GEOM"] == "vggt_da3":
+        _geom_pose_swap(c, dry, c.FRO, f"{c.R1}/02_da3", c.cfg["OBJ_CONF"])
+    _frame_map(c, dry, c.FRO, f"{c.R1}/02_da3")
+
+def o_vlm(c, dry):
+    """Qwen3-VL 看 8 帧列出词表。室内 prompt 和 outdoor 的街景 prompt 不同, 所以是
+    单独一个文件; 骨架照抄 outdoor 的 vlm_list_objects.py, 只换 PROMPT + 加空返回重试
+    (原版 except: words=[] 不报警不重试, ISSUES.md §3 记着 beach 因此静默丢了整个建筑词表)。"""
+    wait_gpu(18000, dry)
+    # ★ OD 必须传。脚本拿 OD 当输出目录, 没传就落到写死的默认 cyberpunk/o1 ——
+    #   09-15 跑 ithor312 时就这样把卧室词表写进了 cyberpunk, 覆盖了那边的原件(已按 03_masks 还原),
+    #   而本场景的 R1 下反倒没有词表, 下一段跟踪直接读不到。
+    sh(envcmd(PY["trellis2"], f"{PIPE}/vlm_list_objects_indoor.py", dict(**_base(c), OD=c.R1)),
+       f"{c.LOG}/01_vlm.log", dry)
+
+def o_up(c, dry):
+    """定出场景真正的"天", 存 02_da3/world_up.json。
+    ★ 必须在量盒子之前 —— 盒子的高度是沿"天"量的, 方向错了盒子本身就是错的, 事后旋转
+    只是把错的盒子摆正, 数字不会变对。
+    室内这一版之前整个漏掉了: world_up.json 不存在, 下游 (boxes / detect) 就退回硬编码
+    的"首帧相机 -y"。cyberpunk 上实测只偏 4.6°, 侥幸没事; 但 beach/carpark 那种低头
+    机位偏 26~29°, 整个场景连地面一起歪掉。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/world_up.py", dict(R1=c.R1)),
+       f"{c.LOG}/02_up.log", dry)
+
+def o_track(c, dry):
+    """SAM3 逐词视频跟踪, mask 落盘, 后面所有步骤都从盘上读不再碰 GPU。
+    ★ SAM3 对措辞极敏感, 双词短语经常整个返回 0 (cyberpunk 上 armchair/sofa/booth seat/
+    couch/bench/bar counter/side table/floor lamp 全是 0, 而 chair/table/lamp 有)。
+    0 实例的词不是幻觉就是它不认这个说法 —— 后者换单词重跑那几个词即可 (单词 ~31s)。
+    真正把这些漏检捡回来的是下面的召回支路, 不是在这里较劲。"""
+    wait_gpu(23000, dry)
+    sh(envcmd(PY["sam3"], f"{SCRIPTS}/track_all.py",
+               dict(**_base(c), EXTRA_WORDS=c.cfg["EXTRA_WORDS"])),
+       f"{c.LOG}/03_track.log", dry)
+
+def o_dedup(c, dry):
+    """跨词去重(二维): 同一批家具被几个同义词各抠一遍, 赶在生成之前判掉多余的词。纯 CPU。
+    ★ 位置就是这一步的全部意义。原来的跨词去重在 boxes 那步(三维体素), 而 boxes 排在
+    gen 之后 —— 它要拿 mesh 的长宽高比例来选词, 于是同义词已经各烧过一次 SAM3D 才发现
+    是重复的, mesh 白生成。挪到 track 之后, 判据只用同一帧上的 mask 重叠, 不经过深度和
+    尺度 —— 那两环恰恰是这条链上最不可靠的。
+    室内比室外更需要这一步: VLM 列的室内词表同义词密度高得多 (chair/armchair/dining
+    chair/stool, sofa/couch/booth seat, table/side table/coffee table), 而 SAM3 对措辞
+    敏感又让每个说法各跟一遍。
+    ★ 门槛用的是 outdoor 的默认值, 没有分叉。密集摆放会不会把一桌四椅并成一组是三维
+    那边的老问题 (所以室内 DUP_TH 从 0.55 提到了 0.70), 二维没有这个病: 椅子挨着桌子
+    在像素上仍然是两块不重叠的区域, 是反投影之后的点云才糊到一起。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/dedup_words.py",
+               dict(R1=c.R1, EXCLUDE=c.cfg["EXCLUDE"],
+                    DW_DUP_TH=c.cfg["DW_DUP_TH"], DW_PART_TH=c.cfg["DW_PART_TH"],
+                    DW_PART_RATIO=c.cfg["DW_PART_RATIO"],
+                    DW_FRAME_FRAC=c.cfg["DW_FRAME_FRAC"], DW_WORD_FRAC=c.cfg["DW_WORD_FRAC"])),
+       f"{c.LOG}/03_dedup.log", dry)
+
+def o_pick(c, dry):
+    """每类挑一张最适合拿去生成的抠图 (面积大、不贴边)。纯 CPU。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/pick_from_masks.py",
+               dict(**_base(c), EXCLUDE=c.cfg["EXCLUDE"], MIN_AREA_PCT=c.cfg["MIN_AREA_PCT"],
+                    MIN_FRAMES=c.cfg["MIN_FRAMES"],
+                    # TOPK 不在这里传: pick_from_masks.py 通篇不读它, 传了是哑弹。
+                    # 它属于 o_verify —— 只有 verify_picks.py 读 TOPK。
+                    # ★ 和 o_solo 传给 gen_per_instance.py 的必须一致, 见 s_pick 的注释
+                    SOLO=c.cfg["SOLO"], SOLO_KEEP=c.cfg["SOLO_KEEP"], SOLO_MIN_PX=c.cfg["SOLO_MIN_PX"])),
+       f"{c.LOG}/04_pick.log", dry)
+
+def o_verify(c, dry):
+    """让 VLM 看一眼抠出来的到底是不是那个东西。SCENE_DESC 换成室内, 原版写死 street photo。"""
+    wait_gpu(18000, dry)
+    sh(envcmd(PY["trellis2"], f"{SCRIPTS}/verify_picks.py",
+               dict(**_base(c), SCENE_DESC=c.cfg["SCENE_DESC"],
+                    TOPK=c.cfg["TOPK"], MIN_AREA_PCT=c.cfg["MIN_AREA_PCT"],
+                    MIN_FRAMES=c.cfg["MIN_FRAMES"],     # 和 o_pick 同一份候选规则(class_sample.py)
+                    # 不传 SOLO, 逐实例校验整段不跑(见 outdoor s_verify)
+                    SOLO=c.cfg["SOLO"], SOLO_KEEP=c.cfg["SOLO_KEEP"], EXCLUDE=c.cfg["EXCLUDE"],
+                    SOLO_MIN_PX=c.cfg["SOLO_MIN_PX"])), f"{c.LOG}/04_verify.log", dry)
+
+def _word_of(tag, dirname):
+    """目录名反推词: hyb_o1_potted_palm -> "potted palm"; hyb_o1_chair_3 -> "chair"。"""
+    n = dirname[len(tag)+1:] if dirname.startswith(tag + "_") else dirname
+    if _is_solo(dirname): n = n.rsplit("_", 1)[0]
+    return n.replace("_", " ")
+
+def _gen_dirs(c, dirs, log, dry):
+    """调 SAM 3D Objects 逐个生成。--hq = 烘焙 1024 贴图, 慢 1-2 分钟但清晰得多。
+    两个必须带的环境变量, 少一个就崩:
+      CONDA_PREFIX   run.py 里 inference.py 直接读 os.environ["CONDA_PREFIX"], 没有就 KeyError
+      HF_HUB_OFFLINE SAM3D 每次启动都去 HuggingFace 拉 DINO 主干, HF 一抽风就 504
+
+    ★ 再过一道排除表。挑图那步已经"排除的词不写盘", 但那只挡得住这一次 —— 上一轮留在
+    my_images/ 里的目录还在盘上, 而 o_gen 是 glob 磁盘目录不是读 picks.json, 照样会捡起来
+    生成一遍。couch 那次是靠人手动删目录才没撞上, 靠人记得删不算修好。"""
+    ex = {w.strip() for w in c.cfg["EXCLUDE"].split(",") if w.strip()}
+    if ex:
+        keep = [d for d in dirs if _word_of(c.tag, os.path.basename(d)) not in ex]
+        if len(keep) != len(dirs):
+            print(f"    [排除] 盘上还留着 {len(dirs)-len(keep)} 个排除词的目录, 不生成: "
+                  + ", ".join(sorted({_word_of(c.tag, os.path.basename(d))
+                                      for d in dirs if d not in keep})), flush=True)
+        dirs = keep
+    dirs = review.filter_dirs(c.R1, dirs)      # 人在闸口逐个否掉的候选
+    def _fresh(d):
+        """这个目录的 mesh 还作数吗 —— 存在, 而且不比抠图旧。
+
+        ★ 只看"在不在"是不够的: 挑图那步 (verify) 会重写 my_images/<n>/frame.png,
+          mesh 却还是老的, 于是整条链跑在过期 mesh 上。实测踩过 —— bar stool 的抠图
+          已经换成金色高凳了, 场景里摆的还是一把餐椅。抠图比 mesh 新就必须重跑。
+        看 frame.png 和 mask.png 里较新的那个 —— 同帧换实例时只有 mask 会变。
+        """
+        n = os.path.basename(d)
+        g = f"{GEN}/outputs/{n}/{n}.glb"
+        if not os.path.exists(g): return False
+        newest = max((os.path.getmtime(f"{d}/{x}") for x in ("frame.png", "mask.png")
+                      if os.path.exists(f"{d}/{x}")), default=0)
+        return newest <= os.path.getmtime(g) + 1
+
+    todo = []
+    for i, d in enumerate(dirs, 1):
+        n = os.path.basename(d)
+        if _fresh(d):
+            print(f"    [{i}/{len(dirs)}] {n} 已有且不过期, 跳过"); continue
+        if os.path.exists(f"{GEN}/outputs/{n}/{n}.glb"):
+            print(f"    [{i}/{len(dirs)}] {n} 抠图比 mesh 新, 重新生成")
+        else:
+            print(f"    [{i}/{len(dirs)}] {n}", flush=True)
+        todo.append(d)
+    if not todo:
+        print("    没有要生成的, 跳过"); return
+
+    # ★ 一批一次交给 run.py, 不再一个物体起一个进程 —— 那样每个都要重装一遍模型
+    #   (约 40 秒), 而真正生成一个才 30 秒。run.py 的 --dirs 模式模型只装一次。
+    #   不能改用 --image 传一串: 图全叫 frame.png, 输出名取自文件名会整批互相覆盖。
+    wait_gpu(21000, dry)
+    print(f"    [批量] {len(todo)} 个一起生成, 模型只装一次", flush=True)
+    # 批量步骤不能一个失败就整批中断 —— HF 504 时后面的连试都没试。
+    # run.py 内部逐个 try 住了, 这里接住它的非零码, 具体谁失败下面按产物点名。
+    try:
+        sh(envcmd(PY["sam3d"], f"{GEN}/run.py",
+                   dict(CONDA_PREFIX=os.path.dirname(os.path.dirname(PY["sam3d"])),
+                        HF_HUB_OFFLINE="1"),
+                   ["--dirs", *todo, "--hq", "--bake-workers", c.cfg["BAKE_WORKERS"]]), log, dry, cwd=GEN)
+    except SystemExit as e:
+        print(f"    [提示] 这一批有失败的 ({e}), 下面按产物点名", flush=True)
+    if dry: return
+    # 按产物点名比按退出码准: 退 0 但没写出文件也算失败。
+    _failed = [os.path.basename(d) for d in todo if not _fresh(d)]
+    if _failed:
+        raise SystemExit(f"[失败] {len(_failed)} 个没生成出来: {', '.join(_failed)}\n"
+                         f"       别的都好了。单独重跑这一步会只补这几个(已有的会跳过)。")
+
+def _is_solo(name):
+    """实例专属 mesh 的命名是 <tag>_<词>_<obj_id>, 末段是数字。"""
+    return name.rsplit("_", 1)[-1].isdigit()
+
+def o_override(c, dry):
+    """人工指定生成样本 —— 路线图里唯一要**永久保留**的人工干预。
+    VLM 判得了"这是不是一把椅子", 判不了"这张抠图完不完整"。
+    ★ 室内以前整个没有这一步, 于是人在闸口标"换候选"什么都不会发生。"""
+    review.write_skip(c.R1, dry)              # "单个不生成"的名单, 生成那步照着挡
+    ov = review.overrides(c.R1)
+    if not ov:
+        print("    [人工指定] 这个场景没有人工指定, 跳过"); return
+    code = f'''
+import os,sys,json,numpy as np,cv2
+from pycocotools import mask as mask_util
+sys.path.insert(0,{SCRIPTS!r})
+from imgio import imwrite_stable
+R1={c.R1!r}; FR={c.FRO!r}; OV={ov!r}
+for w,(oid,fi) in OV.items():
+    _p=f"{{R1}}/03_masks/{{w.replace(chr(32),chr(95))}}.npz"
+    if not os.path.exists(_p):
+        print(f"[跳过] {{w}} 这个场景里没有这个词"); continue
+    z=np.load(_p,allow_pickle=True)
+    meta=z["meta"]; counts=z["counts"]; H,W=z["hw"]
+    hit=[i for i,(o,f,a,e) in enumerate(meta) if int(o)==oid and int(f)==fi and a>0]
+    if not hit: print(f"[跳过] {{w}} 没有 实例{{oid}}/第{{fi}}帧"); continue
+    m=mask_util.decode({{"counts":counts[hit[0]],"size":[int(H),int(W)]}}).astype(np.uint8)
+    d=os.path.expanduser(f"~/sam3d/sam-3d-objects/my_images/{c.tag}_{{w.replace(chr(32),chr(95))}}")
+    os.makedirs(d,exist_ok=True)
+    imwrite_stable(f"{{d}}/frame.png",cv2.imread(f"{{FR}}/{{fi:04d}}.jpg")); imwrite_stable(f"{{d}}/mask.png",m*255)
+    p=json.load(open(f"{{R1}}/04_picks/picks.json")); p.setdefault(w,{{}}).update(obj_id=oid,frame=fi,人工指定=True)
+    json.dump(p,open(f"{{R1}}/04_picks/picks.json","w"),ensure_ascii=False,indent=1)
+    print(f"[人工指定] {{w}} -> 实例{{oid}} 第{{fi}}帧")
+'''
+    sh([PY["sam3d"], "-c", code], f"{c.LOG}/04_override.log", dry)
+
+def o_relabel(c, dry):
+    """挪类别: 把实例在 mask 文件之间搬家, mask 不改只换标签。没有决策就空转。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/relabel_words.py", dict(R1=c.R1)),
+       f"{c.LOG}/04_relabel.log", dry)
+
+def o_gen(c, dry):
+    """每类生成一个 mesh。逐实例的那些走 solo 那步。
+    ★ 只认这轮 04_picks/picks.json 挑中的词, 不照盘上目录 glob —— 见 outdoor 的 s_gen。"""
+    pj = f"{c.R1}/04_picks/picks.json"
+    alld = glob.glob(f"{GEN}/my_images/{c.tag}_*")
+    if os.path.exists(pj):
+        want = {f"{c.tag}_{w.replace(' ','_')}" for w in json.load(open(pj))}
+        dirs = sorted(d for d in alld if os.path.basename(d) in want)
+        stale = sorted(os.path.basename(d) for d in alld
+                       if not _is_solo(os.path.basename(d)) and os.path.basename(d) not in want)
+        if stale:
+            print(f"    [跳过] 盘上 {len(stale)} 个类目录不在这轮挑图结果里, 不生成: "
+                  f"{', '.join(x[len(c.tag)+1:] for x in stale)}", flush=True)
+    else:
+        dirs = sorted(d for d in alld if not _is_solo(os.path.basename(d)))
+    _gen_dirs(c, dirs, f"{c.LOG}/05_gen.log", dry)
+
+def o_ratio(c, dry):
+    """量每个类 mesh 的长宽高比例 -> 05_mesh_ratio.json。
+    ★ 下一步跨词去重要用它: 一个红花盆同时被 plant pot / planter / potted plant 三个词
+    抠到, 这三个词不是粗细关系, 优先级表无从排起 —— 但比例是量得出来的。
+    存的必须是"从大到小排好序"的比例, boxes_from_masks 的 shape_cost 把盒子三条边排序后
+    直接对齐, 存原始 x/y/z 顺序会让整个形状匹配失效。
+    预先算好存盘, 是因为量盒子那步在 sam3 环境跑, 那里没有 trimesh。"""
+    code = f'''
+import os,glob,json,trimesh,numpy as np
+r={{}}
+for p in sorted(glob.glob({GEN + "/outputs/" + "%s_*/*.glb"!r} % {c.tag!r})):
+    n=os.path.basename(os.path.dirname(p))[len({c.tag!r})+1:].replace("_"," ")
+    if n.split(" ")[-1].isdigit(): continue          # 实例专属 mesh 不参与
+    s=trimesh.load(p); m=s.to_geometry() if hasattr(s,"to_geometry") else s
+    e=np.sort(np.array(m.extents))[::-1]
+    r[n]=(e/max(e[0],1e-9)).tolist()
+json.dump(r,open({c.R1 + "/05_mesh_ratio.json"!r},"w"),indent=1); print("[done]",len(r),"类")
+'''
+    sh([PY["sam3d"], "-c", code], f"{c.LOG}/05_ratio.log", dry)
+
+def o_meshes(c, dry):
+    """生成的 mesh 拼一张一览图, 肉眼过一遍有没有明显烂的。"""
+    sh(envcmd(PY["sam3d"], f"{TOOLS}/render_meshes.py", dict(_base(c), GEN_OUT=f"{GEN}/outputs")),
+       f"{c.LOG}/05_meshes.log", dry)
+
+def o_boxes(c, dry):
+    """把 mask 反投影成点团, 量出三维盒子, 再跨词去重。★ 必须在 gen/ratio 之后 ——
+    跨词去重要用 mesh 长宽比, 05_mesh_ratio.json 缺了直接崩。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/boxes_from_masks.py",
+               dict(**_base(c), MIN_POINTS=c.cfg["MIN_POINTS"], CONF_MIN=c.cfg["OBJ_CONF"],
+                    VOX=c.cfg["VOX"], DUP_TH=c.cfg["DUP_TH"], PART_TH=c.cfg["PART_TH"],
+                    SAMPLE_FRAMES=c.cfg["SAMPLE_FRAMES"])), f"{c.LOG}/06_boxes.log", dry)
+
+def o_vlm_sizes(c, dry):
+    """问 Qwen 要词表里每个词的典型真实高度(米), 给下一步当尺子。和室外同一个脚本。"""
+    sh(envcmd(PY["trellis2"], f"{SCRIPTS}/vlm_sizes.py", dict(OD=c.R1)),
+       f"{c.LOG}/06_vlm_sizes.log", dry)
+
+def o_scale(c, dry):
+    """标定并施加全局尺度, 把 DA3 那层改成真米。和室外同一个脚本。
+    室内 DA3 判得比室外准(视角正常、纹理够), 多半算出来接近 1 —— 脚本会自己判断,
+    k 和 1 差不到 5% 就不动数据。留着这一步是为了两边行为一致, 以及万一素材换成俯拍。
+    ★ 排在 boxes 之后(要拿盒子当尺子), 改完深度盒子过期, 脚本自己重量一遍。
+    ★ 幂等靠 cameras.json 的 metric_scale_applied; 原始数据备份在 02_da3/_prescale/。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/world_scale.py",
+               dict(**_base(c), MIN_POINTS=c.cfg["MIN_POINTS"], CONF_MIN=c.cfg["OBJ_CONF"],
+                    VOX=c.cfg["VOX"], DUP_TH=c.cfg["DUP_TH"], PART_TH=c.cfg["PART_TH"],
+                    SAMPLE_FRAMES=c.cfg["SAMPLE_FRAMES"])), f"{c.LOG}/06_scale.log", dry)
+
+def o_solo(c, dry):
+    """主体逐实例抠图 + 生成。吧台/钢琴/沙发/大盆栽形态各异, 复用一个 mesh 会很假;
+    餐桌餐椅吧凳高度重复, 复用把生成次数从几十次压到个位数。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/gen_per_instance.py",
+               dict(**_base(c), EXCLUDE=c.cfg["EXCLUDE"], SOLO=c.cfg["SOLO"],
+                    SOLO_KEEP=c.cfg["SOLO_KEEP"],
+                    SOLO_MIN_PX=c.cfg["SOLO_MIN_PX"])), f"{c.LOG}/06_solo.log", dry)
+    jobs = f"{c.LOG}/solo_jobs.txt"
+    names = open(jobs).read().split() if os.path.exists(jobs) else []
+    _gen_dirs(c, [f"{GEN}/my_images/{n}" for n in names], f"{c.LOG}/06_gen_solo.log", dry)
+
+# ---------- 召回支路: WildDet3D 和 SAM3 并行, 捡回 SAM3 漏掉的 ----------
+# 为什么要有这条: 量盒子那步吃的是 SAM3 的 mask, SAM3 漏掉的它看都看不到。
+# cyberpunk 上 SAM3 只出 36 个实例, 召回补出 82 个漏检 (chair 19 / bar stool 10 / ...),
+# 高背卡座整片餐区都是靠这条捡回来的。
+#     帧 -> Qwen 列词 -> SAM3 跟踪            -> mask + track ID  ┐
+#                    -> WildDet3D 按词检测(原图) -> 3D 框          ┤-> 合并
+#     两边都有 -> 用 SAM3 的 mask; 只有框没 mask -> 框喂回 SAM3 补抠
+def o_detect(c, dry):
+    """召回1: WildDet3D 文本模式全图检测。★ 吃的是原图不是 SAM3 的框, 所以它看得见
+    SAM3 漏掉的东西。它是单帧模型没有 track ID, 跨帧关联是下一步的事。"""
+    wait_gpu(20000, dry)
+    sh(envcmd(PY["wilddet"], f"{SCRIPTS}/detect_wilddet.py",
+               dict(**_base(c), WD3=WD3REPO, DET_STRIDE=c.cfg["DET_STRIDE"],
+                    DET_SCORE=c.cfg["DET_SCORE"])), f"{c.LOG}/12_detect.log", dry)
+
+def o_recall(c, dry):
+    """召回2: 逐帧检测按三维位置聚成实例 (场景静止, 同一物体各帧世界坐标应重合),
+    跨词去重, 再和 SAM3 已有实例比对挑出漏检。"""
+    # ★ FR 必须传: MATCH_2D 那条路要读 SAM3 的 mask 和原帧, 少了就退不回二维。
+    # MATCH_2D=1 是"和 SAM3 比对时用二维框 IoU 而不是三维距离"。三维距离那版有个必然的
+    # 坑: 半径按物体自身尺寸算, 4.26m 的吧台半径撑到 1.37m, 把紧贴着它的吧凳(1.00m)
+    # 圈了进去 -> 吧台被判成"SAM3 已经有了"整个丢掉。而吧凳紧贴吧台是必然的几何关系。
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/merge_recall.py",
+               dict(R1=c.R1, FR=c.FRO, MIN_VIEWS=c.cfg["MIN_VIEWS"], DIST_F=c.cfg["DIST_F"],
+                    MATCH_F=c.cfg["MATCH_F"], MATCH_2D=c.cfg["MATCH_2D"],
+                    IOU_SELF=c.cfg["IOU_SELF"], IOU_SAM=c.cfg["IOU_SAM"],
+                    SELF_3D_F=c.cfg["SELF_3D_F"])), f"{c.LOG}/13_recall.log", dry)
+
+def o_recall_mask(c, dry):
+    """召回3: 漏检的只有框没 mask, 把框喂回 SAM3 补抠一张。
+    ★ SAM3 不是抠不出这些东西, 是它的文字理解没认出 armchair 这种词 —— 给了框就抠得出
+    (cyberpunk 上 61/82 成功, 和输入框重合 0.5~0.75)。
+    ★ 框必须是"左上xywh 归一化", 且要在返回的一组候选里按 IoU 挑, 见脚本文件头三个坑。"""
+    wait_gpu(23000, dry)
+    sh(envcmd(PY["sam3"], f"{SCRIPTS}/mask_recall.py",
+               dict(**_base(c), REC_MIN_PCT=c.cfg["REC_MIN_PCT"],
+                    REC_MIN_IOU=c.cfg["REC_MIN_IOU"],
+                    EXCLUDE=c.cfg["EXCLUDE"])), f"{c.LOG}/14_recall_mask.log", dry)
+
+def o_recall_gen(c, dry):
+    """召回4: 给补抠出来的漏检实例生成 mesh。清单在 logs/recall_jobs.txt。"""
+    jobs = f"{c.LOG}/recall_jobs.txt"
+    names = open(jobs).read().split() if os.path.exists(jobs) else []
+    if not names: print("    没有待生成的漏检实例, 跳过"); return
+    _gen_dirs(c, [f"{GEN}/my_images/{n}" for n in names], f"{c.LOG}/14_recall_gen.log", dry)
+
+def o_recall_merge(c, dry):
+    """召回5: 盒子并进 06_all_boxes_merged.json。原文件不动, 换 BOXES 就能切回去。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/merge_boxes_recall.py",
+               dict(_base(c), GEN_OUT=f"{GEN}/outputs")),
+       f"{c.LOG}/15_merge_boxes.log", dry)
+
+def o_assemble(c, dry):
+    """按盒子把 mesh 摆回房间 + 一个 RANSAC 拟合的地面 -> 07_scene.glb。
+
+    ★ 这一步用的是 outdoor 的 assemble_scene.py, 不是 hybrid_place_5090.py。区别是致命的:
+      assemble_scene  按高度算一个标量, 等比缩放, mesh 自己的长宽比原样保留
+      hybrid_place    逐轴拉伸填满盒子, 盒子的长宽高直接决定 mesh 形状
+    物体链的盒子是点云反投影量出来的, 长宽不可信 (吧凳量成 0.94x0.31 的板子), 喂给逐轴
+    拉伸就把凳子压扁了; 等比缩放根本不看长宽, 天然免疫。hybrid_place 那套是给 SpatialLM
+    链写的 —— 那里的长宽高是模型直接输出的, 可信, 拉伸填满才是对的。
+
+    尺度基准取"当初拿去生成 mesh 的那个实例"(VLM 验过的, 最可信), 不是中位数 ——
+    脚本注释里记着"点数最多的"和"取分布上半段"两条都试过、都不对。
+
+    SNAP_GROUND=0: 落地交给下一步的 phys, 那里会先找支撑面再退回地面。
+    BOXES 指向 merged 那份, 召回的物体才会进场景; 没跑召回就退回原文件。"""
+    boxes = f"{c.R1}/06_all_boxes_merged.json"
+    _base_b = f"{c.R1}/06_all_boxes.json"
+    if not os.path.exists(boxes):
+        boxes = _base_b
+    elif os.path.exists(_base_b) and os.path.getmtime(boxes) < os.path.getmtime(_base_b):
+        # ★ 和室外同一道守卫。"文件在就用"在 scale 会就地改深度并重量盒子之后就不成立了:
+        #   重跑过 boxes/scale 之后 base 是新的、merged 还是上一轮的, 整个房间会退回旧盒子摆,
+        #   而且看着没毛病。重跑 recall_merge, 或者删掉 merged 用基础盒子。
+        raise SystemExit(
+            f"[失败] {os.path.basename(boxes)} 比 {os.path.basename(_base_b)} 旧, 拒绝使用。\n"
+            f"       量盒子那步重跑过了, 召回的合并结果已经过期。\n"
+            f"       重跑 recall_merge, 或者删掉 merged 那份用基础盒子摆。")
+    shell = f"{c.R1}/09_房间壳.glb"
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/assemble_scene.py",
+               dict(**_base(c), GEN_OUT=f"{GEN}/outputs", SOLO_KEEP=c.cfg.get("SOLO_KEEP",""),
+                    EXCLUDE=c.cfg["EXCLUDE"], PER_INSTANCE=c.cfg["PER_INSTANCE"],
+                    SNAP_GROUND=c.cfg["SNAP_GROUND"], BOXES=boxes, SCENE_OUT="07_scene.glb",
+                    # 朝向吸附到房间网格。默认空 = 关, 见 assemble_scene.py 的 YAW_SNAP 注释。
+                    YAW_SNAP=c.cfg.get("YAW_SNAP", ""), YAW_SNAP_MAX=c.cfg.get("YAW_SNAP_MAX", "25"),
+                    ROOM_SHELL=shell if os.path.exists(shell) else "")),
+       f"{c.LOG}/07_assemble.log", dry)
+
+def o_phys(c, dry):
+    """落地 + 推开穿模 -> 07_scene_phy.glb。纯几何, 不上物理引擎。
+    SNAP 从 outdoor 的 0.8 收到 0.15: 室内桌面离地才 0.75m, 0.8 会把桌上的东西传送到地板。
+    (这一轮词表里就没有桌上小物, 但阈值先按室内定, 免得下一轮忘。)"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/scene_phys.py",
+               dict(R1=c.R1, SNAP=c.cfg["SNAP"], ITERS=c.cfg["ITERS"],
+                    MARGIN=c.cfg["MARGIN"], HUNG_LABELS=c.cfg["HUNG_LABELS"],
+                    SUPPORT_LABELS=c.cfg["SUPPORT_LABELS"],
+                    SUPPORT_OVERLAP=c.cfg["SUPPORT_OVERLAP"])), f"{c.LOG}/07_phys.log", dry)
+
+def o_walls(c, dry):
+    """★ 已从 obj 链摘掉 —— 留着只为 lm 链和查阅。房间壳改从点云自己算足迹了。
+    摘掉的理由: 把 arch 模式的输出投回画面核对过, 117 面墙里 108 面首尾相接成 5 条弧,
+    而这些弧贴在**弧形栏杆和演奏台边缘**上, 不是房间边界; 剩下 9 面长墙也对不上画面里
+    那面带垂挂灯管的大墙; 真正的玻璃幕墙一面都没认出来 (它训练集是住宅, 玻璃在点云里
+    几乎没点)。拿它围房间, 围出来的不是房间 —— 而且每跑一次白烧 70 秒 GPU。
+
+    SpatialLM 只标墙门窗 (--detect_type arch), 出灰色几何墙壳。
+    家具一律走物体链 —— SpatialLM 的 59 类是住宅家具表, 这个场景里钢琴/吧台/发光栏杆
+    它结构上表达不了 (r1 的 all 模式出了 54 面碎墙 + 20 curtain + 12 plants, 零家具)。"""
+    wait_gpu(12000, dry)
+    sh(f"cd {shlex.quote(LMREPO)} && {shlex.quote(PY['spatiallm'])} inference.py "
+       f"--point_cloud {shlex.quote(c.R1)}/03_点云_z朝上.ply "
+       f"--output {shlex.quote(c.R1)}/09_墙布局.txt --model_path {c.cfg['LM_MODEL']} "
+       f"--detect_type {c.cfg['WALL_DETECT']} --seed {c.cfg['LM_SEED']}",
+       f"{c.LOG}/09_walls.log", dry)
+
+def o_shell(c, dry):
+    """房间壳: 从点云算闭合足迹, 建灰色半透明墙 + 贴合足迹的地板 -> 09_房间壳.glb。
+
+    ★ 必须排在 assemble 之前, 不是之后。壳是场景的地面和边界, assemble 要用它代替那张
+      "覆盖所有物体 +8m"的大方片 (cyberpunk 上铺成 30x30m 一块灰板), phys 要拿墙当静态
+      碰撞体。排在后面就只能往跑完的场景上叠, 地板还是那张大方片。
+
+    ★ 不吃 SpatialLM 的墙。核对过: arch 模式那 117 面墙里 108 面贴在弧形栏杆和演奏台
+      边缘上, 不是房间边界; 玻璃幕墙一面都没认出来。所以足迹改从点云自己算 ——
+      栅格化 -> 闭运算填窗洞 -> 最大连通域外轮廓, 天然闭合。walls 那步现在只是留个
+      诊断产物, 这条链不依赖它。
+
+    --zup + --world-up 让壳落到和 assemble_scene 一样的坐标系 (DA3 世界 -> 天转 +y);
+    不给的话壳的地板在 y=0 而物体地面在 -0.75m, 合起来物体整体沉到地板下面。"""
+    extra = []
+    src = c.cfg["WALL_SOURCE"].strip()
+    if src == "spatiallm":
+        # 墙交给 SpatialLM (arch 模式只标墙门窗), 家具仍是物体链的。
+        # walls 那步不在 obj 的步骤表里, 这里按需补跑; 已有就不重跑(70 秒 GPU)。
+        if not os.path.exists(f"{c.R1}/09_墙布局.txt") or dry:
+            o_walls(c, dry)
+        extra = ["--walls-txt", f"{c.R1}/09_墙布局.txt"]
+    elif src != "pcd":
+        raise SystemExit(f"[失败] WALL_SOURCE={src!r} 不认识, 只能是 pcd / spatiallm")
+    sh([PY["sam3d"], f"{PIPE}/room_shell.py",
+        "--pcd", f"{c.R1}/03_点云_z朝上.ply",
+        "--out", f"{c.R1}/09_房间壳.glb",
+        "--seg-out", f"{c.R1}/09_房间壳_墙线.json",
+        "--zup", f"{c.R1}/03_点云_z朝上.json",
+        "--world-up", f"{c.R1}/02_da3/world_up.json",
+        "--up", "y",
+        "--thick", c.cfg["WALL_THICK"], "--alpha", c.cfg["WALL_ALPHA"],
+        "--close", c.cfg["SHELL_CLOSE"], "--simplify", c.cfg["SHELL_SIMPLIFY"],
+        # 认出来的物体一定在屋里: 壳必须把每个盒子围进去 (远处的真东西会和深度噪声一起被分位切掉)
+        "--boxes", f"{c.R1}/06_all_boxes_merged.json", "--exclude", c.cfg["EXCLUDE"]] + extra,
+       f"{c.LOG}/09_shell.log", dry)
+
+def o_render(c, dry):
+    """从原视频机位渲染重建结果, 和实拍并排。用 outdoor 的 render_back.py ——
+    它吃 assemble_scene 的输出 (glTF y 朝上), 和这条链天然对齐。
+
+    ★ FR 必须是 c.FRO (frames_<run>) 不是 c.FRB (frames_bright)。render_back 用
+      02_da3/cameras.json 的第 i 个位姿去配 FR 里的第 i 张图, 而 cameras.json 是
+      DA3 在**重编号后**的帧上出的 —— 给 frames_bright 会把渲染和另一帧的照片并排,
+      看起来像"重建整体错位"。同一个坑在 pick/track 那边已经踩过一次。
+    (pipeline/render_check_indoor.py 是给 hybrid_place 的 z 朝上输出写的, 这条链不用。)"""
+    for scene, out in (("07_scene.glb", "08_render_back.jpg"),
+                       ("07_scene_phy.glb", "08_render_back_phy.jpg")):
+        if not os.path.exists(f"{c.R1}/{scene}") and not dry: continue
+        sh(envcmd(PY["sam3d"], f"{SCRIPTS}/render_back.py",
+                   dict(R1=c.R1, FR=c.FRO, SCENE=scene, RBOUT=out,
+                        FRAMES=c.cfg["RB_FRAMES"])), f"{c.LOG}/08_render.log", dry)
+
+STEPS_OBJ = [
+    ("frames",      "sam3d",     "抽帧(补零成 0000.jpg)",              s_frames),
+    ("bright",      "sam3d",     "gamma 提亮(全链都吃这套帧)",          s_bright),
+    ("sub",         "sam3d",     "抽帧+重编号 -> frames_<run>",         o_sub),
+    ("vlm",         "trellis2",  "Qwen3-VL 列词表(室内 prompt)",        o_vlm),
+    ("da3",         "spatiallm", "DA3 米制深度 + 相机位姿",             o_da3),
+    ("up",          "sam3d",     "定出真实的天(地面法向)",               o_up),
+    ("track",       "sam3",      "SAM3 视频跟踪, 落盘",                 o_track),
+    ("dedup",       "sam3d",     "跨词去重(二维 mask), 判掉同义词",       o_dedup),
+    ("relabel",     "sam3d",     "挪类别(闸口说这几个是别的东西)",       o_relabel),
+    ("pick",        "sam3d",     "每类挑生成样本",                      o_pick),
+    ("verify",      "trellis2",  "VLM 验证抠图内容",                    o_verify),
+    ("override",    "sam3d",     "人工指定生成样本(闸口决定)",           o_override),
+    ("gen",         "sam3d",     "SAM3D 每类生成一个 mesh",             o_gen),
+    ("ratio",       "sam3d",     "量 mesh 长宽高比例",                  o_ratio),
+    ("meshes",      "sam3d",     "mesh 一览图",                        o_meshes),
+    ("boxes",       "sam3d",     "反投影量盒子 + 跨词去重",              o_boxes),
+    ("vlm_sizes",   "trellis2",  "问 VLM 要每个词的真实高度(尺子)",      o_vlm_sizes),
+    ("scale",       "sam3d",     "标定全局尺度 -> 真米 + 重量盒子",      o_scale),
+    ("solo",        "sam3d",     "主体逐实例生成",                      o_solo),
+    ("detect",      "wilddet",   "召回1: 全图按词检测",                 o_detect),
+    ("recall",      "sam3d",     "召回2: 聚类 + 和SAM3合并",            o_recall),
+    ("recall_mask", "sam3",      "召回3: 框喂回SAM3补抠mask",           o_recall_mask),
+    ("recall_gen",  "sam3d",     "召回4: 漏检实例生成mesh",             o_recall_gen),
+    ("recall_merge","sam3d",     "召回5: 盒子并进主文件",               o_recall_merge),
+    # ★ zup 排在 scale 之后: 它产的点云是房间壳的输入, 而 scale 会就地改深度。
+    #   排在前面就等于壳留在校准前的世界里, 和物体差一个 k 倍。
+    ("zup",         "spatiallm", "转 z 朝上(房间壳要用)",               o_zup),
+    ("shell",       "sam3d",     "房间壳: 点云足迹 -> 地板+灰墙",        o_shell),
+    ("assemble",    "sam3d",     "摆回房间 + 房间壳(等比缩放)",          o_assemble),
+    ("phys",        "sam3d",     "落地 + 推开穿模(墙是静态碰撞体)",       o_phys),
+    ("render",      "sam3d",     "渲染回图比对",                       o_render),
+]
+
+STEPS_LM = [
+    ("frames",  "sam3d",      "抽帧(补零成 0000.jpg)",            s_frames),
+    ("bright",  "sam3d",      "gamma 提亮(全链都吃这套帧)",        s_bright),
+    ("da3",     "spatiallm",  "DA3 米制深度 + 相机位姿",           s_da3),
+    ("zup",     "spatiallm",  "转 z 朝上 / 地板 z=0 / 墙对齐",     s_zup),
+    ("lm",      "spatiallm",  "SpatialLM 出布局",                 s_lm),
+    ("boxfix",  "spatiallm",  "盒子掰正/去穿模 + 穿墙 clip",       s_boxfix),
+    ("match",   "sam3d",      "逐盒子挑最不被挡的一帧",            s_match),
+    ("plan",    "sam3d",      "定谁单独生成 / 谁复用",             s_plan),
+    ("mask",    "sam3",       "SAM3 按盒投影框 IoU 抠图",          s_mask),
+    ("gen",     "sam3d",      "SAM3D Objects 生成 mesh",          s_gen),
+    ("floor",   "spatialgen", "地板贴图(uniform)",                s_floor),
+    ("place",   "sam3d",      "按盒子归位 + 组装整屋",             s_place),
+    ("render",  "sam3d",      "渲染回图比对",                     s_render),
+]
+DEFAULT_END_LM = "boxfix"   # 闸门: 这个场景是开放式酒廊, 玻璃幕墙 + 中庭, 和 SpatialLM
+                         # 训练的封闭住宅房间差很远。布局废掉的话后面几小时的生成全是
+                         # 白烧, 所以默认停在布局, 看过 04_布局_俯视.png 再显式 --to render
+
+# 每一步应当产出什么 (用来做 --check; 只列关键产物, 不求全)
+ARTIFACTS_LM = {
+    "frames":  ["@FR/0000.jpg"],           # @FR/@FRB = 帧目录, 不在 R1 底下
+    "bright":  ["@FRB/0000.jpg"],
+    "da3":     ["02_DA3点云/points.ply", "02_DA3点云/cameras.json", "02_DA3点云_俯视.png"],
+    "zup":     ["03_点云_z朝上.ply", "03_点云_z朝上.json", "03_点云_分层.jpg"],
+    "lm":      ["04_布局.txt", "04_布局_俯视.png"],
+    "boxfix":  ["05_布局_修复后.txt", "05_盒子体检.csv"],
+    "match":   ["06_配对/配对表.csv"],
+    "plan":    ["07_生成计划.json"],
+    "mask":    [],                          # 产物在 sam-3d-objects/my_images/, 单独查
+    "gen":     [],                          # 产物在 sam-3d-objects/outputs/, 单独查
+    "floor":   ["10_地板/地板.glb"],
+    "place":   ["11_整屋/00_整屋.glb"],
+    "render":  ["12_照片对比.jpg"],
+}
+
+# 每一步真正依赖谁的产物。--check 靠它判断"过期", 而不是靠"比前面所有步骤旧" ——
+# 那种偷懒判法只要有人乱序重跑一步就会级联误报一片。
+DEPS_LM = {
+    "bright": ["frames"],   "da3": ["bright"],      "zup": ["da3"],
+    "lm": ["zup"],          "boxfix": ["lm"],       "match": ["boxfix", "bright"],
+    "plan": ["match"],      "mask": ["plan"],       "gen": ["mask"],
+    "floor": ["boxfix", "da3"],
+    "place": ["gen", "floor"],                      # ★ floor 在 place 之前, 见文件头
+    "render": ["place"],
+}
+
+# ---------------- 物体链的三张表 ----------------
+DEFAULT_END_OBJ = "render"      # 物体链没有闸门, 一路跑到底
+ARTIFACTS_OBJ = {
+    "frames":       ["@FR/0000.jpg"],
+    "bright":       ["@FRB/0000.jpg"],
+    "sub":          ["@FRO/0000.jpg"],
+    "vlm":          ["01_vlm_vocab.json"],
+    "da3":          ["02_da3/cameras.json"],
+    "up":           ["02_da3/world_up.json"],
+    "vlm_sizes":    ["01_vlm_sizes.json"],
+    "scale":        ["02_da3/world_scale.json"],
+    "zup":          ["03_点云_z朝上.ply", "03_点云_z朝上.json"],
+    "track":        ["03_track_report.json"],
+    "dedup":        ["03_dedup_words.json"],
+    "pick":         ["04_picks/picks.json"],
+    "verify":       ["04_picks/vlm_verify.json"],
+    "override":     [],
+    "relabel":      [],
+    "gen":          [],                     # 产物在 sam-3d-objects/outputs/
+    "ratio":        ["05_mesh_ratio.json"],
+    "meshes":       ["05_meshes.jpg"],
+    "boxes":        ["06_all_boxes.json"],
+    "solo":         [],
+    "detect":       ["12_wd_detections.json"],
+    "recall":       ["13_recall.json"],
+    "recall_mask":  ["14_recall_ready.json"],
+    "recall_gen":   [],
+    "recall_merge": ["06_all_boxes_merged.json"],
+    "shell":        ["09_房间壳.glb", "09_房间壳_墙线.json"],
+    "assemble":     ["07_scene.glb"],
+    "phys":         ["07_scene_phy.glb"],
+    "render":       ["08_render_back.jpg"],
+}
+DEPS_OBJ = {
+    "bright": ["frames"], "sub": ["bright"],
+    "vlm": ["sub"],       "da3": ["sub"],      "up": ["da3"],
+    "zup": ["da3", "scale"],  "track": ["vlm", "bright"],
+    "dedup": ["track"],   "relabel": ["dedup"],  "pick": ["track", "dedup", "relabel"],
+    "verify": ["pick"],   "override": ["verify"],   "gen": ["override"],
+    "ratio": ["gen"],     "meshes": ["gen"],
+    # ★ boxes 必须在 gen/ratio 之后: 跨词去重要用 mesh 长宽比, 缺 05_mesh_ratio.json 直接崩
+    "boxes": ["ratio", "up", "track", "dedup"],
+    # scale 依赖 boxes(拿盒子当尺子) —— 千万别反过来把 scale 写进 boxes 的依赖, 会成环
+    "vlm_sizes": ["vlm"],              "scale": ["boxes", "vlm_sizes"],
+    "solo": ["scale"],
+    # 召回不依赖盒子 —— 二维比对读的是 03_masks 的 mask, 和 06_all_boxes.json 无关。
+    "detect": ["da3", "vlm", "up", "scale"],  "recall": ["detect", "track"],
+    "recall_mask": ["recall"],         "recall_gen": ["recall_mask"],
+    "recall_merge": ["recall_gen", "up"],
+    # ★ 补 scale: world_scale 就地把倍数乘进深度和相机, 壳如果不跟着重算,
+    #   房间壳会留在校准前的世界里, 和物体差一个 k 倍。
+    "shell": ["zup", "up", "scale"],
+    "assemble": ["scale", "solo", "recall_merge", "shell"],
+    "phys": ["assemble"],
+    "render": ["phys"],
+}
+
+CHAINS = {
+    # 物体链: Qwen 列词 -> SAM3 跟踪 -> 反投影量盒子 -> 生成 -> 摆回去。
+    #   和 outdoor 走同一套脚本, 家具靠它, 墙只是最后贴一层壳。
+    "obj": (STEPS_OBJ, DEFAULT_END_OBJ, ARTIFACTS_OBJ, DEPS_OBJ),
+    # SpatialLM 链: 点云 -> LLM 直接出布局 -> 按盒子抠图生成 -> 归位。
+    #   逻辑完全不同 —— 它是在无标注点云里找物体, 物体链是在 2D 画面里找。
+    #   封闭住宅房间用它 (词表 59 类住宅家具正好对上); 开放式非住宅场景用物体链。
+    "lm":  (STEPS_LM,  DEFAULT_END_LM,  ARTIFACTS_LM,  DEPS_LM),
+}
+
+# 生成类步骤的产物不在 R1 底下, 而在 sam-3d-objects 树里 (pick_mask_5090.py 的 --out
+# 是名字不是路径, run.py 也只能写进自己 cwd 下的 outputs/)。所以这些步骤没法靠 ARTIFACTS
+# 查, 要靠 logs/*_jobs.txt 反查该有哪些名字。
+GEN_STEPS = {
+    "mask":       ("mask_jobs.txt",   "my_images/{n}/mask.png"),   # LM 链
+    "gen":        ("gen_jobs.txt",    "outputs/{n}/{n}.glb"),      # LM 链
+    "solo":       ("solo_jobs.txt",   "outputs/{n}/{n}.glb"),      # 物体链
+    "recall_gen": ("recall_jobs.txt", "outputs/{n}/{n}.glb"),      # 物体链
+}
+
+def _jobnames(c, which):
+    p = f"{c.LOG}/{GEN_STEPS[which][0]}"
+    if not os.path.exists(p): return []
+    if which == "mask":
+        return [l.split("\t")[0] for l in open(p).read().splitlines() if l.strip()]
+    return open(p).read().split()
+
+def do_check(c):
+    """看一遍产物在不在、有没有过期。过期 = 比它依赖的产物还旧, 说明上游重跑过而它没跟上。"""
+    print(f"场景 {c.scene}  轮次 {c.run}\n")
+    when = {}; bad = 0
+    def _gen_row(c, k, have, want, when, DEPS):
+        """生成类步骤的一行。★ 也要判过期、也要计 bad —— 原来这两支只打印就 continue,
+        于是"闸口重挑过图 -> gen 该重出"这条链在 --check 里整段隐形。"""
+        st = stamp_path(c, k)
+        t = os.path.getmtime(st) if os.path.exists(st) else None
+        if t is not None: when[k] = t
+        older = [u for u in DEPS.get(k, []) if u in when and when[u] > (t or 0) + 1]
+        note = f"  <- 比依赖的 {'/'.join(older)} 旧, 该重跑" if older else ""
+        print(f"  {k:12s} {'有' if have else '缺':2s}  {len(have)}/{len(want) or '?'} 个{note}")
+        return 1 if (older or not have or len(have) < len(want)) else 0
+
+    for k, e, d, _ in STEPS:
+        if k == "gen" and ARTIFACTS is ARTIFACTS_OBJ:
+            # 物体链的 gen 不走 jobs 文件, 它直接扫 my_images 下的类目录
+            # (LM 链的 gen 有 gen_jobs.txt, 所以同名不同查法, 必须先分链再查表)
+            dirs = [os.path.basename(d) for d in glob.glob(f"{GEN}/my_images/{c.tag}_*")
+                    if not _is_solo(os.path.basename(d))]
+            have = [n for n in dirs if os.path.exists(f"{GEN}/outputs/{n}/{n}.glb")]
+            bad += _gen_row(c, k, have, dirs, when, DEPS)
+            continue
+        if k in GEN_STEPS:
+            names = _jobnames(c, k)
+            sub = GEN_STEPS[k][1]
+            have = [n for n in names if os.path.exists(f"{GEN}/" + sub.format(n=n))]
+            bad += _gen_row(c, k, have, names, when, DEPS)
+            continue
+        paths = [p.replace("@FRB", c.FRB).replace("@FRO", c.FRO).replace("@FR", c.FR)
+                 if p.startswith("@")
+                 else os.path.join(c.R1, p) for p in ARTIFACTS.get(k, [])]
+        miss = [p for p in paths if not os.path.exists(p)]
+        if miss:
+            print(f"  {k:12s} 缺  {', '.join(os.path.basename(m) for m in miss)}"); bad += 1; continue
+        st = stamp_path(c, k)
+        if not os.path.exists(st):          # 产物在, 但不是这个驱动跑出来的
+            # 和室外一样计进 bad: "产物在、戳不在"往往就是"产物是上一轮留下的"。
+            print(f"  {k:12s} 有  (产物在, 无完成戳 —— 可能是上一轮留下的, 跑一次这步)")
+            bad += 1; continue
+        t = os.path.getmtime(st); when[k] = t
+        older = [u for u in DEPS.get(k, []) if u in when and when[u] > t + 1]
+        note = f"  <- 比依赖的 {'/'.join(older)} 旧, 该重跑" if older else ""
+        if older: bad += 1
+        print(f"  {k:12s} 有  {time.strftime('%m-%d %H:%M', time.localtime(t))}{note}")
+    print(f"\n{'全部就绪' if not bad else f'{bad} 处需要注意'}")
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--chain", default="obj", choices=sorted(CHAINS),
+                    help="obj=物体链(Qwen+SAM3+WildDet3D, 和 outdoor 同一套脚本); "
+                         "lm=SpatialLM 链(点云直接出布局)。两条链逻辑完全不同, 产物不通用")
+    ap.add_argument("--scene", default="cyberpunk")
+    ap.add_argument("--run",   default="r1")
+    ap.add_argument("--from",  dest="a", default=None)
+    ap.add_argument("--to",    dest="b", default=None)
+    ap.add_argument("--only",  default=None, help="逗号分隔")
+    ap.add_argument("-n", "--dry-run", action="store_true")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--tag-only", action="store_true",
+                    help="配合 --dump-cfg: 只打 tag。驱动别自己抄 tag 表 —— 抄一份就会漂移")
+    ap.add_argument("--dump-cfg", action="store_true",
+                    help="把解析后的配置打成 JSON。给人工闸用 —— 闸要知道 SOLO/EXCLUDE\n                          才能把逐实例候选也摆出来, 而那些值只有这里算得出来。")
+    ap.add_argument("--check", action="store_true", help="不跑, 只看产物在不在/有没有过期")
+    g = ap.parse_args()
+
+    # 两条链共用这一个驱动, 但步骤表/产物表/依赖表各是各的。选好之后塞回模块全局,
+    # do_check 那些函数就不用each 都带一个参数。
+    global STEPS, DEFAULT_END, ARTIFACTS, DEPS
+    STEPS, DEFAULT_END, ARTIFACTS, DEPS = CHAINS[g.chain]
+
+    keys = [s[0] for s in STEPS]
+    if g.dump_cfg:
+        _c = Ctx(g.scene, g.run)
+        print(_c.tag if g.tag_only else json.dumps(_c.cfg, ensure_ascii=False))
+        return
+    if g.list:
+        print(f"[{g.chain} 链] 步骤 (默认跑到 {DEFAULT_END}):\n")
+        for k, e, d, _ in STEPS:
+            print(f"  {k:12s} [{e:10s}] {d}" + ("      <- 默认终点(闸门)" if k == DEFAULT_END else ""))
+        return
+    for x in filter(None, [g.a, g.b] + (g.only.split(",") if g.only else [])):
+        if x not in keys: raise SystemExit(f"没有这个步骤: {x}\n可选: {', '.join(keys)}")
+
+    if g.only:
+        sel = [s for s in STEPS if s[0] in g.only.split(",")]
+    else:
+        i = keys.index(g.a) if g.a else 0
+        j = keys.index(g.b) if g.b else keys.index(DEFAULT_END)
+        sel = STEPS[i:j+1]
+
+    c = Ctx(g.scene, g.run)
+    if g.check: return do_check(c)
+    os.makedirs(c.LOG, exist_ok=True)
+    print(f"链   {g.chain}  ({'物体链: Qwen+SAM3+WildDet3D, 和 outdoor 同一套脚本' if g.chain=='obj' else 'SpatialLM 链: 点云直接出布局'})")
+    print(f"场景 {c.scene}  轮次 {c.run}")
+    # 这里只是打印。没有视频但帧已经放好的场景(ithor312 这种直接给图片的)不该在这一行就硬停 ——
+    # 真正要读视频的只有 s_frames, 而它见到 frames/0000.jpg 就跳过。
+    if glob.glob(f"{c.FR}/0000.jpg"):
+        _v = sorted(glob.glob(f"{c.SRC}/*.mp4") + glob.glob(f"{c.SRC}/*.mov"))
+        print(f"视频 {_v[0] if _v else '(无, 直接用已放好的帧 ' + c.FR + ')'}")
+    else:
+        print(f"视频 {c.VID}")
+    print(f"结果 {c.R1}")
+    print(f"步骤 {' -> '.join(s[0] for s in sel)}" + ("   [干跑]" if g.dry_run else "") + "\n")
+    # 吃显存的步骤, 两条链的名字并在一起(同名的 da3/gen 本来两条链都吃显存)。
+    # 和 outdoor 的 GPU_STEPS 是同一个作用: 进这些步骤之前先去排队拿锁。
+    # ★ vlm_sizes / floor / shell 以前不在任何"等 GPU"的通道里, 这次一并补进来:
+    #   vlm_sizes 跑 Qwen3-VL(outdoor 早就把它算作 GPU 步骤了), floor 跑 LaMa,
+    #   shell 内部会调 o_walls —— 那里有 wait_gpu 但没有锁, 挡不住另一条流水线。
+    GPU_STEPS = {"vlm", "vlm_sizes", "da3", "track", "verify", "gen", "solo",
+                 "detect", "recall_mask", "recall_gen", "shell",   # 物体链
+                 "lm", "mask", "floor"}                            # SpatialLM 链
+    for k, e, d, fn in sel:
+        t = time.time()
+        _cm.CUR_STEP = k               # sh() 靠它往步骤日志打 "== <步骤> <时间戳>" 分隔线
+        print(f"== {k}  [{e}]  {d}", flush=True)
+        t_run, ok = t, "失败"
+        try:
+            if k in GPU_STEPS and not g.dry_run:
+                with GpuLock():
+                    t_run = time.time()      # 排队等锁的时间单独记, 不算进这一步的耗时
+                    fn(c, g.dry_run)
+            else:
+                fn(c, g.dry_run)
+            ok = "ok"
+        finally:
+            if not g.dry_run: _timing(c, k, e, t, t_run, ok)
+        if not g.dry_run: open(stamp_path(c, k), "w").write(time.strftime("%F %T"))
+        print(f"   {time.time()-t:.1f}s\n", flush=True)
+    print("[全部完成]")
+
+if __name__ == "__main__":
+    main()

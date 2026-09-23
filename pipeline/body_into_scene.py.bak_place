@@ -1,0 +1,396 @@
+#!/usr/bin/env python
+"""把 SAM 3D Body 出的逐帧人体网格放进重建好的场景里, 出一个会动的 glb。
+
+  SAM 3 跟踪 + SAM 3D Body  ->  每人每帧一个网格(相机系, 真米)
+  重建流水线                ->  每帧相机在世界里的位置和朝向
+  这个脚本                  ->  把前者摆进后者的世界, 打包成带动画的 glb
+
+★ 为什么需要它: SAM 3D Body 只会说"这个人在**我镜头前方**偏右 3.8 米、远 10.8 米",
+  它不知道镜头本身在哪、朝哪、这一帧和下一帧镜头动了多少。所以它的产物只能贴回原片,
+  拿不到"这个人在这条街上的哪个位置"。缺的那块正是重建流水线有的。
+
+★ 顺带修一个现在就错的东西: 量盒子那步假设物体静止, 把一个人走过的一整条路合并成
+  一个盒子。pedestrian 实测 14 个 person 里有 11.78x1.83x3.26m 的"人";
+  realstreet 4 个 person 没一个尺寸对。所以走动的人**本来就不该**走静态物体那条路。
+
+用法(不碰流水线, 独立跑):
+  python body_into_scene.py --r1 <场景结果目录> --body <body4d轮次目录> [--out <输出目录>]
+  python body_into_scene.py --r1 ~/sam3d/data/outdoor/result/pedestrian/r2sim_vggt \
+                            --body ~/sam3d/sam-body4d/outputs/pedestrian/b1 --render
+
+坐标系(每一步都踩过坑, 别凭印象改):
+  SAM 3D Body 的 ply   x右 y上 z朝后(OpenGL/pyrender 那套, 实测帧中心 z 是负的)
+  cameras.json         OpenCV: x右 y下 z朝前
+  07_scene_phy.glb     assemble_scene 末尾乘过 export_T(UP), 真实的天在 +y
+  -> 人要落到同一个系里, 就得走 (x,-y,-z) -> c2w -> export_T(UP), 一步都不能少。
+
+sam3d 环境(trimesh + pygltflib + cv2 + numpy)。纯 CPU。
+"""
+import argparse, json, os, subprocess, sys
+import numpy as np
+import trimesh
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.expanduser("~/sam3d/data/outdoor/scripts"))
+from _common import load_frame_map
+from world_frame import load_up, export_T
+
+# 身高的合理区间。落在外面说明场景尺度是坏的 —— 不是把人缩放一下就能糊过去的:
+# 人是绝对米制的, 错的是场景。office 那种相机离地 0.23m 的场景会在这里被挡住。
+H_MIN, H_MAX = 1.40, 2.00
+
+
+# ------------------------------------------------------------------ 读
+def load_body(body_dir):
+    """读 body4d 一轮的产物。返回 (每人每帧的顶点, faces, body帧号->原视频帧号)。
+
+    ★ 帧号映射读 00_frames/frames.json 的 kept_indices, **不自己算公式**。
+      算公式在另一条链上必错(室内抽帧步长是 3.6, 不是整数), 而且错得很隐蔽。"""
+    meta = json.load(open(f"{body_dir}/00_frames/frames.json"))
+    kept = meta["kept_indices"]
+    mesh_root = None
+    for d in ("04_mesh_occ1", "04_mesh_occ0"):          # 开了补全的优先
+        if os.path.isdir(f"{body_dir}/{d}/mesh_4d_individual"):
+            mesh_root = f"{body_dir}/{d}/mesh_4d_individual"; break
+    if not mesh_root:
+        raise SystemExit(f"[失败] {body_dir} 下没有 mesh_4d_individual, 先跑 body4d_pipeline 的 mesh 那步")
+    people, faces = {}, None
+    for pid in sorted(os.listdir(mesh_root), key=lambda x: int(x) if x.isdigit() else 1 << 30):
+        d = f"{mesh_root}/{pid}"
+        if not os.path.isdir(d):
+            continue
+        fr = {}
+        for f in sorted(os.listdir(d)):
+            if not f.endswith(".ply"):
+                continue
+            m = trimesh.load(f"{d}/{f}", process=False)
+            bi = int(os.path.splitext(f)[0])
+            fr[bi] = np.asarray(m.vertices, np.float32)
+            if faces is None:
+                faces = np.asarray(m.faces, np.uint32)
+        if fr:
+            people[pid] = fr
+    if not people:
+        raise SystemExit(f"[失败] {mesh_root} 底下一个 ply 都没有")
+    return people, faces, kept
+
+
+def load_scene(r1):
+    """读场景这一半: 相机、天、帧号映射。"""
+    da3 = f"{r1}/02_da3" if os.path.isdir(f"{r1}/02_da3") else f"{r1}/02_DA3点云"
+    cams = json.load(open(f"{da3}/cameras.json"))["cameras"]
+    UP, GH, _ = load_up(da3, "人体入场")
+    fmap = load_frame_map(da3)                      # {帧文件名: 原视频帧号}
+    vid2key = {v: k for k, v in fmap.items()}       # 反过来: 原视频帧号 -> 相机的键
+    return da3, cams, np.asarray(UP, float), float(GH), vid2key
+
+
+# ------------------------------------------------------------------ 摆
+# SAM 3D Body 的 ply 是 y朝上 z朝后, cameras.json 是 OpenCV 的 y朝下 z朝前
+GL2CV = np.diag([1.0, -1.0, -1.0])
+
+
+def place(people, cams, vid2key, kept):
+    """每人每帧: 相机系 -> 场景世界系。返回 {pid: {视频帧号: 世界坐标顶点}}。
+
+    没有对应相机的帧直接丢 —— body4d 的时间范围和 da3 用的帧不一定重合
+    (pedestrian: body4d 覆盖视频前 176 帧, da3 用了 0~268 里的 180 帧)。"""
+    out, miss = {}, 0
+    for pid, frames in people.items():
+        got = {}
+        for bi, V in frames.items():
+            if bi >= len(kept):
+                miss += 1; continue
+            vf = kept[bi]
+            key = vid2key.get(vf)
+            if key is None or key not in cams:
+                miss += 1; continue
+            c2w = np.linalg.inv(np.array(cams[key]["extrinsic_w2c_4x4"], float))
+            got[vf] = (V @ GL2CV) @ c2w[:3, :3].T + c2w[:3, 3]
+        if got:
+            out[pid] = got
+    return out, miss
+
+
+def measure(world, UP, GH):
+    """每个人的体检: 身高、脚离地、帧间位移。这是唯一能判断"摆对了没有"的自查。"""
+    rows = {}
+    for pid, fr in sorted(world.items()):
+        vfs = sorted(fr)
+        h = [fr[v] @ UP for v in vfs]
+        tall = np.array([float(x.max() - x.min()) for x in h])
+        foot = np.array([float(x.min() - GH) for x in h])
+        C = np.array([fr[v].mean(0) for v in vfs])
+        step = np.linalg.norm(np.diff(C, axis=0), axis=1) if len(C) > 1 else np.zeros(1)
+        rows[pid] = dict(帧数=len(vfs), 视频帧=[int(vfs[0]), int(vfs[-1])],
+                         身高=round(float(np.median(tall)), 3),
+                         身高抖动=round(float(tall.std()), 3),
+                         脚离地=round(float(np.median(foot)), 3),
+                         脚离地范围=[round(float(foot.min()), 3), round(float(foot.max()), 3)],
+                         帧间位移=round(float(np.median(step)), 3),
+                         帧间位移最大=round(float(step.max()), 3))
+    return rows
+
+
+def snap_ground(world, rows, UP):
+    """落地: 每人减掉自己那个**固定**的脚离地偏移。
+
+    ★ 为什么是减一个常数而不是逐帧贴地: 实测每个人的偏移在几帧之内只抖几厘米
+      (pedestrian 人3: +0.28~+0.52m), 是一个系统性的常数, 不是噪声。
+      逐帧贴地会把"走路时脚本来就离地"这件事也抹掉, 人会变成滑行。"""
+    for pid, fr in world.items():
+        d = rows[pid]["脚离地"] * UP
+        for v in fr:
+            fr[v] = fr[v] - d
+    return world
+
+
+# ------------------------------------------------------------------ 去重
+def dedup_static(r1, world, UP, thresh=1.5):
+    """静态 person 实例 vs 4D 轨迹。返回 (要摘掉的 obj_id, 没对上的).
+
+    ★ 规则: PERSON 走 4D 时**所有** person 实例都摘掉, 然后把"没有任何 4D 轨迹经过"
+      的那些单独列出来报给人看。留重影是把坏数据藏起来 —— 而那些静态盒子本来就多半是
+      坏的(走动的人被量成拖影), 没对上更可能说明 4D 跟踪漏了人, 那是需要知道的信息。"""
+    p = f"{r1}/06_all_boxes.json"
+    if not os.path.exists(p):
+        return [], []
+    boxes = json.load(open(p))
+    persons = [b for w in boxes if w.strip().lower() in ("person", "pedestrian", "people")
+               for b in boxes[w]]
+    if not persons:
+        return [], []
+    traj = np.concatenate([np.array([fr[v].mean(0) for v in sorted(fr)])
+                           for fr in world.values()]) if world else np.zeros((0, 3))
+    drop, unmatched = [], []
+    for b in persons:
+        c = np.array(b["中心"], float)
+        d = float(np.linalg.norm(traj - c, axis=1).min()) if len(traj) else 1e9
+        drop.append(b["obj_id"])
+        if d > thresh:
+            unmatched.append(dict(obj_id=b["obj_id"], 尺寸=[round(x, 2) for x in b["尺寸"]],
+                                  离最近的4D轨迹=round(d, 2)))
+    return drop, unmatched
+
+
+# ------------------------------------------------------------------ 打包
+def build_glb(scene_glb, world, faces, FLIP, out, fps, drop_ids):
+    """场景 + 顶点动画的人 -> 一个 glb。
+
+    ★ 为什么不用 trimesh 导: trimesh 写不了 glTF 动画。所以先用 trimesh 把场景部分
+      (摘掉静态 person 之后)导成 glb, 再用 pygltflib 往里追加带 morph target 的人。
+    ★ 为什么是 morph target 而不是骨骼: SAM 3D Body 每帧的拓扑完全相同(18439 顶点、
+      同一套面), 所以每帧就是一组顶点位移。骨骼要改上游存关节参数 + 取蒙皮权重,
+      这一版先不做(接口留着, 见 devlog)。代价是动作烘死了、文件按帧线性增长。
+    """
+    import pygltflib as gl
+    from pygltflib import BufferFormat
+
+    # ★ 必须**精确**匹配, 不能用 startswith: "person_1" 的前缀同时命中 person_1 /
+    #   person_10 / person_12 / person_14。这次 drop_ids 恰好是全集所以没咬到人,
+    #   但只要哪天改成"只摘一部分", 前缀匹配就会连坐删掉三个不该删的。
+    want = {f"{w}_{i}" for i in drop_ids for w in ("person", "pedestrian")}
+    sc = trimesh.load(scene_glb)
+    keep = trimesh.Scene()
+    dropped = []
+    for node in sc.graph.nodes_geometry:
+        base = node.rsplit(".", 1)[0]          # trimesh 重名时会加 .1 后缀
+        if base in want or node in want:
+            dropped.append(node); continue
+        T, g = sc.graph[node]
+        m = sc.geometry[g].copy(); m.apply_transform(T)
+        keep.add_geometry(m, node_name=node)
+    # ★ 这份"摘掉人之后的静态场景"要留在盘上: 验收图必须渲它, 不能渲原来的
+    #   07_scene_phy.glb —— 那里面还留着旧的静态人形, 渲出来是"新人+旧人同时在场",
+    #   而且旧人正好填在 4D 覆盖不到的位置, 看着"人都在", 会**高估**效果。
+    #   第一版就是这么渲的, 图比真实情况好看。
+    tmp = os.path.join(os.path.dirname(out), "09_scene_nopeople.glb")
+    keep.export(tmp)
+
+    g = gl.GLTF2().load(tmp)
+    g.convert_buffers(BufferFormat.BINARYBLOB)
+    blob = bytearray(g.binary_blob())
+
+    def add_acc(arr, comp_type, acc_type, target=None, minmax=False):
+        """往 blob 里追加一段数据, 返回 accessor 下标。"""
+        nonlocal blob
+        data = np.ascontiguousarray(arr).tobytes()
+        while len(blob) % 4:                       # glTF 要求 4 字节对齐
+            blob += b"\x00"
+        off = len(blob); blob += data
+        g.bufferViews.append(gl.BufferView(buffer=0, byteOffset=off, byteLength=len(data),
+                                           target=target))
+        a = gl.Accessor(bufferView=len(g.bufferViews) - 1, componentType=comp_type,
+                        count=len(arr), type=acc_type)
+        if minmax:
+            # ★ glTF 规定 min/max 是**数组**, 每个分量一个值。一维(SCALAR)的 .min(0)
+            #   返回的是标量, 直接 tolist() 写进去就是个裸 float —— 文件能写出来,
+            #   但任何严格一点的读取器都会在这里崩(pygltflib 报 "'float' object is not iterable")。
+            #   np.atleast_1d 兜住这一层。
+            a.min = np.atleast_1d(np.asarray(arr).min(0)).tolist()
+            a.max = np.atleast_1d(np.asarray(arr).max(0)).tolist()
+        g.accessors.append(a)
+        return len(g.accessors) - 1
+
+    FACE = 5125   # UNSIGNED_INT
+    FLOAT = 5126
+    idx_acc = add_acc(faces.astype(np.uint32).ravel(), FACE, "SCALAR", target=34963)
+    anim = gl.Animation(name="walk", samplers=[], channels=[])
+    n_people = 0
+    for pid, fr in sorted(world.items()):
+        vfs = sorted(fr)
+        V = [np.asarray(fr[v] @ FLIP[:3, :3].T + FLIP[:3, 3], np.float32) for v in vfs]
+        base = V[0]
+        pos_acc = add_acc(base, FLOAT, "VEC3", target=34962, minmax=True)
+        targets, t_accs = [], []
+        for v in V:                                 # morph target 存的是相对 base 的位移
+            t_accs.append(add_acc(np.asarray(v - base, np.float32), FLOAT, "VEC3",
+                                  target=34962, minmax=True))
+            targets.append({"POSITION": t_accs[-1]})
+        prim = gl.Primitive(attributes=gl.Attributes(POSITION=pos_acc), indices=idx_acc,
+                            targets=targets)
+        g.meshes.append(gl.Mesh(name=f"person_{pid}", primitives=[prim],
+                                weights=[0.0] * len(targets)))
+        g.nodes.append(gl.Node(name=f"person_{pid}", mesh=len(g.meshes) - 1))
+        node_i = len(g.nodes) - 1
+        g.scenes[g.scene].nodes.append(node_i)
+        # 时间轴用**原视频帧号 / fps**, 不是 body4d 自己的序号 —— 这样几个人、
+        # 以及以后的配音字幕, 都落在同一根时间轴上
+        t = np.asarray([v / fps for v in vfs], np.float32)
+        w = np.zeros((len(vfs), len(targets)), np.float32)
+        for i in range(len(vfs)):
+            w[i, i] = 1.0
+        ta = add_acc(t, FLOAT, "SCALAR", minmax=True)
+        wa = add_acc(w.ravel(), FLOAT, "SCALAR")
+        # ★ LINEAR 不是 STEP: 权重是 one-hot 的, LINEAR 会在相邻两帧之间把两组姿势
+        #   线性混合 —— 这正是标准的顶点动画插值。STEP 等于幻灯片, 7.5fps 下一顿一顿。
+        anim.samplers.append(gl.AnimationSampler(input=ta, output=wa, interpolation="LINEAR"))
+        anim.channels.append(gl.AnimationChannel(
+            sampler=len(anim.samplers) - 1,
+            target=gl.AnimationChannelTarget(node=node_i, path="weights")))
+        n_people += 1
+    g.animations.append(anim)
+    g.buffers[0].byteLength = len(blob)
+    g.set_binary_blob(bytes(blob))
+    g.convert_buffers(BufferFormat.BINARYBLOB)
+    g.save(out)
+    return n_people, dropped, tmp
+
+
+def dump_frame_glb(world, faces, FLIP, vf, path):
+    """某一帧的人单独导一个静态 glb, 给渲染回图用(渲染器只会渲静止姿势)。"""
+    sc = trimesh.Scene()
+    n = 0
+    for pid, fr in sorted(world.items()):
+        if vf not in fr:
+            continue
+        V = fr[vf] @ FLIP[:3, :3].T + FLIP[:3, 3]
+        sc.add_geometry(trimesh.Trimesh(vertices=V, faces=faces, process=False),
+                        node_name=f"person4d_{pid}")
+        n += 1
+    if n:
+        sc.export(path)
+    return n
+
+
+# ------------------------------------------------------------------ main
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--r1", required=True, help="场景结果目录(底下有 02_da3/ 和 07_scene_phy.glb)")
+    ap.add_argument("--body", required=True, help="body4d 的一轮, 如 sam-body4d/outputs/pedestrian/b1")
+    ap.add_argument("--scene-glb", default="07_scene_phy.glb")
+    ap.add_argument("--out", default="09_scene_4d.glb")
+    ap.add_argument("--render", action="store_true", help="顺便出渲染回图(调 render_back.py)")
+    ap.add_argument("--render-frames", type=int, default=4)
+    ap.add_argument("--fr", default=None, help="原始帧目录, --render 时要")
+    ap.add_argument("--no-snap", action="store_true", help="不做落地, 看原始偏移")
+    a = ap.parse_args()
+
+    print("== 读 ==")
+    people, faces, kept = load_body(a.body)
+    da3, cams, UP, GH, vid2key = load_scene(a.r1)
+    fps = json.load(open(f"{a.body}/00_frames/frames.json"))["src_fps"]
+    nv = len(next(iter(next(iter(people.values())).values())))
+    print(f"  人体 {len(people)} 人, 每人 {[len(v) for v in people.values()]} 帧, 每帧 {nv} 顶点")
+    print(f"  场景 {len(cams)} 个相机, 天 {np.round(UP,3)}, 地面高 {GH:.2f}m, 视频 {fps:.2f}fps")
+
+    print("== 摆 ==")
+    world, miss = place(people, cams, vid2key, kept)
+    if not world:
+        raise SystemExit("[失败] 人体的帧和场景的相机一帧都对不上 —— 检查是不是同一段素材")
+    rows = measure(world, UP, GH)
+    for pid, r in rows.items():
+        print(f"  人 {pid}: {r['帧数']:3d} 帧(视频 {r['视频帧'][0]}~{r['视频帧'][1]})  "
+              f"身高 {r['身高']:.2f}m ±{r['身高抖动']:.2f}  "
+              f"脚离地 {r['脚离地']:+.2f}m {r['脚离地范围']}  "
+              f"帧间位移 {r['帧间位移']:.2f}m(最大 {r['帧间位移最大']:.2f})")
+    if miss:
+        print(f"  (丢掉 {miss} 帧: 人体有、场景没有对应相机)")
+
+    # ★ 尺度自检。不是把人缩放一下就能糊过去 —— 人是绝对米制的, 错的是场景。
+    tall = np.array([r["身高"] for r in rows.values()])
+    bad = [(p, r["身高"]) for p, r in rows.items() if not H_MIN <= r["身高"] <= H_MAX]
+    if bad:
+        k = 1.70 / float(np.median(tall))
+        raise SystemExit(
+            f"[失败] 尺度自检没过: 身高 {[f'{h:.2f}' for _, h in bad]}m 落在 {H_MIN}~{H_MAX} 之外。\n"
+            f"        人是绝对米制的, 所以错的是场景 —— 它大约差 {k:.2f} 倍"
+            f"(按 1.70m 反推)。先把 world_scale 那步跑对再来, 不要把人硬塞进去。")
+    print(f"  尺度自检过: 身高中位 {np.median(tall):.2f}m, 人 = 场景的独立尺子, "
+          f"两边一致说明场景的米是真的")
+
+    if not a.no_snap:
+        offs = [f"{r['脚离地']:+.2f}" for r in rows.values()]
+        world = snap_ground(world, rows, UP)
+        print(f"  落地: 每人减掉自己那个固定偏移 {offs}")
+
+    print("== 去重 ==")
+    drop, unmatched = dedup_static(a.r1, world, UP)
+    print(f"  静态 person 实例 {len(drop)} 个全部摘掉: {drop}")
+    if unmatched:
+        print(f"  ★ 其中 {len(unmatched)} 个没有任何 4D 轨迹经过 —— 可能是 4D 漏跟了人, 也可能本来就是误检:")
+        for u in unmatched:
+            print(f"      obj {u['obj_id']}  尺寸 {u['尺寸']}  离最近轨迹 {u['离最近的4D轨迹']}m")
+
+    print("== 打包 ==")
+    FLIP = export_T(UP)
+    out = f"{a.r1}/{a.out}"
+    n, dropped, static_glb = build_glb(f"{a.r1}/{a.scene_glb}", world, faces, FLIP, out, fps, drop)
+    mb = os.path.getsize(out) / 1e6
+    # ★ 两个数不是一回事, 分开报: 盒子表里有 N 个 person, 但其中一部分在 assemble 那步
+    #   就被守卫挡掉了、根本没进过场景。混着说会让人以为场景里原来有 N 个人。
+    print(f"  {out}  {n} 个人的动画, {mb:.1f} MB")
+    print(f"  盒子表里 person {len(drop)} 个, 其中真正进过场景的 {len(dropped)} 个, 已摘: {dropped}")
+    print(f"  摘人之后的静态场景 -> {os.path.basename(static_glb)} (验收图渲的是它)")
+
+    rep = dict(场景=a.r1, 人体=a.body, 视频fps=fps, 人=rows,
+               摘掉的静态person=drop, 没对上4D的=unmatched,
+               glb=os.path.basename(out), 大小MB=round(mb, 1))
+    json.dump(rep, open(f"{a.r1}/09_body4d_report.json", "w"), ensure_ascii=False, indent=1)
+    print(f"  报告 {a.r1}/09_body4d_report.json")
+
+    if a.render:
+        if not a.fr:
+            raise SystemExit("[失败] --render 要给 --fr 原始帧目录")
+        print("== 渲染回图 ==")
+        allvf = sorted({v for fr in world.values() for v in fr})
+        pick = [allvf[int(round(i * (len(allvf) - 1) / max(1, a.render_frames - 1)))]
+                for i in range(a.render_frames)]
+        for vf in sorted(set(pick)):
+            gp = f"{a.r1}/09_people_f{vf:04d}.glb"
+            if not dump_frame_glb(world, faces, FLIP, vf, gp):
+                continue
+            # ★ 渲 09_scene_nopeople.glb, **不是** 07_scene_phy.glb, 理由见 build_glb。
+            env = dict(os.environ, R1=a.r1, FR=a.fr,
+                       SCENE=f"{os.path.basename(static_glb)},{os.path.basename(gp)}",
+                       RBOUT=f"09_render_4d_f{vf:04d}.jpg", FRAMES=str(vf))
+            r = subprocess.run([sys.executable,
+                                os.path.expanduser("~/sam3d/data/outdoor/scripts/render_back.py")],
+                               env=env, capture_output=True, text=True)
+            print(f"  帧 {vf:04d} -> 09_render_4d_f{vf:04d}.jpg"
+                  + ("" if r.returncode == 0 else f"   ★失败: {r.stderr.strip().splitlines()[-1:]}"))
+
+
+if __name__ == "__main__":
+    main()

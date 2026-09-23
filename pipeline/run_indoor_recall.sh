@@ -26,7 +26,7 @@ TAG=cyb_o1
 L=$R1/logs; mkdir -p "$L"
 P3=~/miniforge3/envs/sam3;  P3D=~/miniforge3/envs/sam3d;  PWD3=~/miniforge3/envs/wilddet
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_HOME=/usr/local/cuda-12.8
-export TORCH_CUDA_ARCH_LIST=12.0
+export TORCH_CUDA_ARCH_LIST=8.6
 
 export DET_STRIDE=3 DET_SCORE=0.35
 export MIN_VIEWS=3 DIST_F=0.35 MATCH_F=0.7

@@ -1,0 +1,236 @@
+#!/usr/bin/env python
+"""室内外两条流水线共用的驱动层。
+
+★ 为什么有这个文件(2026-09-20)
+  算法脚本早就共用了 —— indoor_pipeline.py 的 SCRIPTS 直接指向 data/outdoor/scripts,
+  一边改另一边立刻跟上。但**驱动层**一直是复制粘贴的: _timing / resolve_cfg /
+  stamp_path 三个函数两边逐字相同, GpuLock 只差一句提示文字, envcmd 只差个默认值。
+  复制粘贴的东西一定会漂移, 而且漂移的时候不报错 —— 显卡那两套"等 GPU"的机制
+  就是这么分叉的(一边 flock 一边查 nvidia-smi, 结果谁也拦不住谁, 双双 OOM)。
+  所以: 不该分歧的地方一律搬到这里, 两边 import。
+
+  留在各自文件里的是**真该不同**的那些: Ctx(路径不同)、s_frames/s_da3/s_gen/s_render
+  (室内外做的事就是不一样)、do_check/main(室内多一个 --chain)。
+
+★ 这个文件不依赖任何一条流水线, 只用标准库。别往里加场景相关的东西。
+"""
+import fcntl, json, os, shlex, subprocess, time
+
+
+# ==================================================================== GPU 排队
+# ★ 两条流水线(以及 body4d 那条)共用同一把锁。锁文件名是字面值, 一个字都不能改 ——
+#   改了就等于又分成两个队, 而分成两个队的后果见文件头。
+LOCK = "/tmp/outdoor_pipeline_gpu.lock"
+
+
+class GpuLock:
+    """吃显存的步骤串行执行。不是调参数能解决的问题: 单份 SAM3D 驻留 20GB 出头,
+    32G 卡装不下两份。之前 beach 和 carpark 并行跑 gen, 两边同时被 CUDA OOM 杀掉,
+    而且日志一停就再没有新内容, 靠"看日志有没有更新"的监控反而永远静默。
+
+    和 wait_gpu() 是两层, 两层都要:
+      锁       管"我们自己的几条流水线之间" —— 对方即使还没吃上显存也得排队,
+               因为它可能正在加载模型, 这时候查显存是看不出来的
+      wait_gpu 管"流水线之外的第三方进程" —— 那些进程不会来拿这把锁, 只能靠查显存看见
+    """
+    def __enter__(self):
+        self.f = open(LOCK, "a+")
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("    [等待] 另一条流水线正在占用 GPU, 排队中...", flush=True)
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
+
+
+def wait_gpu(need_mb, dry=False, timeout=10800):
+    """等到卡上没有别人的进程、而且余量够了才返回。
+
+    ★ 只看瞬时余量不够: 别人一个实例只跑一分多钟, 空档期能骗过检查, 然后在我们跑到
+      一半时又把显存吃回去(实测被这么坑过, DA3 前向到 dinov2 attention 才炸)。
+      所以要等到**没有别的进程占着卡**。
+    ★ 只等不杀 —— 别人的活不归我们管。
+    """
+    if dry:
+        return
+    me, t0 = os.getpid(), time.time()
+    while True:
+        q = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True)
+        others = 0
+        for line in q.stdout.strip().splitlines():
+            if not line.strip():
+                continue
+            pid, mb = [int(x) for x in line.split(",")]
+            if pid != me and mb > 2000:
+                others += mb
+        g = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True)
+        used, total = [int(x) for x in g.stdout.strip().splitlines()[0].split(",")]
+        if not others and total - used >= need_mb:
+            return
+        if time.time() - t0 > timeout:
+            raise SystemExit(f"[失败] 排了 {timeout/60:.0f}min 队还是轮不上 "
+                             f"(需要 {need_mb}MB, 别人占着 {others}MB)")
+        print(f"    别的活占着 {others}MB, 空闲 {total-used}MB / 需要 {need_mb}MB, "
+              f"等 30s (已等 {(time.time()-t0)/60:.0f}min)", flush=True)
+        time.sleep(30)
+
+
+# ==================================================================== 跑命令
+def sh(cmd, log=None, dry=False, cwd=None, sep=None, env=None):
+    """跑一条命令, 打印出来的那行要能直接粘去复现。
+
+    sep: 写进日志的分隔条(室外每步一条, 便于在一个大日志里定位)。
+    env: 额外的环境变量(室内要给 CUDA_HOME 那一套; 室外把环境变量写在命令行里, 不用这个)。
+         给了 env 的时候也会打印在命令前面, 保证"打印的 == 实际跑的"。
+    """
+    line = cmd if isinstance(cmd, str) else " ".join(shlex.quote(str(x)) for x in cmd)
+    pre = " ".join(f"{k}={v}" for k, v in (env or {}).items())
+    print(f"    $ {pre + ' ' if pre else ''}{line}" +
+          (f"   > {os.path.basename(log)}" if log else ""), flush=True)
+    if dry:
+        return 0
+    if log:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        if sep:
+            with open(log, "a") as f:
+                f.write(sep)
+    run_env = None
+    if env:
+        run_env = dict(os.environ); run_env.update(env)
+        if "CUDA_HOME" in env:
+            run_env["PATH"] = env["CUDA_HOME"] + "/bin:" + run_env.get("PATH", "")
+    with (open(log, "a") if log else open(os.devnull, "w")) as f:
+        out = f if log else None
+        r = subprocess.run(cmd, shell=isinstance(cmd, str), cwd=cwd, env=run_env,
+                           stdout=out or None, stderr=subprocess.STDOUT if out else None)
+    if r.returncode:
+        raise SystemExit(f"[失败] 退出码 {r.returncode}: {line}")
+    return r.returncode
+
+
+def envcmd(py, script, env=None, args=None):
+    """把环境变量写在命令行最前面, 这样 --dry-run 打印出来的就是能直接粘去跑的命令。
+    data/outdoor/scripts 底下的脚本大多没有 argparse, 只吃环境变量, 所以这个用得很多。"""
+    pre = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in (env or {}).items())
+    # ★ env 为空时不能留下前导空格 —— 打印出来的那行是给人直接粘去跑的, "$  python ..."
+    #   看着像笔误。body4d 原来的写法是对的, 合并时差点把它弄丢。
+    return (pre + " " if pre else "") + f"{shlex.quote(py)} {shlex.quote(script)} " + " ".join(
+        shlex.quote(str(x)) for x in (args or []))
+
+
+# ==================================================================== 配置 / 戳 / 计时
+def resolve_cfg(CFG, SCENES, scene, R1=None, review=None):
+    """生效顺序: CFG 默认值 <- 场景覆盖 <- 人工闸决策 <- 环境变量。
+
+    人工闸排在环境变量之前 —— 临时敲一个环境变量试值, 应该压得过闸的决定;
+    但闸的决定要压得过写死在 SCENES 里的默认, 否则人在闸口做的判断永远轮不上。
+
+    ★ 环境变量那一层只认已经在 CFG 里的键, 所以 CFG 同时也是"可调参数白名单"。
+      写错名字的环境变量会被静默忽略 —— 这是故意的, 否则整个 os.environ 都会灌进来。
+    """
+    cfg = dict(CFG)
+    cfg.update(SCENES.get(scene, {}))
+    if R1 and review is not None:
+        review.apply_to_cfg(cfg, R1)
+    cfg.update({k: v for k, v in os.environ.items() if k in CFG})
+    return cfg
+
+
+def stamp_path(c, key):
+    return f"{c.LOG}/.stamp_{key}"
+
+
+def timing(c, k, env, t0, t_run, status):
+    """每一步的时间开销追加进 logs/timing.tsv(成功失败都记)。
+    列: 步骤 环境 开始 结束 耗时秒 等GPU秒 结果。终端上那行 "12.3s" 滚走就没了, 这份留得住,
+    跑完用 `column -t -s$'\\t' logs/timing.tsv` 看。
+    ★ 为什么失败也记: "跑了 40 分钟才挂"和"一上来就崩"在日志里长得很像, 在这张表里一眼分得开。
+    ★ 为什么等锁的时间单独一列: 不分开的话, 改动到底有没有让这一步变快会被排队时间淹掉。"""
+    p = f"{c.LOG}/timing.tsv"
+    new = not os.path.exists(p)
+    t1 = time.time()
+    with open(p, "a") as f:
+        if new:
+            f.write("步骤\t环境\t开始\t结束\t耗时秒\t等GPU秒\t结果\n")
+        f.write(f"{k}\t{env}\t{time.strftime('%F %T', time.localtime(t0))}\t"
+                f"{time.strftime('%F %T', time.localtime(t1))}\t{t1 - t_run:.1f}\t{t_run - t0:.1f}\t{status}\n")
+
+
+# ==================================================================== 帧号 <-> 原视频
+# ★ 为什么需要这个(2026-09-20)
+#   两条链的 cameras.json 里, 键的含义**不一样**:
+#     室外  键就是原视频帧号, 不等间隔(realstreet: 0000,0002,0003,0005,...,0284)
+#     室内  键是重编号 0000..N-1, 原号另存在 frames_<run>/映射.json (office 步长 3.6, 不是整数)
+#   任何要回到原视频时间轴的模块(人体动画、配音、字幕、和别的视频算法交叉验证)
+#   如果自己从键名解析或者自己算公式, 在另一条链上必错, 而且错得很隐蔽 ——
+#   拿一帧的内容去配另一帧的相机, 表现是"轮廓对、里面的画面错位"。
+#
+#   所以: da3 那一步跑完就在 cameras.json 旁边写一份 frame_map.json, 路径两条链完全一样,
+#   下游一律查它, 谁也不准自己解析键名、不准算公式。
+#
+#   为什么不放在 frames 目录里: 室内的帧目录按轮次分(frames_<run>/), 室外的不分
+#   (dataset/<场景>/frames), 放那儿的话下游还得写 if 室内/else, 正是要消灭的东西。
+#   放在 cameras.json 旁边, 谁拿到 R1 谁就能查, 而且它是由写 cameras.json 的同一步
+#   从 cameras.json 自己的键生成的, 不会漂移。
+FRAME_MAP = "frame_map.json"
+
+
+def _video_fps(video):
+    """读视频的 fps。读不到就返回 None —— 不让它变成硬失败, 下游需要时间的自己判断。"""
+    if not video or not os.path.exists(video):
+        return None
+    try:
+        import cv2
+        cap = cv2.VideoCapture(video)
+        fps = float(cap.get(cv2.CAP_PROP_FPS)); cap.release()
+        return round(fps, 4) if fps and fps > 0 else None
+    except Exception:
+        return None
+
+
+def _orig_index(name, sub):
+    """一个帧文件名 -> 原视频帧号。sub 是 映射.json 的内容(没有就是恒等)。"""
+    i = int(os.path.splitext(os.path.basename(name))[0])
+    return int(sub[str(i)]) if sub and str(i) in sub else i
+
+
+def write_frame_map(da3_dir, frames_dir, video=None, dry=False):
+    """da3 那步跑完调它, 在 cameras.json 旁边写 frame_map.json。
+
+    frames_dir 是这一轮 da3 **实际吃的**那个帧目录 —— 室内两条链吃的不是同一个
+    (SpatialLM 链吃 frames_bright, 是恒等; 物体链吃 frames_<run>, 有映射),
+    光看目录里有没有 映射.json 去猜是靠巧合, 所以由知道答案的调用方传进来。
+    """
+    if dry:
+        return
+    cj = f"{da3_dir}/cameras.json"
+    if not os.path.exists(cj):
+        return
+    names = json.load(open(cj))["images_used"]
+    mp = f"{frames_dir}/映射.json"
+    sub = json.load(open(mp)) if os.path.exists(mp) else None
+    json.dump(dict(video=video, fps=_video_fps(video), frames_dir=frames_dir,
+                   identity=sub is None,
+                   frames={n: _orig_index(n, sub) for n in names}),
+              open(f"{da3_dir}/{FRAME_MAP}", "w"), ensure_ascii=False, indent=1)
+
+
+def load_frame_map(da3_dir):
+    """读 frame_map.json, 返回 {帧文件名: 原视频帧号}。
+
+    ★ 兼容旧轮次: 文件不存在时就地推一份 —— cameras.json 里有 source(当初吃的帧目录),
+      顺着它找 映射.json, 找不到就是恒等。所以 09-20 之前跑的结果也能用, 不用重跑。
+    """
+    p = f"{da3_dir}/{FRAME_MAP}"
+    if os.path.exists(p):
+        return json.load(open(p))["frames"]
+    c = json.load(open(f"{da3_dir}/cameras.json"))
+    src = c.get("source") or ""
+    mp = f"{src}/映射.json"
+    sub = json.load(open(mp)) if src and os.path.exists(mp) else None
+    return {n: _orig_index(n, sub) for n in c["images_used"]}

@@ -396,7 +396,7 @@ class Ctx:
 # custom_interpolate 里 OOM (实测: 报"reserved but unallocated 2.32 GiB")。
 GPUENV = {
     "CUDA_HOME": "/usr/local/cuda-12.8",
-    "TORCH_CUDA_ARCH_LIST": "12.0",
+    "TORCH_CUDA_ARCH_LIST": "8.6",
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
 }
 
