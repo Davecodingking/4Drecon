@@ -1396,11 +1396,16 @@ PAGE = r"""<!doctype html>
  .panel{grid-column:1/-1;background:var(--sheet);padding:14px}
  .panel h3{margin:0 0 12px;font-size:13px;font-weight:700;letter-spacing:-.01em}
  .panel h3 span{color:var(--mute);font-weight:400;margin-left:10px;font-size:12px;letter-spacing:0}
- .insts{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:0;padding-right:1px}
+ .insts{display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:0;padding-right:1px}
  .inst{position:relative;background:var(--sheet);border:1px solid var(--rule);
        margin:0 -1px -1px 0;display:flex;flex-direction:column;min-width:0}
  .inst img{display:block;width:calc(100% - 16px);margin:8px 8px 0;aspect-ratio:1;
            background:var(--plate);object-fit:cover}
+ /* 两张图并排: 左特写(是什么), 右整帧定位(在哪、挨着什么)。定位图点开是原分辨率的大图。 */
+ .inst .pics{display:grid;grid-template-columns:120px 1fr;gap:8px;margin:8px 8px 0;align-items:start}
+ .inst .pics img{width:100%;margin:0}
+ .inst .pics img.loc{aspect-ratio:16/9;object-fit:contain;background:var(--plate)}
+ .inst.flash{box-shadow:inset 0 0 0 3px var(--yellow);z-index:2}
  /* 质量可疑只挂黄徽章, 图保持彩色。★ 原来还降饱和, 但警报是自动规则会误报
     (pedestrian r2 的 car #0 镜头走近面积涨 5 倍, 好图也被变灰), 而且和"被判掉"的灰叉
     撞了同一个视觉通道 —— 人分不清"可疑"和"不进场景"。灰色只留给判掉的。 */
@@ -2592,11 +2597,16 @@ function 展开面板(w){
     // 那个是"这张图信不过"(黄徽章), 这个是"你判了它不进场景"(红框), 两码事。
     el.className = "inst" + (警.length ? " bad" : "") + (是代表 ? " rep" : "")
                  + (不摆 ? " dropped" : "");
+    el.dataset.key = w.词 + ':' + r.oid;      // ?sel= 跳过来时靠它找到这张卡
     // AR 画成小矩形字形 —— 数字要读, 图形一扫就分堆
     const bw = Math.round(Math.min(Math.max(r.ar,0.15),4) * 14), bh = 14;
     el.innerHTML =
-      '<img loading="lazy" src="'+U('/img/inst', 显帧 != null ? {word:w.词,oid:r.oid,frame:显帧,size:120}
-                                                          : {word:w.词,oid:r.oid,size:120})+'">'+
+      (() => { const q = 显帧 != null ? {word:w.词, oid:r.oid, frame:显帧} : {word:w.词, oid:r.oid};
+        return '<div class="pics">'+
+          '<img loading="lazy" src="'+U('/img/inst', {...q, size:120})+'">'+
+          '<a href="'+U('/img/frame', {...q, size:1280})+'" target="_blank" title="Open the full frame">'+
+            '<img class="loc" loading="lazy" src="'+U('/img/frame', {...q, size:520})+'"></a>'+
+        '</div>'; })()+
       (警.length ? '<i class="alarm" title="'+esc(警.join('；'))+'">⚠ '+esc(警[0])+'</i>' : '')+
       (是代表 ? 样徽章(w, 样) : '')+
       '<div class="im">'+
