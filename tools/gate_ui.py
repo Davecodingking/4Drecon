@@ -74,7 +74,28 @@ DEC_COLOR = {"keep": "#5ab45a", "drop": "#f0963c", "drop-word": "#dc3c3c",
 
 
 # ------------------------------------------------------------------ 抠图
-def cutout_rgb(img, m, size):
+def _gamma(img, m):
+    """暗抠图的提亮 gamma。按 **mask 内**像素的灰度中位数 med 定: med >= 110 一点不动(1.0);
+    再暗就把 med 拉到 128 —— g = log(0.5) / log(med/255), 夹在 [0.4, 1.0]。
+    ★ 特写和定位图必须用同一个 g, 两张图亮度才一致。"""
+    b = m > 127
+    if b.sum() < 30:
+        return 1.0
+    med = float(np.median(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)[b]))
+    if med >= 110:
+        return 1.0
+    return float(np.clip(np.log(0.5) / np.log(max(med, 1.0) / 255.0), 0.4, 1.0))
+
+
+def _apply_gamma(img, g):
+    """g < 1 提亮。返回新数组 —— _frame() 缓存里的那份不许改。"""
+    if g >= 0.999:
+        return img
+    lut = (np.clip((np.arange(256) / 255.0) ** g, 0, 1) * 255).astype(np.uint8)
+    return cv2.LUT(img, lut)
+
+
+def cutout_rgb(img, m, size, gamma=True):
     """灰底特写: 只留 mask 里的像素, 裁到外接框再留一圈边, 缩到 size 见方居中。
 
     ★ 逐行抄自 review_gate.py 的 cutout(), 只把"读两个文件"改成"收两个数组" ——
@@ -87,8 +108,9 @@ def cutout_rgb(img, m, size):
     b = m > 127
     if b.sum() < 30:
         return None
+    src = _apply_gamma(img, _gamma(img, m)) if gamma else img
     out = np.full_like(img, 210)                      # 灰底
-    out[b] = img[b]
+    out[b] = src[b]
     v, u = np.nonzero(b)
     pad = int(0.12 * max(u.max() - u.min(), v.max() - v.min())) + 8
     y0, y1 = max(v.min() - pad, 0), min(v.max() + pad, img.shape[0])
@@ -102,6 +124,33 @@ def cutout_rgb(img, m, size):
     oy, ox = (size - c.shape[0]) // 2, (size - c.shape[1]) // 2
     canvas[oy:oy + c.shape[0], ox:ox + c.shape[1]] = c
     return canvas
+
+
+def locate_rgb(img, m, size=420, g=None):
+    """整帧定位图 —— 物体在画面哪儿、挨着什么。mask 外压暗到 0.45, 外接框(留 3px 边)2px 红框,
+    mask 轮廓 1px 红线, 长边缩到 size。红线在**缩完之后**画, 否则 1920 缩到 420 时 2px 线只剩半个像素。
+    g 是提亮 gamma, 和 cutout_rgb 用同一个(None = 自己按 mask 算)。"""
+    if img is None or m is None:
+        return None
+    if m.shape != img.shape[:2]:
+        m = cv2.resize(m, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+    b = m > 127
+    if b.sum() < 30:
+        return None
+    src = _apply_gamma(img, _gamma(img, m) if g is None else g)
+    out = (src * 0.45).astype(np.uint8)
+    out[b] = src[b]
+    s = size / max(out.shape[0], out.shape[1])
+    sm = cv2.resize(out, (max(int(out.shape[1] * s), 1), max(int(out.shape[0] * s), 1)),
+                    interpolation=cv2.INTER_AREA)
+    bs = cv2.resize(b.astype(np.uint8), (sm.shape[1], sm.shape[0]), interpolation=cv2.INTER_NEAREST)
+    v, u = np.nonzero(bs)
+    if len(v):
+        cv2.rectangle(sm, (int(u.min()) - 3, int(v.min()) - 3), (int(u.max()) + 3, int(v.max()) + 3),
+                      (0, 0, 230), 2)
+        cs, _ = cv2.findContours(bs, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(sm, cs, -1, (0, 0, 230), 1)
+    return sm
 
 
 # ------------------------------------------------------------------ 数据
@@ -704,12 +753,8 @@ class Store:
             out += picked
         return out
 
-    def cutout(self, word, oid, frame, size=200):
-        """现场抠一张。先看 my_images 里有没有写好盘的(那是 pick 选中的那张), 没有就从 mask 抠。
-
-        ★ 判据是"盘上有没有这个文件", 不是来源标签 —— 抄的是 review_gate.py 那条注释,
-          它踩过: 人把标签改成"整词复用"之后实例目录并不存在, 整张表变成 mask empty。
-        """
+    def _mask(self, word, oid, frame):
+        """这一帧这个实例的 mask(uint8 0/255), 没有就 None。cutout / locate 共用, 同一帧同一 mask。"""
         z = self._npz(word)
         if not z:
             return None
@@ -718,8 +763,21 @@ class Store:
                if int(r["oid"]) == oid and int(r["frame"]) == frame and r["area"] > 0]
         if not hit:
             return None
-        m = mask_util.decode({"counts": counts[hit[0]], "size": [H, W]}).astype(np.uint8) * 255
-        return cutout_rgb(self._frame(frame), m, size)      # 走 LRU, 不直接 imread
+        return mask_util.decode({"counts": counts[hit[0]], "size": [H, W]}).astype(np.uint8) * 255
+
+    def cutout(self, word, oid, frame, size=200):
+        """现场抠一张。先看 my_images 里有没有写好盘的(那是 pick 选中的那张), 没有就从 mask 抠。
+
+        ★ 判据是"盘上有没有这个文件", 不是来源标签 —— 抄的是 review_gate.py 那条注释,
+          它踩过: 人把标签改成"整词复用"之后实例目录并不存在, 整张表变成 mask empty。
+        """
+        m = self._mask(word, oid, frame)
+        return None if m is None else cutout_rgb(self._frame(frame), m, size)      # 走 LRU, 不直接 imread
+
+    def locate(self, word, oid, frame, size=420):
+        """整帧定位图, 和 cutout 同一帧同一 mask。"""
+        m = self._mask(word, oid, frame)
+        return None if m is None else locate_rgb(self._frame(frame), m, size)
 
     # ================================================================ 闸 3: 尺度
     # ★ 下面这一段是 world_scale.py:110-152 的**逐字搬运**。搬而不是读它的输出, 是因为
@@ -1147,6 +1205,14 @@ def make_handler(store):
                     fr = int(q["frame"]) if q.get("frame") else hit["代表帧"]
                     return self._png(st.cutout(
                         q["word"], hit["oid"], fr, int(q.get("size", "120"))))
+                if u.path == "/img/frame":
+                    # 整帧定位图: 和 /img/inst 同一帧(前端带 frame 就那帧, 否则代表帧)
+                    ins = st.insts(q["word"], st.solo_min_px())
+                    hit = next((r for r in ins if r["oid"] == int(q["oid"])), None)
+                    if not hit:
+                        return self._png(None)
+                    fr = int(q["frame"]) if q.get("frame") else hit["代表帧"]
+                    return self._png(st.locate(q["word"], hit["oid"], fr, int(q.get("size", "420"))))
                 if u.path == "/api/cands":
                     must = ([(int(q["oid"]), int(q["frame"]))]
                             if "oid" in q and "frame" in q else [])
