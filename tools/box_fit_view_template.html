@@ -1,0 +1,688 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  --ground:#F2F4F1; --panel:#FFFFFF; --ink:#1B211E; --muted:#5D6862; --line:#DDE2DE;
+  --hover:#EAEEEB; --sel:#E3EBFA; --accent:#2E6BD6; --frame-box:#D9822B;
+  --ok:#2F8F5B; --warn:#B7791F; --crit:#C2413A; --grid:#C9D0CB; --grid2:#E1E6E2;
+  --view:#E9ECEA; --recall:#7A5AC8; --cam:#8E44EC; --body:#128C7E; --phys:#1E7F4F;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#111512; --panel:#171C19; --ink:#E2E8E4; --muted:#95A19A; --line:#2A322D;
+    --hover:#1F2622; --sel:#1C2A40; --accent:#6B9DF2; --frame-box:#EDA253;
+    --ok:#5CC08A; --warn:#E0B04F; --crit:#EE7A72; --grid:#3A443E; --grid2:#252C28;
+    --view:#0C0F0D; --recall:#B39AF0; --cam:#B78AF5; --body:#3CC7B4; --phys:#4FC98A;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#111512; --panel:#171C19; --ink:#E2E8E4; --muted:#95A19A; --line:#2A322D;
+  --hover:#1F2622; --sel:#1C2A40; --accent:#6B9DF2; --frame-box:#EDA253;
+  --ok:#5CC08A; --warn:#E0B04F; --crit:#EE7A72; --grid:#3A443E; --grid2:#252C28;
+  --view:#0C0F0D; --recall:#B39AF0; --cam:#B78AF5; --body:#3CC7B4; --phys:#4FC98A;
+}
+html,body{height:100%}
+body{background:var(--ground);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.45}
+.app{height:100%;display:grid;grid-template-columns:minmax(300px,380px) 1fr;gap:0}
+.side{background:var(--panel);border-right:1px solid var(--line);overflow-y:auto;padding-block:20px;padding-inline:20px;display:flex;flex-direction:column;gap:18px}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+h1{margin:4px 0 6px;font-size:20px;line-height:1.25;font-weight:600;text-wrap:balance}
+.lede{margin:0;color:var(--muted);max-width:60ch}
+.lede b{color:var(--ink);font-weight:500}
+.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.stat{border:1px solid var(--line);border-radius:6px;padding:8px 10px}
+.stat .v{font-family:var(--mono);font-size:17px;font-variant-numeric:tabular-nums}
+.stat .k{font-size:11px;color:var(--muted);line-height:1.3}
+.group h2{margin:0 0 8px;font-size:11px;font-family:var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:500}
+.toggles{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px}
+.toggles label{display:flex;align-items:center;gap:8px;cursor:pointer;padding:3px 0}
+.sw{width:10px;height:10px;border-radius:2px;flex:none}
+input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px;margin:0}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg button{font:inherit;font-size:13px;border:0;background:transparent;color:var(--ink);padding:5px 12px;cursor:pointer}
+.seg button[aria-pressed="true"]{background:var(--accent);color:#fff}
+.framebar{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
+.framebar input[type=range]{flex:1;min-width:120px;accent-color:var(--accent)}
+.iconbtn{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:6px;padding:4px 10px;cursor:pointer}
+.iconbtn:disabled{opacity:.45;cursor:default}
+.flabel{font-family:var(--mono);font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;min-width:12ch}
+.ramp{height:8px;border-radius:4px;margin-top:6px}
+.rampk{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:3px}
+.list{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.row{display:grid;grid-template-columns:4px 1fr auto;gap:0 10px;align-items:center;padding:8px 10px 8px 0;border-top:1px solid var(--line);cursor:pointer;background:transparent;border-left:0;border-right:0;border-bottom:0;text-align:left;font:inherit;color:inherit;width:100%}
+.row:first-child{border-top:0}
+.row:hover{background:var(--hover)}
+.row[aria-current="true"]{background:var(--sel)}
+.row .stripe{align-self:stretch}
+.row .name{font-weight:500}
+.row .meta{font-family:var(--mono);font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.row .spread{font-family:var(--mono);font-size:13px;font-variant-numeric:tabular-nums;text-align:right}
+.pill{display:inline-block;font-size:10.5px;padding:1px 6px;border-radius:9px;border:1px solid currentColor;margin-left:6px;vertical-align:1px}
+.s-static{color:var(--ok)} .s-walk{color:var(--warn)} .s-split{color:var(--crit)}
+.bg-static{background:var(--ok)} .bg-walk{background:var(--warn)} .bg-split{background:var(--crit)}
+.s-recall{color:var(--recall)} .bg-recall{background:var(--recall)}
+.s-body{color:var(--body)} .bg-body{background:var(--body)}
+.s-phys{color:var(--phys)} .bg-phys{background:var(--phys)}
+.notice{margin-top:10px;padding:9px 11px;border:1px solid var(--line);border-left:3px solid var(--frame-box);border-radius:5px;font-size:13px;background:color-mix(in srgb,var(--frame-box) 7%,transparent)}
+.s-out{color:var(--muted)} .bg-out{background:var(--line)}
+.tip{position:absolute;pointer-events:none;font-family:var(--mono);font-size:12px;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:3px 7px;white-space:nowrap;z-index:2}
+button:disabled{opacity:.45;cursor:default}
+.note{font-size:12px;color:var(--muted);margin:0}
+button:focus-visible,input:focus-visible,.row:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.view{position:relative;min-height:0;background:var(--view)}
+#cv{display:block;width:100%;height:100%}
+.hud{position:absolute;left:14px;top:14px;right:14px;display:flex;justify-content:space-between;align-items:flex-start;gap:10px;pointer-events:none;flex-wrap:wrap}
+.card{pointer-events:auto;background:color-mix(in srgb,var(--panel) 92%,transparent);border:1px solid var(--line);border-radius:6px;padding:10px 12px;max-width:340px}
+.card h3{margin:0 0 6px;font-size:15px;font-weight:600}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;font-size:12.5px}
+.kv dt{color:var(--muted)} .kv dd{margin:0;font-family:var(--mono);font-variant-numeric:tabular-nums}
+.hint{position:absolute;right:14px;bottom:12px;font-size:11.5px;color:var(--muted);background:color-mix(in srgb,var(--panel) 85%,transparent);padding:4px 8px;border-radius:4px}
+@media (max-width:760px){
+  .app{grid-template-columns:1fr;grid-template-rows:auto auto;height:auto}
+  .view{order:-1;height:58vh;min-height:320px}
+  .side{border-right:0;border-top:1px solid var(--line);overflow:visible}
+  .summary{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .hint{display:none}
+}
+</style>
+
+<div class="app">
+  <aside class="side">
+    <div>
+      <div class="eyebrow">__EYEBROW__</div>
+      <h1>Point clouds and fitted boxes</h1>
+      <p class="lede">Each object is measured from its <b>8 frames with the largest mask</b>. Points are colored by frame. The <b style="color:var(--accent)">blue box</b> is what the pipeline fits after merging all 8 frames; <b style="color:var(--frame-box)">orange boxes</b> are fitted to one frame at a time.
+      A static object's per-frame boxes should stack; when they spread out, the object moved, or the depth or the track is wrong.
+      <span id="lede-phys"><b style="color:var(--phys)">Green boxes</b> are where each object ended up after the physics pass — measured off the mesh in the final glb, the one the video is rendered from.</span>
+      <b style="color:var(--recall)">Dashed boxes</b> were recalled by WildDet3D after SAM 3 missed them — no masks, so no points.
+      <span id="lede-body"> <b style="color:var(--body)">People</b> come from SAM 3D Body: one box per video frame, placed exactly as in the animated scene. Drag the <b>timeline</b> to move them; the <b style="color:var(--cam)">camera frustum</b> follows the same frame.</span></p>
+__NOTICE__
+      <p class="note" id="gatelink-wrap" hidden><a id="gatelink" href="/">‹ Back to the gate — this object</a></p>
+    </div>
+
+    <div class="summary" id="summary"></div>
+
+    <div class="group">
+      <h2>Layers</h2>
+      <div class="toggles">
+        <label><input type="checkbox" id="t-box" checked><span class="sw" style="background:var(--accent)"></span>Merged box</label>
+        <label class="physonly"><input type="checkbox" id="t-pbox" checked><span class="sw" style="background:var(--phys)"></span>After physics</label>
+        <label><input type="checkbox" id="t-fbox"><span class="sw" style="background:var(--frame-box)"></span>Per-frame boxes</label>
+        <label><input type="checkbox" id="t-path" checked><span class="sw" style="background:var(--ink)"></span>Centroid path</label>
+        <label><input type="checkbox" id="t-ctx" checked><span class="sw" style="background:#9AA49F"></span>Scene points</label>
+        <label><input type="checkbox" id="t-others" checked><span class="sw" style="background:var(--muted)"></span>Other objects</label>
+        <label><input type="checkbox" id="t-cam" checked><span class="sw" style="background:var(--cam)"></span>Camera path</label>
+        <label><input type="checkbox" id="t-frus"><span class="sw" style="background:var(--cam);opacity:.5"></span>All frustums</label>
+        <label class="bodyonly"><input type="checkbox" id="t-ppl" checked><span class="sw" style="background:var(--body)"></span>People</label>
+        <label class="bodyonly"><input type="checkbox" id="t-ppath" checked><span class="sw" style="background:var(--body);opacity:.6"></span>Person paths</label>
+      </div>
+    </div>
+
+    <div class="group" id="tl-group">
+      <h2>Timeline (video frames)</h2>
+      <div class="framebar" style="margin-top:0">
+        <button class="iconbtn" id="tplay" aria-label="Play timeline">Play</button>
+        <input type="range" id="tslider" min="0" max="0" value="0" aria-label="Video frame">
+        <span class="flabel" id="tlabel">—</span>
+      </div>
+      <p class="note" id="tnote" style="margin-top:6px"></p>
+    </div>
+
+    <div class="group">
+      <h2>Mask frames (selected object)</h2>
+      <div class="seg" role="group" aria-label="Frame mode">
+        <button id="m-all" aria-pressed="true">All 8 frames</button>
+        <button id="m-step" aria-pressed="false">One at a time</button>
+      </div>
+      <div class="framebar">
+        <button class="iconbtn" id="play" disabled aria-label="Play frames">Play</button>
+        <input type="range" id="fslider" min="0" max="7" value="0" disabled aria-label="Frame">
+        <span class="flabel" id="flabel">—</span>
+      </div>
+      <div class="ramp" id="ramp"></div>
+      <div class="rampk"><span>earliest of the 8</span><span>latest</span></div>
+    </div>
+
+    <div class="group">
+      <h2 id="listhead">Objects</h2>
+      <div class="seg runseg" id="scopebar" role="group" aria-label="Which boxes" style="margin-bottom:8px">
+        <button id="sc-scene" aria-pressed="true">In final scene</button>
+        <button id="sc-phys" aria-pressed="false">After physics</button>
+        <button id="sc-all" aria-pressed="false">All boxes</button>
+      </div>
+      <select id="f-word" aria-label="Filter by word"
+        style="width:100%;margin-bottom:8px;font:inherit;font-size:13px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--ink)"></select>
+      <div class="list" id="list"></div>
+      <p class="note" style="margin-top:8px">Spread = largest horizontal distance between the per-frame centroids. Under <span class="s-static">0.3 m</span> is ordinary depth noise. <span class="s-walk">0.3–1.5 m</span>: the object moved, or its mask or depth drifts between frames. Over <span class="s-split">1.5 m</span>: the track almost certainly jumped to a different object. <span class="s-recall">Recalled</span> instances have no spread and sort last.</p>
+    </div>
+  </aside>
+
+  <main class="view">
+    <canvas id="cv" aria-label="3D view of points and boxes"></canvas>
+    <div class="hud">
+      <div class="card" id="info"></div>
+      <button class="iconbtn" id="reset" style="pointer-events:auto">Reset view</button>
+    </div>
+    <div class="tip" id="tip" hidden></div>
+    <div class="hint">Click a box to select (click again to cycle overlapping boxes) · double-click to focus · drag to orbit · scroll to zoom · right-drag to pan</div>
+  </main>
+</div>
+
+<script id="data" type="application/json">__DATA__</script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(async function(){
+// Single-file mode: the data is baked into the page. Served mode (gate_ui /3d): the tag is empty — fetch it.
+const SERVED = !document.getElementById('data').textContent.trim();
+const D = SERVED
+  ? await (async () => { const r = await fetch('/3d/data' + location.search);
+      if (!r.ok) throw new Error('No 3D data for this run (' + r.status + ')'); return r.json(); })()
+  : JSON.parse(document.getElementById('data').textContent);
+if (SERVED && D.页){
+  document.title = D.页.title || 'Box Fit View';
+  document.querySelector('.eyebrow').textContent = D.页.eyebrow || '';
+  const nt = document.getElementById('notice'); if (nt) nt.outerHTML = D.页.notice || '';
+}
+const RAMP = ['#8E44EC','#4F6EF0','#1F9FD0','#1FB5A8','#6CC24A','#C9C22E','#F2A02E','#E8603C'];
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+// Recalled instances have no masks of their own, so there is no spread to judge them by.
+const status = o => o.body ? ['body','SAM 3D Body'] : o.recall ? ['recall','Recalled']
+  : o.spread < 0.3 ? ['static','Consistent'] : o.spread < 1.5 ? ['walk','Moving / drifting'] : ['split','Likely ID switch'];
+const cap = w => w.replace(/\b\w/g, c => c.toUpperCase());
+const label = o => cap(o.word) + ' #' + o.id;
+const fmtVf = v => String(v).padStart(4,'0');
+const fmt = a => a.map(x => x.toFixed(2)).join(' × ');
+
+function dec16(b64){const s=atob(b64),u=new Uint8Array(s.length);for(let i=0;i<s.length;i++)u[i]=s.charCodeAt(i);return new Int16Array(u.buffer);}
+function dec8(b64){const s=atob(b64),u=new Uint8Array(s.length);for(let i=0;i<s.length;i++)u[i]=s.charCodeAt(i);return u;}
+function rampColor(k,n){const t=n<=1?0:k/(n-1)*(RAMP.length-1);const i=Math.min(Math.floor(t),RAMP.length-2);const a=new THREE.Color(RAMP[i]),b=new THREE.Color(RAMP[i+1]);return a.lerp(b,t-i);}
+
+document.getElementById('ramp').style.background = 'linear-gradient(90deg,' + RAMP.join(',') + ')';
+
+// ---- summary (measured instances only; recalled ones have no spread) ----
+// People are pseudo-instances: no mask frames, one box per video frame, moved by the timeline.
+const PEOPLE = D.people || [];
+const BODY = PEOPLE.map(p => ({word:'person', id:p.id, body:true, recall:false, frames:[], single:[], cent:[],
+  box:p.boxes[0], dims:p.dims, spread:0, inscene:!!D.people_glb, why:D.people_glb ? null : 'people not composed yet', p}));
+const ALL = D.insts.concat(BODY);
+// "In final scene" = the object is a node in the assembled glb (D.glb). Without a glb there is no split.
+const HAS_SCENE = !!D.glb && ALL.some(o => 'inscene' in o);
+const inScene = o => !HAS_SCENE || o.inscene;
+const HAS_PHYS = ALL.some(o => o.pbox);
+const med = a => {const s=[...a].sort((x,y)=>x-y);return s.length?s[Math.floor(s.length/2)]:0;};
+function renderSummary(){
+  const pool = ALL.filter(o => S.scope === 'all' || inScope(o)), MEAS = pool.filter(o => !o.recall && !o.body);
+  if (S.scope === 'phys'){
+    const mv = ALL.filter(o => o.pbox).map(o => o.moved).sort((a,b)=>a-b);
+    document.getElementById('summary').innerHTML =
+      `<div class="stat"><div class="v">${mv.length}</div><div class="k">objects in the<br>final glb</div></div>
+       <div class="stat"><div class="v">${med(mv).toFixed(2)} m</div><div class="k">median move<br>by physics</div></div>
+       <div class="stat"><div class="v s-phys">${mv[mv.length-1].toFixed(2)} m</div><div class="k">largest move<br>(mostly settling down)</div></div>`;
+    return;
+  }
+  const nDrift = MEAS.filter(p => p.spread >= 0.3 && p.spread < 1.5).length;
+  const nSplit = MEAS.filter(p => p.spread >= 1.5).length;
+  document.getElementById('summary').innerHTML =
+    `<div class="stat"><div class="v">${med(MEAS.map(v => v.spread)).toFixed(2)} m</div><div class="k">median spread<br>(${MEAS.length} measured)</div></div>
+     <div class="stat"><div class="v s-walk">${nDrift}/${MEAS.length}</div><div class="k">moving / drifting<br>0.3–1.5 m</div></div>
+     <div class="stat"><div class="v s-split">${nSplit}/${MEAS.length}</div><div class="k">likely ID switch<br>&gt; 1.5 m</div></div>`;
+}
+
+// ---- three ----
+const canvas = document.getElementById('cv');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 500);
+const controls = new THREE.OrbitControls(camera, canvas);
+controls.enableDamping = true; controls.dampingFactor = 0.12;
+
+let grid;
+function applyTheme(){
+  scene.background = new THREE.Color(css('--view'));
+  if (grid) scene.remove(grid);
+  grid = new THREE.GridHelper(D.grid || 40, D.grid || 40, new THREE.Color(css('--grid')), new THREE.Color(css('--grid2')));
+  grid.position.y = 0; scene.add(grid);
+  camLine.material.color.set(css('--cam')); frusAll.material.color.set(css('--cam')); frusCur.material.color.set(css('--cam'));
+  objs.forEach(o => { if (o.o.body){ const c = css('--body'); o.boxMat.color.set(c); o.pts.material.color.set(c); o.pathMat.color.set(c); return; } o.boxMat.color.set(css(o.o.recall ? '--recall' : '--accent')); if (o.pboxMat) o.pboxMat.color.set(css('--phys')); o.fboxMat.color.set(css('--frame-box')); o.pathMat.color.set(css('--ink')); });
+  requestRender();
+}
+
+// scene points
+const cp = dec16(D.ctx.pts), crgb = dec8(D.ctx.rgb);
+const cg = new THREE.BufferGeometry();
+const cpos = new Float32Array(cp.length); for (let i=0;i<cp.length;i++) cpos[i]=cp[i]/100;
+const ccol = new Float32Array(crgb.length); for (let i=0;i<crgb.length;i++) ccol[i]=crgb[i]/255;
+cg.setAttribute('position', new THREE.BufferAttribute(cpos,3));
+cg.setAttribute('color', new THREE.BufferAttribute(ccol,3));
+const ctxPts = new THREE.Points(cg, new THREE.PointsMaterial({size:D.ctx_size || 0.035, vertexColors:true, transparent:true, opacity:0.55, depthWrite:false}));
+scene.add(ctxPts);
+
+// camera path + frustums (apex, then the four image corners at a fixed depth)
+const camG = new THREE.BufferGeometry().setFromPoints(D.cams.map(c => new THREE.Vector3(...c)));
+const camLine = new THREE.Line(camG, new THREE.LineBasicMaterial({color:css('--cam'), transparent:true, opacity:0.8}));
+scene.add(camLine);
+const CAMF = D.camf || [];
+const FRUS_E = [0,1, 0,2, 0,3, 0,4, 1,2, 2,3, 3,4, 4,1];
+function frusPos(list){
+  const arr = new Float32Array(list.length * FRUS_E.length * 3); let j = 0;
+  list.forEach(c => FRUS_E.forEach(k => { arr[j++]=c.p[k][0]; arr[j++]=c.p[k][1]; arr[j++]=c.p[k][2]; }));
+  return arr;
+}
+const fStep = Math.max(1, Math.ceil(CAMF.length / 40));
+const gAll = new THREE.BufferGeometry();
+gAll.setAttribute('position', new THREE.BufferAttribute(frusPos(CAMF.filter((c,i) => i % fStep === 0)), 3));
+const frusAll = new THREE.LineSegments(gAll, new THREE.LineBasicMaterial({color:css('--cam'), transparent:true, opacity:0.35}));
+frusAll.visible = false; scene.add(frusAll);
+const gCur = new THREE.BufferGeometry();
+gCur.setAttribute('position', new THREE.BufferAttribute(new Float32Array(FRUS_E.length*3), 3));
+const frusCur = new THREE.LineSegments(gCur, new THREE.LineBasicMaterial({color:css('--cam')}));
+frusCur.visible = false; scene.add(frusCur);
+const camDot = new THREE.Mesh(new THREE.SphereGeometry(0.04, 12, 10), new THREE.MeshBasicMaterial({color:'#ffffff'}));
+camDot.visible = false; scene.add(camDot);
+
+// Corner order from the exporter: index = ix*4 + iy*2 + iz, each axis -½ / +½.
+const EDGES = [];
+for (let a=0;a<8;a++) for (const bit of [1,2,4]) { const b=a^bit; if (a<b) EDGES.push(a,b); }
+const FACES = [[0,1,3,2],[4,6,7,5],[0,4,5,1],[2,3,7,6],[0,2,6,4],[1,5,7,3]];
+function boxLines(c, mat){
+  const g = new THREE.BufferGeometry();
+  const arr = new Float32Array(EDGES.length*3);
+  EDGES.forEach((k,i)=>{arr[i*3]=c[k][0];arr[i*3+1]=c[k][1];arr[i*3+2]=c[k][2];});
+  g.setAttribute('position', new THREE.BufferAttribute(arr,3));
+  const l = new THREE.LineSegments(g, mat);
+  if (mat.isLineDashedMaterial) l.computeLineDistances();
+  return l;
+}
+
+// Timeline = every video frame that has a camera or a person.
+const TL = [...new Set(CAMF.map(c => c.vf).concat(...PEOPLE.map(p => p.vf)))].sort((a,b) => a-b);
+const T = {i:0, playing:null};
+function nearestIdx(arr, v){ let lo=0, hi=arr.length-1; while (lo<hi){ const m=(lo+hi)>>1; if (arr[m]<v) lo=m+1; else hi=m; }
+  return (lo>0 && Math.abs(arr[lo-1]-v) <= Math.abs(arr[lo]-v)) ? lo-1 : lo; }
+const CAMVF = CAMF.map(c => c.vf);
+
+function makeBody(o){
+  const p = o.p, grp = new THREE.Group();
+  const bmat = new THREE.LineBasicMaterial({color:css('--body'), transparent:true});
+  const bg = new THREE.BufferGeometry(); bg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(EDGES.length*3), 3));
+  const box = new THREE.LineSegments(bg, bmat); grp.add(box);
+  const P = dec16(p.pts);
+  const pg = new THREE.BufferGeometry(); pg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(p.npf*3), 3));
+  const pts = new THREE.Points(pg, new THREE.PointsMaterial({size:(D.pt_size||0.04)*0.8, color:css('--body'), transparent:true}));
+  grp.add(pts);
+  const pathMat = new THREE.LineBasicMaterial({color:css('--body'), transparent:true, opacity:0.6});
+  const path = new THREE.Line(new THREE.BufferGeometry().setFromPoints(p.path.map(c => new THREE.Vector3(c[0], c[1]+0.01, c[2]))), pathMat);
+  grp.add(path);
+  scene.add(grp);
+  const d = p.vf.slice(1).map((v,i) => v - p.vf[i]).sort((a,b)=>a-b);
+  const gap = Math.max(4, 1.5 * (d.length ? d[d.length>>1] : 4));     // farther than this from any body frame = not present
+  const ob = {o, grp, frames:[], box, boxMat:bmat, fboxes:[], pathMat, path, dots:[], pts, P, gap, fi:-1,
+              center:new THREE.Vector3(), tris:[], size:Math.max(...o.dims), vol:o.dims[0]*o.dims[1]*o.dims[2]};
+  return ob;
+}
+// Move one person to video frame v. Returns false when the person is not in the video there.
+function bodyAt(ob, v){
+  const p = ob.o.p, i = nearestIdx(p.vf, v);
+  if (Math.abs(p.vf[i] - v) > ob.gap){ ob.fi = -1; ob.tris = []; return false; }
+  if (i === ob.fi) return true;
+  ob.fi = i;
+  const c = p.boxes[i], a = ob.box.geometry.attributes.position.array;
+  EDGES.forEach((k,j)=>{a[j*3]=c[k][0];a[j*3+1]=c[k][1];a[j*3+2]=c[k][2];});
+  ob.box.geometry.attributes.position.needsUpdate = true; ob.box.geometry.computeBoundingSphere();
+  const q = ob.pts.geometry.attributes.position.array, off = i * p.npf * 3;
+  for (let j=0;j<p.npf*3;j++) q[j] = ob.P[off+j]/100;
+  ob.pts.geometry.attributes.position.needsUpdate = true; ob.pts.geometry.computeBoundingSphere();
+  const V = c.map(x => new THREE.Vector3(...x));
+  ob.center.set(0,0,0); V.forEach(x => ob.center.add(x)); ob.center.multiplyScalar(1/8);
+  ob.tris = []; FACES.forEach(([a1,b,cc,dd]) => ob.tris.push([V[a1],V[b],V[cc]], [V[a1],V[cc],V[dd]]));
+  return true;
+}
+
+const objs = ALL.map(o => o.body ? makeBody(o) : makeInst(o));
+function makeInst(o){
+  const grp = new THREE.Group();
+  const nf = o.frames.length;
+  const P = nf ? dec16(o.pts) : new Int16Array(0), F = nf ? dec8(o.fid) : new Uint8Array(0);
+  const frames = [];
+  for (let k=0;k<nf;k++){
+    const idx=[]; for (let i=0;i<F.length;i++) if (F[i]===k) idx.push(i);
+    const pos = new Float32Array(idx.length*3);
+    idx.forEach((i,j)=>{pos[j*3]=P[i*3]/100;pos[j*3+1]=P[i*3+1]/100;pos[j*3+2]=P[i*3+2]/100;});
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos,3));
+    const m = new THREE.PointsMaterial({size:D.pt_size || 0.04, color:rampColor(k,nf), transparent:true, opacity:1});
+    const pts = new THREE.Points(g,m); grp.add(pts); frames.push(pts);
+  }
+  // Recalled boxes are dashed: WildDet3D gave the box directly, nothing was measured.
+  const boxMat = o.recall
+    ? new THREE.LineDashedMaterial({color:css('--recall'), transparent:true, dashSize:0.08, gapSize:0.06})
+    : new THREE.LineBasicMaterial({color:css('--accent'), transparent:true});
+  const box = boxLines(o.box, boxMat); grp.add(box);
+  // Where the object actually is in the final glb (after physics), measured with the same box fit.
+  const pboxMat = new THREE.LineBasicMaterial({color:css('--phys'), transparent:true});
+  const pbox = o.pbox ? boxLines(o.pbox, pboxMat) : null; if (pbox) grp.add(pbox);
+  const fboxMat = new THREE.LineBasicMaterial({color:css('--frame-box'), transparent:true, opacity:0.85});
+  const fboxes = o.single.map(s => { const l = boxLines(s.c, fboxMat); grp.add(l); return l; });
+  const pathMat = new THREE.LineBasicMaterial({color:css('--ink'), transparent:true});
+  const path = new THREE.Line(new THREE.BufferGeometry().setFromPoints(o.cent.map(c=>new THREE.Vector3(...c))), pathMat);
+  grp.add(path);
+  const dots = o.cent.map((c,k)=>{ const s=new THREE.Mesh(new THREE.SphereGeometry(0.05,10,8), new THREE.MeshBasicMaterial({color:rampColor(k,nf)})); s.position.set(...c); grp.add(s); return s; });
+  scene.add(grp);
+  const V = o.box.map(c => new THREE.Vector3(...c));
+  const center = new THREE.Vector3(); V.forEach(v=>center.add(v)); center.multiplyScalar(1/8);
+  const tris = [];                       // 12 triangles for click picking
+  FACES.forEach(([a,b,c,d]) => { tris.push([V[a],V[b],V[c]], [V[a],V[c],V[d]]); });
+  return {o, grp, frames, box, boxMat, pbox, pboxMat, fboxes, fboxMat, path, pathMat, dots, center, tris,
+          size:Math.max(...o.dims), vol:o.dims[0]*o.dims[1]*o.dims[2]};
+}
+
+// ---- state ----
+const S = {filter:'*', scope: HAS_SCENE ? 'scene' : 'all', sel:null, hover:null, mode:'all', k:0, playing:null};
+// People carry no physics box (physics does not move them), but they are in the final video, so they stay in that scope.
+function inScope(o){ return S.scope === 'all' ? true : S.scope === 'phys' ? (o.body ? inScene(o) : !!o.pbox) : inScene(o); }
+const $ = id => document.getElementById(id);
+const key = o => o.word + ':' + o.id;
+function visible(ob){ return inScope(ob.o) && (S.filter === '*' || ob.o.word === S.filter); }
+
+function update(){
+  document.querySelectorAll('.physonly').forEach(e => e.hidden = !(HAS_PHYS && S.scope === 'phys'));
+  const showBox=$('t-box').checked, showF=$('t-fbox').checked, showPath=$('t-path').checked, showOthers=$('t-others').checked;
+  ctxPts.visible = $('t-ctx').checked; camLine.visible = $('t-cam').checked; frusAll.visible = $('t-frus').checked;
+  const step = S.mode === 'step' && S.sel && S.sel.o.frames.length > 0;
+  const v = TL.length ? TL[T.i] : 0;
+  if (CAMF.length){
+    const c = CAMF[nearestIdx(CAMVF, v)], a = frusCur.geometry.attributes.position.array;
+    a.set(frusPos([c])); frusCur.geometry.attributes.position.needsUpdate = true; frusCur.geometry.computeBoundingSphere();
+    frusCur.visible = camDot.visible = true; camDot.position.set(...c.p[0]);
+    $('tlabel').textContent = `frame ${v} · cam ${c.key}` + (c.vf !== v ? ` (${c.vf})` : '');
+  }
+  let nHere = 0;
+  objs.forEach(ob => {
+    if (!ob.o.body) return;
+    const here = bodyAt(ob, v); nHere += here;
+    const isSel = ob === S.sel, isHov = ob === S.hover;
+    ob.grp.visible = !step && (isSel || ($('t-ppl').checked && inScope(ob.o)));
+    ob.box.visible = ob.pts.visible = here;
+    ob.path.visible = $('t-ppath').checked || isSel;
+    ob.boxMat.opacity = isSel ? 1 : isHov ? 0.85 : 0.6;
+    ob.pts.material.opacity = isSel ? 1 : 0.6; ob.pathMat.opacity = isSel ? 0.95 : 0.45;
+  });
+  if (PEOPLE.length) $('tnote').textContent = `${nHere} of ${PEOPLE.length} people in the video at this frame.`;
+  objs.forEach(ob => {
+    if (ob.o.body) return;
+    const isSel = ob === S.sel, isHov = ob === S.hover;
+    const show = isSel || (!step && showOthers && inScope(ob.o));
+    ob.grp.visible = show;
+    if (!show) return;
+    const dim = isSel ? 1 : 0.25;
+    ob.frames.forEach((p,k)=>{ p.visible = !step || k === S.k; p.material.opacity = dim; });
+    // A recalled box has no points, so it is always drawn, even with "Merged box" off.
+    ob.box.visible = (showBox || ob.o.recall) && !step;
+    if (ob.pbox){ ob.pbox.visible = S.scope === 'phys' && $('t-pbox').checked && !step;
+                  ob.pboxMat.opacity = isSel ? 1 : isHov ? 0.8 : 0.35; }
+    ob.boxMat.opacity = isSel ? 1 : isHov ? 0.8 : 0.35;
+    ob.fboxes.forEach((b,k)=>{ b.visible = isSel && (step ? k === S.k : showF); });
+    ob.path.visible = showPath && isSel; ob.pathMat.opacity = 0.9;
+    ob.dots.forEach((d,k)=>{ d.visible = showPath && isSel && (!step || k <= S.k); });
+    if (isSel && step) { ob.box.visible = showBox; ob.boxMat.opacity = 0.35; }
+  });
+  const nf = S.sel ? S.sel.o.frames.length : 0;
+  $('fslider').max = Math.max(nf - 1, 0);
+  $('fslider').disabled = $('play').disabled = !step;
+  $('m-step').disabled = nf === 0;
+  $('flabel').textContent = !S.sel ? '—' : nf === 0 ? 'no mask frames'
+    : step ? `frame ${S.sel.o.frames[S.k]} · ${S.k+1}/${nf}` : `frames ${S.sel.o.frames[0]}–${S.sel.o.frames[nf-1]}`;
+  renderInfo();
+  requestRender();
+}
+
+const sceneRow = o => !HAS_SCENE ? '' : o.inscene ? `<dt>Final scene</dt><dd class="s-static">${o.body ? 'animated in the 4D scene' : 'placed'}</dd>`
+  : `<dt>Final scene</dt><dd class="s-out">not placed — ${o.why}</dd>`;
+function renderInfo(){
+  if (!S.sel){ $('info').innerHTML=''; return; }
+  const o = S.sel.o, [cls, txt] = status(o);
+  if (o.body){
+    const p = o.p, here = S.sel.fi >= 0, i = S.sel.fi;
+    const cur = here ? p.boxes[i] : null;
+    const dd = cur ? [0,1,2].map(ax => ax===2 ? cur[1][1]-cur[0][1] : null) : null;
+    $('info').innerHTML = `<h3>${label(o)} <span class="pill s-${cls}">${txt}</span></h3>
+    <dl class="kv">
+      <dt>Video frames</dt><dd>${p.vf.length} (${p.vf[0]}–${p.vf[p.vf.length-1]})</dd>
+      <dt>This frame</dt><dd>${here ? 'frame ' + p.vf[i] + ' · height ' + dd[2].toFixed(2) + ' m' : 'not in the video here'}</dd>
+      <dt>Box (median)</dt><dd>${fmt(o.dims)} m</dd>
+      <dt>Pose</dt><dd>${p.seated ? 'seated' + (p.chair ? ' on ' + p.chair : ' (no chair found)') : 'standing / walking'}</dd>
+      <dt>Path length</dt><dd>${p.walk.toFixed(2)} m</dd>
+      <dt>Depth scale</dt><dd>× ${p.ratio.toFixed(3)}</dd>
+      ${sceneRow(o)}
+    </dl>
+    <p class="note" style="margin-top:6px">One box per video frame, fitted to the SAM 3D Body mesh after the same depth and floor correction the animated scene uses. The line on the floor is the path of the box centre.</p>`;
+    return;
+  }
+  if (o.recall){
+    $('info').innerHTML = `<h3>${label(o)} <span class="pill s-${cls}">${txt}</span></h3>
+    <dl class="kv">
+      <dt>Source</dt><dd>WildDet3D recall</dd>
+      <dt>Seen in</dt><dd>${o.seen} frames</dd>
+      <dt>Box</dt><dd>${fmt(o.dims)} m</dd>
+      ${sceneRow(o)}
+    </dl>
+    <p class="note" style="margin-top:6px">SAM 3 tracked nothing for this object, so there are no mask points and no per-frame boxes. The dashed box comes straight from the detector.</p>`;
+    return;
+  }
+  const sf = S.mode === 'step' ? o.single[S.k].dims : null;
+  $('info').innerHTML = `<h3>${label(o)} <span class="pill s-${cls}">${txt}</span></h3>
+  <dl class="kv">
+    <dt>Tracked</dt><dd>${o.tracked[2]} frames (${o.tracked[0]}–${o.tracked[1]})</dd>
+    <dt>Used frames</dt><dd>${o.frames.join(', ')}</dd>
+    <dt>Centroid spread</dt><dd>${o.spread.toFixed(2)} m</dd>
+    <dt>Merged box</dt><dd>${fmt(o.dims)} m</dd>
+    ${o.pbox ? `<dt>After physics</dt><dd>${fmt(o.pdims)} m · moved ${o.moved.toFixed(2)} m</dd>` : ''}
+    <dt>${sf ? 'This frame' : 'Per-frame (median)'}</dt><dd>${sf ? fmt(sf) : fmt(o.sdims)} m${sf ? '' : ' (L × W)'}</dd>
+    ${sceneRow(o)}
+  </dl>`;
+}
+
+function focus(ob){
+  const d = Math.max(ob.size * 1.6, 2.5);
+  controls.target.copy(ob.center);
+  camera.position.set(ob.center.x + d*0.9, ob.center.y + d*0.75, ob.center.z + d*0.9);
+  controls.update(); requestRender();
+}
+
+function select(ob, doFocus=true){
+  S.sel = ob; S.k = 0; $('fslider').value = 0; stop();
+  if (SERVED){ const q = new URLSearchParams(location.search); q.set('sel', key(ob.o));
+    $('gatelink').href = '/?' + q.toString(); $('gatelink-wrap').hidden = false; }
+  if (ob.o.body && !bodyAt(ob, TL[T.i])){ const p = ob.o.p; setT(TL.indexOf(p.vf[p.vf.length >> 1]), false); bodyAt(ob, TL[T.i]); }
+  if (S.mode === 'step' && ob.o.frames.length === 0) setMode('all', false);
+  [...$('list').children].forEach(r => {
+    const on = r.dataset.key === key(ob.o);
+    r.setAttribute('aria-current', on ? 'true' : 'false');
+    if (on && !doFocus) r.scrollIntoView({block:'nearest'});
+  });
+  if (doFocus) focus(ob);
+  update();
+}
+
+const sortKey = o => o.body ? 1e6 - (+o.id || 0) : o.recall ? -1 : o.spread;
+function renderList(){
+  const items = objs.filter(visible).sort((a,b)=>sortKey(b.o)-sortKey(a.o));
+  $('listhead').textContent = (S.filter === '*' ? 'Objects' : cap(S.filter)) + ` (${items.length})`;
+  $('list').innerHTML = '';
+  items.forEach(ob => {
+    const o = ob.o, [cls, txt] = status(o);
+    const b = document.createElement('button');
+    b.className = 'row'; b.dataset.key = key(o);
+    if (HAS_SCENE && !o.inscene) b.style.opacity = 0.62;
+    b.setAttribute('aria-current', ob === S.sel ? 'true' : 'false');
+    const out = HAS_SCENE && !o.inscene;
+    const mv = S.scope === 'phys' && o.pbox ? `<br><span class="s-phys">physics moved it ${o.moved.toFixed(2)} m</span>` : '';
+    const meta = (o.body ? `video ${o.p.vf[0]}–${o.p.vf[o.p.vf.length-1]} · ${o.p.seated ? 'seated' + (o.p.chair ? ' · ' + o.p.chair : '') : 'walked ' + o.p.walk.toFixed(1) + ' m'} · box ${fmt(o.dims)} m`
+               : o.recall ? `recall · seen in ${o.seen} frames · box ${fmt(o.dims)} m`
+                           : `frames ${o.frames[0]}–${o.frames[o.frames.length-1]} · box ${fmt(o.dims)} m`)
+               + (out ? `<br><span class="s-out">not in scene: ${o.why}</span>` : '') + mv;
+    b.innerHTML = `<span class="stripe bg-${cls}"></span>
+      <span><span class="name">${label(o)}</span><span class="pill s-${cls}">${txt}</span><br>
+      <span class="meta">${meta}</span></span>
+      <span class="spread">${o.recall || o.body ? '—' : o.spread.toFixed(2) + ' m'}</span>`;
+    b.addEventListener('click', () => select(ob));
+    $('list').appendChild(b);
+  });
+}
+
+function setFilter(f, pickFirst=true){
+  S.filter = f; $('f-word').value = f;
+  renderList();
+  if (!pickFirst) return;
+  const first = objs.filter(visible).sort((a,b)=>sortKey(b.o)-sortKey(a.o))[0];
+  if (first) select(first);
+}
+function renderWords(){
+  const pool = ALL.filter(inScope), cnt = {}; pool.forEach(o => cnt[o.word] = (cnt[o.word]||0)+1);
+  if (S.filter !== '*' && !cnt[S.filter]) S.filter = '*';
+  $('f-word').innerHTML = ['<option value="*">All words (' + pool.length + ')</option>'].concat(
+    Object.keys(cnt).sort((a,b) => cnt[b]-cnt[a] || a.localeCompare(b))
+      .map(w => `<option value="${w}">${cap(w)} (${cnt[w]})</option>`)).join('');
+  $('f-word').value = S.filter;
+}
+function setScope(sc){
+  S.scope = sc;
+  $('sc-scene').setAttribute('aria-pressed', sc === 'scene'); $('sc-phys').setAttribute('aria-pressed', sc === 'phys');
+  $('sc-all').setAttribute('aria-pressed', sc === 'all');
+  renderWords(); renderSummary(); renderList();
+  if (!S.sel || !visible(S.sel)) {
+    const first = objs.filter(visible).sort((a,b)=>sortKey(b.o)-sortKey(a.o))[0];
+    if (first) select(first); else update();
+  } else update();
+}
+if (HAS_SCENE) {
+  const nIn = ALL.filter(o => o.inscene).length;
+  $('sc-scene').textContent = `In final scene (${nIn})`; $('sc-all').textContent = `All boxes (${ALL.length})`;
+  $('sc-phys').textContent = 'After physics';
+  $('sc-scene').addEventListener('click', () => setScope('scene'));
+  $('sc-phys').addEventListener('click', () => setScope('phys'));
+  $('sc-all').addEventListener('click', () => setScope('all'));
+  if (!HAS_PHYS) $('sc-phys').hidden = true;
+} else $('scopebar').hidden = true;
+function setMode(m, doUpdate=true){
+  if (m === 'step' && (!S.sel || S.sel.o.frames.length === 0)) m = 'all';
+  S.mode = m; S.k = Math.min(S.k, S.sel ? Math.max(S.sel.o.frames.length-1, 0) : 0);
+  $('m-all').setAttribute('aria-pressed', m==='all'); $('m-step').setAttribute('aria-pressed', m==='step');
+  if (m === 'all') stop();
+  if (doUpdate) update();
+}
+function stop(){ if (S.playing){ clearInterval(S.playing); S.playing=null; $('play').textContent='Play'; } }
+$('play').addEventListener('click', () => {
+  if (S.playing) return stop();
+  $('play').textContent = 'Pause';
+  S.playing = setInterval(() => { const n = S.sel.o.frames.length; S.k = (S.k+1)%n; $('fslider').value = S.k; update(); }, 750);
+});
+$('fslider').addEventListener('input', e => { stop(); S.k = +e.target.value; update(); });
+$('m-all').addEventListener('click', () => setMode('all'));
+$('m-step').addEventListener('click', () => setMode('step'));
+$('f-word').addEventListener('change', e => setFilter(e.target.value));
+['t-box','t-pbox','t-fbox','t-path','t-ctx','t-others','t-cam','t-frus','t-ppl','t-ppath'].forEach(id => $(id).addEventListener('change', update));
+
+// ---- timeline ----
+function setT(i, doUpdate=true){ T.i = Math.max(0, Math.min(TL.length-1, i)); $('tslider').value = T.i; if (doUpdate) update(); }
+function tstop(){ if (T.playing){ clearInterval(T.playing); T.playing = null; $('tplay').textContent = 'Play'; } }
+if (TL.length){
+  $('tslider').max = TL.length - 1;
+  $('tslider').addEventListener('input', e => { tstop(); setT(+e.target.value); });
+  $('tplay').addEventListener('click', () => {
+    if (T.playing) return tstop();
+    $('tplay').textContent = 'Pause';
+    T.playing = setInterval(() => setT((T.i + 1) % TL.length), 110);
+  });
+} else $('tl-group').hidden = true;
+if (!HAS_PHYS) $('lede-phys').hidden = true;
+if (!PEOPLE.length){ document.querySelectorAll('.bodyonly').forEach(e => e.hidden = true); $('lede-body').hidden = true; }
+$('reset').addEventListener('click', () => S.sel && focus(S.sel));
+
+// ---- click a box in the view to select it ----
+// Every visible box is tested against the pick ray. Clicking the same spot again steps
+// through the boxes under the cursor, nearest first — a cup box sits inside a desk box,
+// and without cycling the desk would always win.
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2(), hit = new THREE.Vector3();
+function hitsAt(ev){
+  const r = canvas.getBoundingClientRect();
+  ndc.set(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  const out = [];
+  objs.forEach(ob => {
+    if (!ob.grp.visible) return;
+    let best = Infinity;
+    for (const [a,b,c] of ob.tris)
+      if (ray.ray.intersectTriangle(a, b, c, false, hit)) best = Math.min(best, hit.distanceTo(ray.ray.origin));
+    if (best < Infinity) out.push({ob, d:best});
+  });
+  // Nearest first; for near-equal distances, the smaller box first.
+  return out.sort((x,y) => Math.abs(x.d-y.d) < 0.05 ? x.ob.vol - y.ob.vol : x.d - y.d).map(h => h.ob);
+}
+let down = null, last = {x:-99, y:-99, list:[], i:0};
+canvas.addEventListener('pointerdown', ev => { if (ev.button === 0) down = {x:ev.clientX, y:ev.clientY}; });
+canvas.addEventListener('pointerup', ev => {
+  if (!down || ev.button !== 0) return;
+  const moved = Math.hypot(ev.clientX - down.x, ev.clientY - down.y); down = null;
+  if (moved > 5) return;                                     // that was an orbit drag
+  const list = hitsAt(ev);
+  if (!list.length) return;
+  const same = Math.hypot(ev.clientX - last.x, ev.clientY - last.y) < 6
+            && list.length === last.list.length && list.every((o,i) => o === last.list[i]);
+  const i = same ? (last.i + 1) % list.length : 0;
+  last = {x:ev.clientX, y:ev.clientY, list, i};
+  const ob = list[i];
+  if (!visible(ob)) setFilter('*', false);
+  select(ob, false);
+});
+canvas.addEventListener('dblclick', () => S.sel && focus(S.sel));
+
+// hover: pointer cursor + a name tag, throttled to one raycast per frame
+const tip = $('tip'); let hoverEv = null;
+canvas.addEventListener('pointermove', ev => {
+  if (ev.buttons) { tip.hidden = true; return; }
+  if (!hoverEv) requestAnimationFrame(() => {
+    const e = hoverEv; hoverEv = null;
+    const ob = hitsAt(e)[0] || null;
+    canvas.style.cursor = ob ? 'pointer' : '';
+    if (ob) {
+      const r = canvas.getBoundingClientRect();
+      tip.textContent = label(ob.o) + (ob.o.body ? ' · SAM 3D Body' : ob.o.recall ? ' · recalled' : ` · ${ob.o.spread.toFixed(2)} m`);
+      tip.style.left = (e.clientX - r.left + 14) + 'px'; tip.style.top = (e.clientY - r.top + 14) + 'px';
+      tip.hidden = false;
+    } else tip.hidden = true;
+    if (ob !== S.hover) { S.hover = ob; update(); }
+  });
+  hoverEv = ev;
+});
+canvas.addEventListener('pointerleave', () => { tip.hidden = true; canvas.style.cursor = ''; if (S.hover) { S.hover = null; update(); } });
+
+// ---- render loop (on demand) ----
+let pending = false;
+function requestRender(){ if (!pending){ pending = true; requestAnimationFrame(frame); } }
+function frame(){ pending = false; const moving = controls.update(); renderer.render(scene, camera); if (moving) requestRender(); }
+controls.addEventListener('change', requestRender);
+function resize(){
+  const v = canvas.parentElement; const w = v.clientWidth, h = v.clientHeight;
+  renderer.setSize(w, h, false); camera.aspect = w / Math.max(h,1); camera.updateProjectionMatrix(); requestRender();
+}
+new ResizeObserver(resize).observe(canvas.parentElement);
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
+new MutationObserver(applyTheme).observe(document.documentElement, {attributes:true, attributeFilter:['data-theme']});
+
+applyTheme();
+renderWords(); renderSummary(); renderList();
+// Opened from the gate with #sel=word:id — start on that object; otherwise the widest-spread one.
+const want = decodeURIComponent((location.hash.match(/sel=([^&]+)/) || [])[1] || '');
+select(objs.find(ob => key(ob.o) === want) || objs.filter(visible).sort((a,b)=>sortKey(b.o)-sortKey(a.o))[0] || objs[0]);
+resize();
+})().catch(e => { document.body.insertAdjacentHTML('afterbegin',
+  '<p style="margin:24px;font:15px ui-sans-serif,system-ui">' + String(e.message || e) + '</p>'); });
+</script>
