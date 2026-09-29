@@ -28,6 +28,8 @@ PIPE_IN  = f"{SAM3D}/pipeline/indoor_pipeline.py"
 PY    = os.path.expanduser("~/miniforge3/envs/sam3d/bin/python")
 HERE  = os.path.dirname(os.path.abspath(__file__))
 TOOLS = f"{SAM3D}/tools"      # 闸口那几张图的脚本都在 tools/ —— 常用的放一处好找
+sys.path.insert(0, f"{SAM3D}/pipeline")
+import _common, people_decisions   # 本轮配置 00_run_config.json / 挑人决策 05_people.json, 和 pipeline 同一份实现
 # ★ 别在这里自己抄一份 tag 表 —— pipeline 那边有 SCENE_TAG, 抄一份就会漂移
 #   (ueindoor 在 pipeline 里是 "ue", 这里按 scene[:3] 会算成 "uei", 闸口一个候选都找不到)。
 _TAG_CACHE = {}
@@ -45,6 +47,21 @@ def scene_tag(kind, scene, run):
     _TAG_CACHE[k] = t
     return t
 
+def recall_on(kind, scene, run):
+    """召回开关也问 pipeline(--dump-cfg), 别自己读 CFG —— 场景覆盖/人工闸/环境变量三层它才算得全。
+    不缓存: 环境变量 RECALL=1 临时一开就该生效。问不到按开算, 闸照停, 宁可多停一次。"""
+    cmd = [PY, PIPE_OUT if kind == "outdoor" else PIPE_IN, "--scene", scene, "--run", run, "--dump-cfg"]
+    if kind == "indoor": cmd += ["--chain", "obj"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout).get("RECALL", "1") == "1"
+    except ValueError:
+        return True
+
+def gate_stops(kind, seg, scene, run):
+    """这一段跑完要不要停在闸口。召回关着时第 4 道闸(check_recall)不停 —— 它就是看召回候选的。"""
+    return SEGMENTS[kind][seg][2] != "check_recall" or recall_on(kind, scene, run)
+
 # 段 = (闸名, 这一段要跑的步骤, 到闸口做什么检查)
 # 每条链一套分段。步骤名必须存在于各自 pipeline 的 STEPS 里, 否则跑到那一段直接 SystemExit
 # (walls 就这么炸过: 步骤摘掉了, 这张表没跟着改, 室内最后一段整段跑不了)。
@@ -59,8 +76,10 @@ def scene_tag(kind, scene, run):
 SEGMENTS = {
     "outdoor": [
         ("地基",   ["frames", "vlm", "da3", "up"],                                     "check_ground"),
-        ("生成前", ["track", "dedup", "relabel", "pick", "verify", "override"],        "check_picks"),
-        ("尺度",   ["gen", "ratio", "meshes", "boxes", "vlm_sizes", "scale"],          "check_scale"),
+        # ★ 2026-09-24 人体线接进来: people_track 和物体跟踪同段, 挑人和挑候选在同一道闸(第 2 道);
+        #   people_mesh 在尺度之前 —— 尺度拿人当尺子。没有人的轮次这两步自己跳过。
+        ("生成前", ["track", "people_track", "dedup", "relabel", "pick", "verify", "override"], "check_picks"),
+        ("尺度",   ["gen", "ratio", "meshes", "boxes", "vlm_sizes", "people_mesh", "scale"], "check_scale"),
         # ★ 段名按"这段跑完你要在闸口看什么"起, 不按步骤性质。solo(逐实例生成)和召回是
         #   两件事, 之所以同段: solo 要读 06_all_boxes.json 决定哪些实例值得单独生成,
         #   而那个文件是上一段 boxes 步才产的 —— 依赖关系决定的顺序。
@@ -74,13 +93,16 @@ SEGMENTS = {
     # 室内物体链: 多了提亮/抽帧/z朝上三步, 墙壳走 walls+shell, 没有 WD 对照那一支
     "indoor": [
         ("地基",   ["frames", "bright", "sub", "vlm", "da3", "up"],                    "check_ground"),
-        ("生成前", ["track", "dedup", "relabel", "pick", "verify", "override"],        "check_picks"),
-        ("尺度",   ["gen", "ratio", "meshes", "boxes", "vlm_sizes", "scale"],          "check_scale"),
+        ("生成前", ["track", "people_track", "dedup", "relabel", "pick", "verify", "override"], "check_picks"),
+        # ★ vlm_rest 以前漏在这张表外面(自检只打一行提示), 驱动跑室内从来没问过"东西放在哪"
+        ("尺度",   ["gen", "ratio", "meshes", "boxes", "vlm_sizes", "vlm_rest", "people_mesh", "scale"],
+                                                                                        "check_scale"),
         ("逐实例+召回", ["solo", "detect", "recall", "recall_mask"],                    "check_recall"),
         # walls 已从两张步骤表里摘掉(房间壳改从点云自己算足迹), 这里再列它会直接 SystemExit
         # zup 排在 scale 之后(见 indoor_pipeline 的注释), 所以它在这一段不在地基段
+        # ★ people / people_glb 以前也漏在外面 —— 室内走驱动从来没把人放进场景过。和室外同序
         ("验收",   ["recall_gen", "recall_merge", "zup", "shell",
-                    "assemble", "phys", "render"],                                     "check_scene"),
+                    "assemble", "people", "phys", "people_glb", "render"],             "check_scene"),
     ],
 }
 
@@ -180,6 +202,8 @@ def run_steps(kind, scene, run, steps, dry):
     print(f"\n$ {' '.join(cmd)}\n", flush=True)
     return subprocess.run(cmd).returncode
 
+BOX_VIEW_TIMEOUT = 180      # 秒; office 18 s、nfl1 14 s, 十倍余量
+
 def ensure_box_view(R1, dry=False):
     """闸口网页 3D tab 要的数据 <R1>/10_box_fit_view.json: 不在、或比产物旧, 就重算(office 实测 18 s);
     否则跳过。判"旧"的规则在 tools/scene_view.py(闸口网页也用同一份报"过时"), 别在这再抄。
@@ -194,7 +218,12 @@ def ensure_box_view(R1, dry=False):
     print(f"\n[3D 页] 数据{why if why == '还没有' else '比 ' + why + ' 旧'}, 重算 (~20 s): $ {' '.join(cmd)}", flush=True)
     if dry:
         return "干跑"
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    # ★ 限时: "不挡闸"不光是失败不挡, 卡住也不能挡。2026-09-24 nfl1 找地面的 SVD 吃了 194 GB、
+    #   近 5 分钟(已修, 现在 14 s), 那几分钟驱动一直不退, 网页上闸口一直显示"运行中"点不了继续。
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=BOX_VIEW_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print(f"[3D 页] 超过 {BOX_VIEW_TIMEOUT} s 没算完, 放弃(不挡闸); 要看 3D 页手动跑上面那条命令"); return "超时"
     if r.returncode != 0:
         print("[3D 页] 失败(不挡闸): " + (r.stderr or r.stdout).strip()[-400:]); return "失败"
     print(f"[3D 页] {p}   闸口网页顶栏 3D 就是它")
@@ -309,7 +338,23 @@ def check_picks(R1, tag, scene, kind="outdoor", run="r1"):
     # 两个粒度不同的问题, 各一张图。这一步纯 CPU, 几秒。
     t = subprocess.run([PY, f"{TOOLS}/reuse_table.py"], env=env, capture_output=True, text=True)
     lines += [l for l in (t.stdout + t.stderr).strip().split("\n") if l.strip()]
-    return lines, [f"{R1}/05_review_sheet.jpg", f"{R1}/05_reuse_table.jpg"]
+    lines += people_lines(R1)
+    return lines, [f"{R1}/05_review_sheet.jpg", f"{R1}/05_reuse_table.jpg",
+                   f"{people_decisions.auto_dir(R1)}/03_check.jpg"]
+
+def people_lines(R1):
+    """闸 2 的"人"(文字版; 网页"人"那一栏是同一份文件)。人体线没跑过 -> []。"""
+    d = people_decisions.load(R1)
+    if d is None:
+        return []
+    rows = d["人"]
+    keep = [r["id"] for r in rows if r["决定"] == "keep"]
+    out = [f"人: 跟到 {len(rows)} 个, 勾了 {len(keep)} 个 {keep} —— 在闸口网页\"人\"那一栏改"
+           f"(或直接改 {people_decisions.path(R1)})"]
+    for r in rows:
+        out.append(f"  #{r['id']:<3} {r['决定']:4s}  {r['帧数']:3d} 帧  最大面积 {r['最大面积%']}%"
+                   + (f"  串号/跳变告警 {r['告警']}" if r["告警"] else ""))
+    return out
 
 def check_scale(R1, tag, scene, kind="outdoor", run="r1"):
     lines = []
@@ -452,6 +497,9 @@ def apply_decisions(R1, tag, scene, kind, run, seg, dry):
     """
     if not os.path.exists(f"{R1}/05_review.json"): return
     if SEGMENTS[kind][seg][2] not in ("check_picks", "check_recall"): return
+    if not gate_stops(kind, seg, scene, run):
+        # 召回关: 闸 4 那份(_afterrecall)决策不落地 —— 闸 2 那份已经落过了, 这里什么都不用重跑
+        print("\n[落地决策] 召回关(RECALL=0), 闸 4 的决策不落地"); return
     print(f"\n[落地决策] 把闸口的决定写成配置 ...")
     env = gate_env(R1, tag, scene, kind, run)
     # 落地时也要说清是哪道闸 —— --apply 读的决策文件按阶段分两份
@@ -524,6 +572,35 @@ def apply_decisions(R1, tag, scene, kind, run, seg, dry):
         sys.exit(f"\n★ 说要重跑, 却一个步骤都排不出来 —— 多半是问不到 {kind} 的步骤表"
                  f"(pipeline 语法错或 import 失败)。先修好它, 决定还在文件里没丢。")
 
+def init_run_config(R1, kind, people, recall, done):
+    """命令行 --people / --recall 写进本轮配置 00_run_config.json(启动页和本轮页写的也是它)。
+    规则在 _common.update_run_config, 和网页同一套; 这里只把 ValueError 变成就地停。"""
+    changes = {k: v for k, v in (("PEOPLE", people), ("RECALL", recall)) if v is not None}
+    try:
+        return _common.update_run_config(R1, kind, changes, done)
+    except ValueError as e:
+        sys.exit(f"[失败] {e}")
+
+def people_changed(R1, body):
+    """过了第 2 道闸又改了挑人: 决策文件里勾的人 != body4d 上次出网格用的 picked.json。"""
+    keep = people_decisions.keep_ids(R1)
+    try:
+        used = sorted(json.load(open(f"{body}/02_body4d/picked.json"))["keep_ids"])
+    except (OSError, ValueError, KeyError):
+        return False          # 还没出过网格, 第 3 段自己会按现在的决定出
+    return keep is not None and keep != used
+
+def rerun_people(R1, kind, scene, run, dry):
+    """挑人改了 -> 出网格和摆人那几步重来(只重跑跑过的)。尺度不重定: 它已经乘进深度, 幂等守卫拒绝再乘。"""
+    if not people_changed(R1, people_decisions.auto_dir(R1)):
+        return
+    LOOP = ["people_mesh", "people", "phys", "people_glb", "render"]
+    have = _pipeline_steps(kind)
+    todo = [x for x in LOOP if x in have and os.path.exists(f"{R1}/logs/.stamp_{x}")]
+    print(f"\n[挑人] 勾的人和上次出网格的不一样了, 重跑 {' -> '.join(todo)}(尺度不动)")
+    if todo and run_steps(kind, scene, run, todo, dry) != 0:
+        sys.exit("\n★ 重跑失败, 挑人的决定没能落到实处。就地停。")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", required=True)
@@ -533,6 +610,8 @@ def main():
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--reset", action="store_true")
     ap.add_argument("-n", "--dry-run", action="store_true")
+    ap.add_argument("--people", choices=["0", "1"], help="这一轮有没有人(写进 00_run_config.json, 第 1 道闸之前能改)")
+    ap.add_argument("--recall", choices=["0", "1"], help="开不开召回(写进 00_run_config.json, 第 4 段之前能改)")
     a = ap.parse_args()
     kind = "indoor" if a.indoor else "outdoor"
     check_segments(kind)      # 五个注册点里最容易漏的那个, 启动就核
@@ -565,12 +644,21 @@ def main():
         if s["停在闸口"]: print(f"\n停在闸 {i+1} 等人。继续: --go")
         return
 
+    # 本轮配置: 给了 --people/--recall 就写; 新开的一轮(还没跑过任何一段)也落一份, 记下类型
+    if a.people or a.recall or (s["段"] == 0 and not s["停在闸口"] and not _common.load_run_config(R1)):
+        if not a.dry_run:
+            rc = init_run_config(R1, kind, a.people, a.recall, s["段"] + (1 if s["停在闸口"] else 0))
+            print(f"[本轮配置] {_common.RUN_CONFIG}: 类型 {rc['类型']}, 覆盖 {rc['覆盖'] or '无'}")
+    elif (_common.load_run_config(R1) or {}).get("类型", kind) != kind:
+        sys.exit(f"[失败] 这一轮是 {_common.load_run_config(R1)['类型']}, 命令行给的是 {kind}(--indoor 对不上)")
+
     if s["停在闸口"]:
         if not a.go:
             print(f"[等人] 停在闸 {s['段']+1}。看完之后加 --go 继续, 或 --status 看全貌。")
             gate_report(s["段"], R1, tag, a.scene, kind, a.run,
                         last=(s["段"] == len(segs)-1)); return
         apply_decisions(R1, tag, a.scene, kind, a.run, s["段"], a.dry_run)
+        rerun_people(R1, kind, a.scene, a.run, a.dry_run)
         s["段"] += 1; s["停在闸口"] = False; save_state(R1, s)
 
     while s["段"] < len(segs):
@@ -589,6 +677,9 @@ def main():
         if rc != 0:
             print(f"\n★ 第 {i+1} 段失败 (退出码 {rc}), 就地停。日志在 {R1}/logs/")
             sys.exit(rc)
+        if not gate_stops(kind, i, a.scene, a.run):
+            print(f"\n[召回关] 第 {i+1} 道闸是看召回候选的, RECALL=0 不停, 直接进下一段")
+            s["段"] += 1; save_state(R1, s); continue
         s["停在闸口"] = True; save_state(R1, s)
         gate_report(i, R1, tag, a.scene, kind, a.run, last=(i == len(segs)-1))
         return                                # 一次只跑到下一道闸

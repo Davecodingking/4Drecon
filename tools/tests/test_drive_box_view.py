@@ -12,5 +12,19 @@ def test_missing_stale_fresh():
         g = f"{R1}/07_scene_phy.glb"; open(g, "wb").write(b"x"); os.utime(g, (time.time() + 10,) * 2)
         assert drive.ensure_box_view(R1, dry=True) == "干跑"                 # 产物比它新 -> 要算
 
+def test_hung_view_does_not_block_gate():
+    """box_fit_view 卡住(2026-09-24 nfl1: 找地面吃了 194 GB、近 5 分钟), 驱动不许跟着卡在闸口"运行中"。"""
+    with tempfile.TemporaryDirectory() as R1:
+        fake = f"{R1}/fake_py"; open(fake, "w").write("#!/bin/bash\nexec sleep 30\n"); os.chmod(fake, 0o755)
+        old = drive.PY, getattr(drive, "BOX_VIEW_TIMEOUT", None)
+        drive.PY, drive.BOX_VIEW_TIMEOUT = fake, 1
+        try:
+            t = time.time(); r = drive.ensure_box_view(R1); took = time.time() - t
+        finally:
+            drive.PY, drive.BOX_VIEW_TIMEOUT = old
+        assert r == "超时" and took < 10, (r, took)
+
 if __name__ == "__main__":
-    test_missing_stale_fresh(); print("ok test_missing_stale_fresh")
+    for name, t in list(globals().items()):
+        if name.startswith("test_") and callable(t):
+            t(); print("ok", name)

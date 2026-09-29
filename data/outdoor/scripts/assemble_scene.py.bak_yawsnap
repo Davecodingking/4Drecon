@@ -1,0 +1,433 @@
+#!/usr/bin/env python
+"""同款复制: 一类一个 mesh, 按各实例的盒子摆回街上, 加地面, 导出整场景 glb.
+尺度用高度对齐(高度几乎总能看全, 长度会被遮挡截短); 朝向用盒子长轴, 180° 未解。"""
+import os, sys, json, numpy as np, trimesh
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from world_frame import load_up, export_T, inverse_T
+from word_rank import base_word
+TAG=os.environ.get("TAG","ts_r1")
+
+ROOT=os.environ.get("R1","/home/jincheng/sam3d/data/outdoor/result/timesquare/r1")
+# 写死绝对路径换台机器就 glob 到空, 而空的结果是"什么都没摆进去"而不是报错 —— 静默失败。
+OUTS=os.environ.get("GEN_OUT", os.path.expanduser("~/sam3d/sam-3d-objects/outputs"))
+# "天"的方向。老的写法是写死 [0,-1,0] = 首帧相机的 -y —— 街头平视时相机水平, 这个假设
+# 成立(时代广场实测只偏 0.4°); 但高空俯拍时相机低着头, 它的 -y 指向斜上后方, beach 偏
+# 26.2°、carpark 偏 29.2°, 整个场景连同地面一起歪掉。
+# 现在改成读 world_up.py 从点云主平面拟合出来的真实法向, 没有那个文件才退回老假设。
+# ★ 必须在"量盒子"之前定好: 盒子的高度是沿"天"量出来的, 方向错了盒子本身就是错的,
+#   事后旋转只是把错的盒子摆正, 数字不会变对。
+# 天的方向和导出旋转都在 world_frame.py 里 —— 这个约定以前每个文件各抄一份, 已经漂移过。
+UP, _GH, _FB = load_up(f"{ROOT}/02_da3", "组装")
+
+
+# ---- 合法性守卫: 这两个数是**绝对真米**, 所以它们的含义取决于尺度校准成没成功 ----
+# ★ 校准前 carpark 整个世界被压缩 6.43 倍: 0.85 m 的长椅量出来 0.13 m, 被 MIN_H 当成
+#   "太薄"扔掉 —— 上一轮那句"[跳过] 12 个尺寸不合理"大半是这么来的。
+#   反过来校准后世界放大了, MAX_D 才第一次有能力误杀。
+#   守卫本身没错, 错在它不知道自己站在校准过还是没校准的世界里。所以这里先去问一句。
+MIN_H = float(os.environ.get("MIN_H", "0.15"))    # 比这薄就当量错了
+MAX_D = float(os.environ.get("MAX_D", "15"))      # 比这大就当量错了
+_cj = f"{ROOT}/02_da3/cameras.json"
+_k = None
+if os.path.exists(_cj):
+    try: _k = json.load(open(_cj)).get("metric_scale_applied")
+    except Exception: pass
+if _k is None:
+    print(f"★★ 这个场景没有做过尺度标定(cameras.json 里没有 metric_scale_applied)。\n"
+          f"   下面 MIN_H={MIN_H} / MAX_D={MAX_D} 这两个守卫写的是真米, 在未校准的世界里\n"
+          f"   含义可能差好几倍, 会误杀。先跑 scale 那一步, 或显式覆盖 MIN_H/MAX_D。", flush=True)
+else:
+    print(f"[尺度] 这个世界已按 {float(_k):.3f} 倍校准过, 守卫 MIN_H={MIN_H} MAX_D={MAX_D} 是真米", flush=True)
+EXCLUDE=set(os.environ.get("EXCLUDE","sign,billboard,pedestrian,manhole cover").split(","))
+# ---- 人在闸口逐个否掉的候选 ----
+# ★ EXCLUDE 是**词级**的, 挡不住"这个词留着但这一个实例不要", 而闸口最常见的判断恰好是后者。
+#   以前这份名单只挡了生成(不烧 GPU), 组装这步从来不看 —— 于是盘上但凡有上一轮留下的 glb,
+#   被人否掉的东西照样摆进场景, 而且一声不吭。人的语义是"这东西别出现在场景里",
+#   不只是"别再烧这份 GPU", 所以这里必须再挡一道。
+import review_decisions as _review
+SKIP_NAMES=set(_review.skip_names(ROOT))
+def _gen_name(w, oid=None):
+    """生成名的拼法: 类共用 = <TAG>_<词>, 实例专属 = <TAG>_<词>_<实例号>。词里的空格换成下划线。"""
+    s = f"{TAG}_{w}" if oid is None else f"{TAG}_{w}_{oid}"
+    return s.replace(" ", "_")
+if SKIP_NAMES:
+    print(f"[人工闸] 人工否掉 {len(SKIP_NAMES)} 个, 不摆进场景: {', '.join(sorted(SKIP_NAMES))}", flush=True)
+VLM_REJ = _review.vlm_rejected(ROOT)
+VLM_REL = _review.vlm_released(ROOT)
+if VLM_REJ:
+    print(f"[VLM否决] {sum(len(v) for v in VLM_REJ.values())} 个实例被否决, 人工放行 {len(VLM_REL)} 个", flush=True)
+# 自动扫描 outputs/。ts_r1_<词> = 该类共用的 mesh; ts_r1_<词>_<实例号> = 这个实例专属的
+AVAIL={d for d in os.listdir(OUTS) if d.startswith(TAG+"_") and os.path.exists(f"{OUTS}/{d}/{d}.glb")}
+MESH={d[len(TAG)+1:].replace("_"," "):d for d in AVAIL}
+# 一个词的全部实例 mesh, 给"没有类 mesh"的词兜底用
+INST={}
+for _d in AVAIL:
+    if _d.rsplit("_",1)[-1].isdigit():
+        INST.setdefault(_d[len(TAG)+1:].rsplit("_",1)[0].replace("_"," "), []).append(_d)
+# 人在闸口判了"共用一个 mesh"的词。组装必须知道这件事 ——
+# ★ 否则会这样: 一个词先 solo 生成过(outputs/ 里躺着 be_r2_light_fixture_7/8/13/14/15),
+#   后来在闸 4 被标成 shared, 类 mesh 也出来了, 但 pick_mesh **优先**用实例专属 mesh,
+#   于是那 5 个孤儿照样各用各的 —— "shared"对组装是个空操作, 而且不报错。
+#   盘上的旧 mesh 不会自己消失, 所以只能在这里按人的决定压过它们。
+KEEP_W=set(x.strip() for x in os.environ.get("SOLO_KEEP","").split(",") if x.strip())
+def pick_mesh(w, oid):
+    """优先用这个实例专属的 mesh, 没有才退回该类共用的。
+    第三条退路: 有些词 SAM3 一个实例都没跟到, 全靠召回捡回来 —— 它们从来没生成过类 mesh,
+    只有召回代表那一个实例 mesh。没有这条退路, 这些词会整个从场景里消失, 而它们正是召回
+    最该体现价值的部分。借这个词自己的任一实例 mesh 用, 比整个丢掉合理。"""
+    if (w in KEEP_W or base_word(w) in KEEP_W) and w in MESH:
+        return MESH[w]           # 人判了共用, 压过盘上残留的实例专属 mesh(见上面 KEEP_W)
+    solo=f"{TAG}_{w.replace(' ','_')}_{oid}"
+    if solo in AVAIL: return solo
+    if w in MESH: return MESH[w]
+    c=INST.get(w)
+    return sorted(c)[0] if c else None
+SNAP_GROUND=os.environ.get("SNAP_GROUND","1")=="1"   # 强制所有物体落在地面上
+# 房间壳 (room_shell.py 出的 floor + wall_*)。给了就用它当地面, 不再铺那张覆盖全场的大方片。
+# 室内必须给 —— 大方片是按物体范围 +8m 铺的, cyberpunk 上铺成 30x30m 一块灰板, 一眼就穿帮。
+# 室外不给, 走原来的大方片 (街景本来就没有闭合房间)。
+# ★ 壳是 room_shell.py 用 --up y 导出的, 已经在最终的 glTF 系里, 所以必须在文件末尾
+#   那个 FLIP 之后才并进来, 否则会被转两次。
+# ★ 这个变量原来叫 SHELL, 撞上了系统自带的同名环境变量(每个 shell 里它都等于 /bin/bash)。
+# 脚本无条件继承到它, 于是每次都走"用房间壳"那条路, 然后拿 /bin/bash 当 mesh 加载崩掉。
+# 室内那边显式传了 SHELL= 空值覆盖掉才没事, 室外没传, 整个组装步骤直接挂死(退出码 1)。
+# 教训: 环境变量名要挑不会和系统撞的。
+# 旧名字兼容一轮: 只认看起来像文件的值。
+ROOM_SHELL=os.environ.get("ROOM_SHELL","") or (
+    os.environ.get("SHELL","") if os.environ.get("SHELL","").endswith((".glb",".ply",".obj")) else "")
+FLOAT_WORDS=set(x for x in os.environ.get("FLOAT_WORDS","awning,traffic light,billboard,sign").split(",") if x)
+BOXES=os.environ.get("BOXES", f"{ROOT}/06_all_boxes.json")   # 换成 06_all_boxes_merged.json 即含召回
+boxes=json.load(open(BOXES))
+
+cache={}
+def get_mesh(key):
+    w=key
+    if w not in cache:
+        s=trimesh.load(f"{OUTS}/{w}/{w}.glb")
+        m=s.dump(concatenate=True) if hasattr(s,"dump") else s
+        m.apply_translation(-m.bounds.mean(0))          # 中心到原点
+        cache[w]=m
+    return cache[w].copy()
+
+# --- 地面: 用所有实例的盒底拟合一个平面 (物体都站在地上) ---
+pts=[]
+for w,bs in boxes.items():
+    for b in bs:
+        c=np.array(b["中心"]); h=b["尺寸"][2]
+        pts.append(c - UP*h/2)                          # 盒底中心
+pts=np.array(pts)
+# 地面必须是水平的 —— 真实的"天"已经由 up 那步从点云主平面拟合出来了(world_up.json),
+# 在这个坐标系里地面按定义就是水平面, 只剩"多高"一个未知数。
+#
+# 老写法拟合的是带坡度的 y = a*x + b*z + c, 结果被盒底噪声带歪了约 10°:
+# carpark 的地面片在 96x67m 的范围上竖直方向跨了 17 米(y 2.08~19.34),
+# 直接斜插穿过物体群(物体 y 0.38~14.05)。以前地面是单面背朝上、看不见, 没人发现;
+# 一把法向修正过来, 它就糊住了整个画面。
+#
+# 所以只沿 UP 求一个高度: 1D RANSAC 取"盒底最扎堆"的那一层。
+# 用众数而不是最低点/中位数 —— 最低点会被一个飘到地下的误检拉走,
+# 中位数会被半空中的广告牌、树冠盒底抬高。
+# ★ 地面高度优先取点云直接拟合的那个 (world_up.py 存的 ground_h)。
+# 从盒底反推是错的源头: 俯视场景里盒子的高度被压扁, 盒底本身就散了十几米
+# (beach 实测跨 14.9m), 拿它推出来的地面必然穿过物体群中间, 上下都贴不上。
+# 地面在点云里本来就是一整片实测数据, 不该用一堆错的盒底去猜它。
+# ★ 直接用文件开头 load_up 已经拿到的 _GH, 不再自己 json.load 一遍。
+#   原来那份是 try/except Exception: pass —— world_up.json 一旦损坏就悄悄退回盒底反推,
+#   日志只会说"用 N 个盒底拟合", 看不出这是降级。而降级的后果是整个地面高度错掉。
+_gh = _GH
+
+hh = pts @ UP                                    # 每个盒底沿"天"方向的高度
+cand = np.sort(hh)
+best_n, best_h = -1, float(np.median(hh))
+for h0 in cand:                                  # 盒底本身就是最好的候选高度
+    n_in = int((np.abs(hh - h0) < 0.5).sum())
+    if n_in > best_n: best_n, best_h = n_in, h0
+inl = np.abs(hh - best_h) < 0.5
+best_h = float(hh[inl].mean())                   # 用内点精修
+if _gh is not None:
+    print(f"[地面] 用点云拟合的高度 {_gh:.2f} m (盒底反推会给出 {best_h:.2f} m, 不用它)")
+    best_h = float(_gh)
+else:
+    print(f"[地面] {len(pts)} 个盒底中 {int(inl.sum())} 个在地面上, "
+          f"残差中位 {np.median(np.abs(hh[inl]-best_h)):.2f} m (水平面, 高度 {best_h:.2f} m)")
+
+scene=trimesh.Scene(); n=0; skipped=[]
+# ---- 每类一个统一缩放 ----
+# 基准 = 生成这个类 mesh 时用的那个实例。它是 VLM 校验过、抠得最完整的那一个,
+# 拿它定尺寸和 mesh 本身自洽。查不到(被去重合并了)就退回"剔掉离群后的中位数"。
+#
+# 试过但不对的两条:
+#   点数最多的  —— table 点数最多的 5 号其实是误检(抠了一辆红车+卡车, 盒子 2.7x2.4m),
+#                  当基准把整类桌子撑到 1.18 米(真实 0.7)。
+#   取分布上半段 —— 理由是"遮挡只会让盒子变小", 但漏了反向的错: mask 抠多了盒子会变大
+#                  (table 有 4.8m 和 8.2m 的盒子), 两头都有噪声, 取大端等于专挑抠多的。
+PICKS=json.load(open(f"{ROOT}/04_picks/picks.json"))
+# 这些类真实世界里本来就有大有小, 不统一 —— 树 0.66~4.84m 全压成 2.78m 会把大树压矮一半
+PER_INSTANCE=set(os.environ.get("PER_INSTANCE","tree").split(","))
+def one_scale(ext, me):
+    ext=np.array(ext)
+    return (np.sort(ext)[::-1][0]/max(np.sort(me)[::-1][0],1e-6)) if ext[2]<0.2 \
+           else ext[2]/max(me[1],1e-6)
+
+def ruler(ext):
+    """one_scale 实际拿哪个量去定尺寸。类内守卫必须比**这个**量, 不能比 ext.max()。
+    ★ 为什么: 高度和最长边是两个量, 一个物体可以最长边只差 1.5 倍而高度差 5 倍
+      (mask 横向漂移就是这个形状)。守卫要判的是"摆出来会不会大小离谱",
+      那就必须比 one_scale 真正拿去算的那个量, 否则判的和发生的不是一回事。
+    ★ 注意: 守卫和中位数两处都要求 ext[2]>=0.2, 所以在守卫这条路上只会走 ext[2] 分支;
+      max 那半是给别的调用者留的(和 one_scale 保持同构)。"""
+    ext=np.asarray(ext, float)
+    return float(np.max(ext)) if ext[2] < 0.2 else float(ext[2])
+
+# --- SAM3D 生成的 mesh 没有统一朝向 ---
+# 下面 R 的写法默认"mesh 的长轴在自己的 +Z 上", 但 SAM3D 并不保证这件事:
+# carpark 里 19 辆 car 全在 Z(对), 5 个 van、5 个 barrier、14 个 container 里 10 个却在 X(错 90°)。
+# 结果就是盒子明明摆对了, 物体自己却横过来 —— 集装箱围墙整片转 90°。实测 51 个物体里 17 个中招。
+# 修法: 摆之前先量 mesh 自己在水平面(XZ)上的长轴, 绕自己的 Y 转到 +Z, 再交给 R。
+# 只对确实细长的做(长宽比 > YAW_MIN_AR); 接近方的物体长轴是噪声, 转了反而乱。
+# 这解决的是 90°, 解决不了 180° 正反 —— 那个还是没解。
+YAW_MIN_AR = float(os.environ.get("YAW_MIN_AR","1.15"))
+YAW_FIX    = os.environ.get("YAW_FIX","1")=="1"
+_yaw_n=[0,0]
+def yaw_to_z(m):
+    if not YAW_FIX: return np.eye(4)
+    V=m.vertices[:,[0,2]]                      # 只看水平面
+    e=V.max(0)-V.min(0)
+    if max(e)/max(min(e),1e-6) < YAW_MIN_AR:
+        _yaw_n[1]+=1; return np.eye(4)         # 太方, 不动
+    Q=V-V.mean(0); ev,W=np.linalg.eigh(Q.T@Q)
+    a=W[:,np.argmax(ev)]                       # (x,z) 上的长轴
+    th=np.arctan2(a[0],a[1])                   # 要把它转到 +Z
+    ct,st=np.cos(-th),np.sin(-th)
+    T=np.eye(4); T[0,0],T[0,2],T[2,0],T[2,2]=ct,st,-st,ct
+    _yaw_n[0]+= int(abs(np.degrees(th))>45)
+    return T
+
+# ---- 类内相对守卫的基准: 每个词自己的"最长边中位数" ----
+# ★ 为什么还要再来一道: MIN_H/MAX_D 是**绝对**阈值, 它只知道"这个盒子本身离谱吗",
+#   不知道"这个盒子和同类的另外 12 个自相矛盾吗"。beach 实测 street lamp 13 个实例最长边
+#   从 2.89 m 到 42.39 m 差 14 倍, MAX_D=15 只拦下 4 个, 12.63/11.43/11.19/10.70 米的路灯
+#   和 0.87 米的路灯并肩摆进同一个场景, 一个都没拦。
+#   而绝对阈值往两边都不对: 校准前压缩的世界里它拦不住, 校准后放大的世界里它开始误杀
+#   (restaurant 真实 17.5 m 会被 MAX_D 冤枉)。相对判据不受全局尺度影响, 正好补上这一段。
+# ★ 必须在下面那个 CLASS_SCALE 循环**之外**单独扫一遍: 那个循环会因为"排除词"和"没有类 mesh"
+#   提前 continue, 而这些词的实例仍然能靠 pick_mesh 的第三条退路被摆出来, 拿不到中位数。
+REL_N     = float(os.environ.get("REL_N", "2.5"))   # 和类内中位数差这么多倍就当量错了
+REL_MIN_N = int(os.environ.get("REL_MIN_N", "4"))   # 类内实例数不到这个数, 中位数不可信, 不判
+# ★ 中位数只用**过了绝对守卫**的那些盒子算。
+#   拿全量算是错的, 而且错得很隐蔽: street lamp 13 个实例里有 42.39/31.32/17.08/15.67 四个
+#   垃圾盒子, 它们把中位数抬到 11.19 m —— 于是"和中位差 2.5 倍"判下来, 被拦掉的反而是
+#   2.89/3.35/3.98/4.01 这四根**唯一符合常识**的路灯, 12.63 那根倒留下了。方向整个是反的。
+#   剔掉垃圾之后中位变成 5.05 m, 拦的对象立刻翻转 —— 一行之差, 结论相反。
+def _abs_ok(b):
+    e=np.array(b["尺寸"]); return not (e[2]<MIN_H or e.max()>MAX_D)
+# ★ 只收 ext[2]>=0.2 的盒子进中位数。ruler 会按这个界在"最长边"和"高度"之间切换,
+#   而绝对守卫的下限是 MIN_H=0.15 —— 高度落在 [0.15,0.20) 的盒子会过绝对守卫却贡献最长边,
+#   和贡献高度的盒子混进同一个统计量, 两个量纲搅在一起。扁的那批也不判(它们本来就该被
+#   当成薄片处理)。
+CLASS_EXT_MED={}
+_by_base={}
+for _w,_bs in boxes.items():
+    _good=[ruler(b["尺寸"]) for b in _bs if _abs_ok(b) and b["尺寸"][2] >= 0.2]
+    if len(_good) >= REL_MIN_N:
+        CLASS_EXT_MED[_w]=float(np.median(_good))
+    _by_base.setdefault(base_word(_w), []).extend(_good)
+# ★ 派生子类退回母词。人在闸口把 umbrella 分成三组各 4 个之后, 每组自己算中位数 ——
+#   大伞自成一组就不再"离群", 同样那两把在分组前会被拦、分组后一个都不拦。
+#   再分细一点(某组只有 3 个)那一整组就彻底没有相对守卫了, 而且不吭声。
+#   守卫的强度不该由人怎么分组来决定, 所以查不到原词时用母词的中位数兜底。
+def _med_of(w):
+    m = CLASS_EXT_MED.get(w)
+    if m is not None: return m
+    g = _by_base.get(base_word(w)) or []
+    return float(np.median(g)) if len(g) >= REL_MIN_N else None
+
+CLASS_SCALE={}; dropped=0; DEGENERATE=set()
+for w,bs in boxes.items():
+    if w in EXCLUDE or base_word(w) in EXCLUDE or not bs: continue
+    mk=MESH.get(w)
+    if mk is None: continue
+    me=get_mesh(mk).extents
+    S=np.array([one_scale(b["尺寸"], me) for b in bs])
+    keep=np.abs(np.log(S/np.median(S)))<np.log(2.0)        # 和中位差 2 倍以上 = 离群, 不参与
+    dropped += int((~keep).sum())
+    oid=PICKS.get(w,{}).get("obj_id")
+    hit=[i for i,b in enumerate(bs) if b["obj_id"]==oid]
+    # ★ 生成实例是首选基准, 但**它自己也可能是那个离群的**。一旦是, 拿它定基准等于
+    #   把整类一起带歪 —— 一个词只有一个 CLASS_SCALE, 错一次错全类, 这是这里最贵的一种错。
+    #   所以先问一句它在不在 keep 里, 不在就退回中位数。
+    if hit and keep[hit[0]]:
+        CLASS_SCALE[w]=float(S[hit[0]]); src="生成实例"
+    elif hit:
+        CLASS_SCALE[w]=float(np.median(S[keep])); src="生成实例离群→改用中位"
+    else:
+        CLASS_SCALE[w]=float(np.median(S[keep])); src="离群后中位"
+    # 整类的兜底: 单个盒子已经有 ext.max()>15 的守卫, 但那守的是"盒子", 守不住"mesh 烂".
+    # carpark 的 barrier: SAM3D 把护栏生成成了一张 1.00x0.09x0.01 的薄片, 高度只有 9cm。
+    # 对高度时要除以这 0.09, 尺度被放大 17.5 倍 —— 9 个护栏全变成 17.6 米的巨大平板,
+    # 横在整个停车场上把别的都挡住了。盒子本身是正常的, 所以老守卫一个都没拦下。
+    if CLASS_SCALE[w]*me.max() > 15:
+        print(f"  [{w:16s}] 整类丢弃: 摆出来会是 {CLASS_SCALE[w]*me.max():.1f} m "
+              f"(mesh {np.round(me,3).tolist()} 太扁, 对高度时除出了大尺度)")
+        CLASS_SCALE.pop(w); DEGENERATE.add(w); continue
+    print(f"  [{w:16s}] {len(bs):3d} 个 -> 统一 {CLASS_SCALE[w]*me.max():.2f} m  ({src})")
+print(f"  定基准时忽略了 {dropped} 个离群实例")
+
+solo_used=0
+for w,bs in boxes.items():
+    if w in EXCLUDE or base_word(w) in EXCLUDE or w in DEGENERATE: continue
+    for b in bs:
+        # 人在闸口否掉的: 类名被否 = 整个词不要, 实例名被否 = 只这一个不要
+        if _gen_name(w) in SKIP_NAMES or _gen_name(w, b["obj_id"]) in SKIP_NAMES:
+            skipped.append((w,b["obj_id"],[],"人工否掉")); continue
+        # ★ VLM 否决只是提醒。没被人放行 -> 不摆; 放行了 -> 只许用它自己的 mesh
+        #   (或人判了共用的类 mesh), 不许按名字借同词别人的 —— 那就是 8 米长的 car_0。
+        _vetoed = b["obj_id"] in VLM_REJ.get(w, ())
+        if _vetoed and _gen_name(w, b["obj_id"]) not in VLM_REL:
+            skipped.append((w,b["obj_id"],[],"VLM否决(人没放行)")); continue
+        mk=pick_mesh(w, b["obj_id"])
+        if mk is None: continue
+        if _vetoed and mk != _gen_name(w, b["obj_id"]) and not (
+                (w in KEEP_W or base_word(w) in KEEP_W) and mk == MESH.get(w)):
+            skipped.append((w,b["obj_id"],[],"VLM否决已放行, 但还没有自己的 mesh(不借别人的)")); continue
+        # ★ 还要拿**实际用上的那个 mesh** 再比一次。pick_mesh 的第三条退路会借同词
+        #   另一个实例的 mesh —— 人否掉了 be_r2_w_0, 实例 1 没有自己的 mesh, 于是借了
+        #   be_r2_w_0 摆出来: 名义上的名字不在名单里, 被否掉的东西照样出现在场景里。
+        if mk in SKIP_NAMES:
+            skipped.append((w,b["obj_id"],[],"人工否掉(借的是被否的mesh)")); continue
+        ext=np.array(b["尺寸"])
+        if ext[2]<MIN_H or ext.max()>MAX_D:
+            skipped.append((w,b["obj_id"],ext.round(2).tolist(),"绝对")); continue
+        # ---- 类内相对守卫 ----
+        # ★ 只守**盒子决定尺寸**的那条路: 专属 mesh 和逐实例词走下面的 one_scale(ext, me),
+        #   盒子量错多少, 摆出来就大多少倍 —— 12 米的垃圾桶就是这么来的。
+        #   走类统一缩放(CLASS_SCALE)的那条路不守: 那些实例摆出来全是同一个尺寸,
+        #   盒子离谱只影响它自己的位置, 拦掉等于白删一个本来好好的物体。
+        #   第一版守反了(守在类统一那条), 净效果是只误杀不多拦, 实测 57 个变 51 个。
+        _self_scaled = (mk != MESH.get(w)) or (base_word(w) in PER_INSTANCE)
+        # ★ 类内守卫对**所有**实例生效, 不只是自缩放的那些。
+        #   共用词的实例虽然摆出来都是同一个尺寸(尺寸来自 CLASS_SCALE), 但它的**位置和朝向**
+        #   仍然是从这个盒子来的 —— 一个在定尺寸的那个量上偏了 2.5 倍的盒子, 中心多半也是错的。
+        #   实测(beach, 中位数剔过垃圾之后): 全类生效只拦下 street lamp 的 10.29m 和 10.44m
+        #   两根, 别的类一个都没误杀 —— 正是渲染回图里那根巨大的路灯。
+        #   只限自缩放分支的话, 这两根照样摆进场景。
+        _med=_med_of(w)
+        if _med and ext[2] >= 0.2:
+            _dev = np.log(max(ruler(ext),1e-6)/_med)
+            # ★ 方向是不对称的, 这一点很关键:
+            #   **偏大**  = mask 跨帧漂移 / 深度拖尾, 盒子被横着拉开 —— 这种盒子的中心也是错的,
+            #             不管尺寸从哪来, 位置都不能要。beach 那两根 10.4 米的路灯就是:
+            #             水平占地 11 米、厚度 0.65 米、点数只有正常杆子的 1/10。
+            #   **偏小**  = 遮挡截短。这是这条链上最常见的噪声, 而且**只影响尺寸不影响中心**。
+            #             对走类统一缩放的实例, 尺寸本来就来自 CLASS_SCALE 不来自这个盒子,
+            #             按偏小拦掉纯属白删 —— 实测会误杀 timesquare 的一根路灯、一辆卡车,
+            #             以及 WD 支线上 36 个盆栽里的 5 个(它们高度是连续分布, 不是离群)。
+            #   所以: 自缩放的两头都判(尺寸真由盒子定); 类统一缩放的只判偏大。
+            if _dev > np.log(REL_N) or (_self_scaled and -_dev > np.log(REL_N)):
+                _why = "类内偏大(盒子横向拉开, 中心也不可信)" if _dev > 0 else "类内偏小"
+                skipped.append((w,b["obj_id"],
+                                f"{ruler(ext):.2f}m vs 类内中位 {_med:.2f}m", _why)); continue
+        m=get_mesh(mk); me=m.extents
+        solo_used += (mk != MESH.get(w))
+        me=m.extents
+        if _self_scaled:                                 # 专属 mesh(8 辆车) 和树: 各按各的
+            s = one_scale(ext, me)
+        else:
+            s = CLASS_SCALE.get(w)
+            if s is None: continue
+        # ★ 守门要再查一次**摆出来的尺寸**, 不能只查盒子。
+        #   one_scale 是拿盒子**高度**去缩 mesh 的, 所以最终多大 = mesh 自己的比例 x 高度 ——
+        #   mesh 比例和盒子比例对不上的时候, 一个过了 MAX_D 的盒子照样能摆出个超标的东西。
+        #   实测 office 2026-09-20 的 ventilation duct: 盒子 8.97x1.65x1.52(最长边 8.97 < 15,
+        #   放行), 而 mesh 是根细管(归一化 0.105 x 0.087 x 1.0), 按高度 1.52 缩 = 17.5 倍,
+        #   长轴被拉成 17.5 m, 飞到离场景中心 27 m 的地方, 一声不吭。
+        _placed = float(np.max(np.asarray(me, float) * s))
+        if _placed > MAX_D:
+            skipped.append((w, b["obj_id"],
+                            f"摆出来 {_placed:.1f}m > MAX_D={MAX_D} (盒子最长边才 {float(np.max(ext)):.1f}m, "
+                            f"mesh 比例和盒子对不上)", "摆出来超上限")); continue
+        m.apply_scale(s)
+        m.apply_transform(yaw_to_z(m))                   # ★ 先把 mesh 自己的长轴摆到 +Z
+        fwd=np.array(b["长轴"]); fwd=fwd-UP*(fwd@UP); fwd/=np.linalg.norm(fwd)
+        rgt=np.cross(UP,fwd)
+        R=np.eye(4); R[:3,0],R[:3,1],R[:3,2]=rgt,UP,fwd  # mesh X->右 Y->上 Z->前
+        m.apply_transform(R)
+        c=np.array(b["中心"])
+        bottom=c-UP*ext[2]/2
+        # ★ 强制落地: 盒子高度在俯视场景里量不准, 用它算出来的"底"有的悬空有的埋地。
+        # 物体本来就该站在地上, 所以直接把底放到地面高度, 不信盒子自己算的。
+        # 本该悬空的(雨篷/树冠/灯头)靠 FLOAT_WORDS 放过, 不参与强制落地。
+        if SNAP_GROUND and w not in FLOAT_WORDS:
+            bottom = bottom - UP*((bottom@UP) - best_h)
+        # 精确落地: 把 mesh 最低点对到盒底
+        h_now=(m.vertices@UP); m.apply_translation(UP*((bottom@UP)-h_now.min()))
+        # 水平对中
+        d=c-m.bounds.mean(0); d=d-UP*(d@UP); m.apply_translation(d)
+        scene.add_geometry(m, node_name=f"{w.replace(' ','_')}_{b['obj_id']}")
+        n+=1
+
+# --- 地面片: 覆盖所有物体的范围 (没有房间壳时才铺) ---
+allp=np.array([b["中心"] for bs in boxes.values() for b in bs])
+mn,mx=allp.min(0)-8, allp.max(0)+8
+gx=np.linspace(mn[0],mx[0],2); gz=np.linspace(mn[2],mx[2],2)
+# 平面上任取一点 = best_h*UP, 再沿两个与 UP 正交的方向铺开
+_e1 = np.array([1,0,0.]); _e1 = _e1 - UP*(_e1@UP)
+if np.linalg.norm(_e1) < 1e-6: _e1 = np.array([0,0,1.]) - UP*(np.array([0,0,1.])@UP)
+_e1 /= np.linalg.norm(_e1); _e2 = np.cross(UP,_e1)
+_ctr = allp.mean(0); _ctr = _ctr - UP*(_ctr@UP) + UP*best_h
+_r = float(np.abs((allp-_ctr) @ np.c_[_e1,_e2]).max()) + 8
+V=[_ctr + a*_r*_e1 + b*_r*_e2 for a in (-1,1) for b in (-1,1)]
+V=np.array(V); F=np.array([[0,1,3],[0,3,2]])
+ground=trimesh.Trimesh(V,F)
+# 单面渲染时法向朝哪边决定从哪边看得见。不校正的话从上往下看地面是隐形的,
+# 只有从地底下才看得见, 一眼像"没生成地面"。
+# 注意这里还在 DA3 世界系, 上 = UP = [0,-1,0], 也就是 -y;
+# 文件末尾的 FLIP 才把它翻成 glTF 约定的 +y。所以这里要让法向朝 -y。
+if float(ground.face_normals[0] @ UP) < 0: ground.faces = ground.faces[:, ::-1]
+ground.visual.face_colors=[130,130,135,255]
+if not ROOM_SHELL:
+    scene.add_geometry(ground,node_name="ground")
+else:
+    print(f"[地面] 用房间壳代替大方片: {os.path.basename(ROOM_SHELL)}")
+
+# DA3 世界系 = 首帧相机系 (OpenCV, y 朝下), glTF 约定 y 朝上, 差 180°。
+# 内部一直用 DA3 系(渲染回图要对上原相机), 只在导出时翻过来。
+# 导出前把整个世界转正: 让真实的"天"对准 glTF 的 +y。
+# 老代码只做了 FLIP(翻 y/z), 那等于默认"天"就是 -y —— 相机低着头时这个默认是错的,
+# 于是地面和物体一起歪着导出去(beach 地面在竖直方向跨了 33 米, 本该接近 0)。
+# 注意这一步只解决"歪", 解决不了"矮": 高度是在量盒子那步定的, 那边也已经改用真实的天了。
+# ★ UP 本身就是"天": 整条链取高度用 P@UP, 值越大越高。老代码 FLIP=diag(1,-1,-1)
+# 把 UP=[0,-1,0] 映射到 +y, 也印证了这一点。第一版这里写成 -UP, 等于把天当成地,
+# 导出后地面跑到物体上方、路灯整根挂在地面下面(顶贴地、底 -4.7m)。
+# 导出旋转从 world_frame 拿。渲染回图那边用 inverse_T, 两边同源, 不许各算各的 ——
+# 2026-09-08 就是这里改了、渲染回图没跟着改, carpark 差 29°、beach 差 154°,
+# 四张验收图全废还被当依据看了好几天。
+from world_frame import deviation_deg
+FLIP = export_T(UP)
+print(f"[转正] 把真实的天转到 +y, 相对老写法差 {deviation_deg(UP):.1f}°")
+scene.apply_transform(FLIP)
+
+# --- 房间壳: FLIP 之后并进来 (它自己已经是最终 glTF 系) ---
+nw=0
+if ROOM_SHELL:
+    if not os.path.exists(ROOM_SHELL): sys.exit(f"[失败] 找不到房间壳 {ROOM_SHELL}")
+    shl=trimesh.load(ROOM_SHELL, force="scene")
+    for node in shl.graph.nodes_geometry:
+        T,gn=shl.graph[node]; g=shl.geometry[gn].copy(); g.apply_transform(T)
+        # 节点名要保住 floor / wall_N —— 下游 scene_phys 靠名字区分"地面/静态墙/可动物体"
+        scene.add_geometry(g, node_name=node)
+        nw += node.startswith("wall")
+    print(f"[房间壳] 并入 floor + {nw} 面墙")
+
+dst=f"{ROOT}/"+os.environ.get("SCENE_OUT","07_scene.glb"); scene.export(dst)
+print(f"[组装] {n} 个物体 + {'房间壳(floor+%d墙)'%nw if ROOM_SHELL else '地面'} -> {dst}"
+      f"  (其中 {solo_used} 个用了实例专属 mesh, 排除了 {sorted(EXCLUDE)})")
+print(f"[朝向] 把 mesh 自身长轴对齐到盒子长轴: 其中 {_yaw_n[0]} 个原本歪了 45°以上, {_yaw_n[1]} 个太方没动")
+if skipped:
+    # 按原因分开报 —— 混在一起的话, 排查时分不清是"阈值定错了"还是"盒子本身量错了",
+    # 而这两件事的修法完全相反。
+    _by={}
+    for w,oid,ext,why in skipped: _by.setdefault(why,[]).append((w,oid,ext))
+    print(f"[跳过] 共 {len(skipped)} 个:")
+    for why,items in sorted(_by.items()):
+        print(f"   {why:14s} {len(items):3d} 个: {items[:5]}")

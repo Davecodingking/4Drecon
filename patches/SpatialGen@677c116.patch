@@ -1,0 +1,61 @@
+diff --git a/src/inference_sd.py b/src/inference_sd.py
+index 9350b55..e99f382 100644
+--- a/src/inference_sd.py
++++ b/src/inference_sd.py
+@@ -14,6 +14,13 @@ import gc
+ import shutil
+ 
+ import accelerate
++# 5090 patch: xformers 0.0.32 在算力>=9.0 的卡上一律选 FlashAttention-3(Hopper 专用) 内核, sm_120 上报 CUDA invalid argument;
++# 关掉 FA3 让它退回 flash2/cutlass 内核
++try:
++    import xformers.ops.fmha.dispatch as _xf_dispatch
++    _xf_dispatch._get_use_fa3 = lambda: False
++except Exception:
++    pass
+ import torch
+ import torchvision
+ import numpy as np
+@@ -1853,11 +1860,11 @@ def main():
+     val_loader = torch.utils.data.DataLoader(
+         val_dataset,
+         batch_size=1,
+-        num_workers=1,
++        num_workers=0,  # 5090 patch: 数据集里有 CUDA 渲染器, 子进程共享 CUDA 张量报 pidfd_getfd 不允许, 改主进程加载
+         drop_last=False,
+         pin_memory=True,
+         worker_init_fn=worker_init_fn,
+-        persistent_workers=True,
++        persistent_workers=False,  # 5090 patch: num_workers=0 时必须为 False
+     )
+ 
+     logger.info(f"Load [{len(val_loader)}] validation samples\n")
+@@ -1868,7 +1875,9 @@ def main():
+         TARGET_ROOM_UIDS_PROMPTS = {args.scene_id: args.style_prompt}
+         logger.info(f"TARGET_ROOM_UIDS_PROMPTS: {TARGET_ROOM_UIDS_PROMPTS}")
+     elif val_dataset.load_dataset == "spatiallm":
+-        raise NotImplementedError("spatiallm dataset is not supported yet.")
++        # 5090 patch: 作者留的 NotImplementedError; 其实下面的推理对 spatiallm 分支只缺 prompts 这一个变量, 和 spatialgen 一样处理即可
++        TARGET_ROOM_UIDS_PROMPTS = {args.scene_id: args.style_prompt}
++        logger.info(f"TARGET_ROOM_UIDS_PROMPTS (spatiallm): {TARGET_ROOM_UIDS_PROMPTS}")
+ 
+     rooms_infer_res_dict = log_val_autoregressive_from_dataloader(
+         validation_dataloader=val_loader,
+@@ -1894,6 +1903,11 @@ def main():
+         if os.path.isdir(os.path.join(infer_dir, "val", f))
+         and os.path.exists(os.path.join(infer_dir, "val", f, "inference_results.npz"))
+     ]
++    # 5090 patch: 存在 SKIP_GS_RECON 标记文件或环境变量时跳过 3DGS 训练+渲染 (只要生成图时用)
++    import os as _os
++    if _os.environ.get("SKIP_GS_RECON") or _os.path.exists(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "SKIP_GS_RECON")):
++        logger.info("SKIP_GS_RECON set -> skip gaussian reconstruction")
++        return
+     os.chdir("./src/recons/Sparse-RaDeGS")
+     for room_output_folder in room_output_folders:
+         logger.info(f"Reconstructing scene: {room_output_folder}")
+diff --git a/src/recons/Sparse-RaDeGS b/src/recons/Sparse-RaDeGS
+--- a/src/recons/Sparse-RaDeGS
++++ b/src/recons/Sparse-RaDeGS
+@@ -1 +1 @@
+-Subproject commit ee7b413d2089322dd140f644d597957aca257c09
++Subproject commit ee7b413d2089322dd140f644d597957aca257c09-dirty

@@ -33,7 +33,7 @@ say () { echo; echo "########## $* ($(date '+%m-%d %H:%M:%S')) ##########"; }
 gpu () {
   local tries=0
   while :; do
-    ( flock 9; "$@" ) 9>>/tmp/outdoor_pipeline_gpu.lock && return 0
+    ( flock 9; "$@" ) 9>>"/tmp/outdoor_pipeline_gpu$(d=${CUDA_VISIBLE_DEVICES:-0}; d=${d%%,*}; echo ${d:-0}).lock" && return 0
     tries=$((tries+1))
     [ $tries -ge 3 ] && { echo "!! 连续 $tries 次失败, 放弃: $*"; return 1; }
     echo "!! 失败(多半是 OOM/抢卡), 5 分钟后第 $((tries+1)) 次重试"; sleep 300

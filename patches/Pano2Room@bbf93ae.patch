@@ -1,0 +1,326 @@
+diff --git a/modules/geo_predictors/omnidata/modules/midas/base_model.py b/modules/geo_predictors/omnidata/modules/midas/base_model.py
+index 5cf4302..bdf913f 100644
+--- a/modules/geo_predictors/omnidata/modules/midas/base_model.py
++++ b/modules/geo_predictors/omnidata/modules/midas/base_model.py
+@@ -8,7 +8,7 @@ class BaseModel(torch.nn.Module):
+         Args:
+             path (str): file path
+         """
+-        parameters = torch.load(path, map_location=torch.device('cpu'))
++        parameters = torch.load(path, map_location=torch.device('cpu'), weights_only=False)
+ 
+         if "optimizer" in parameters:
+             parameters = parameters["model"]
+diff --git a/modules/geo_predictors/omnidata/omnidata_normal_predictor.py b/modules/geo_predictors/omnidata/omnidata_normal_predictor.py
+index aedea1c..05d7c5e 100644
+--- a/modules/geo_predictors/omnidata/omnidata_normal_predictor.py
++++ b/modules/geo_predictors/omnidata/omnidata_normal_predictor.py
+@@ -18,7 +18,7 @@ class OmnidataNormalPredictor(GeoPredictor):
+         ckpt_path = './checkpoints/omnidata_dpt_normal_v2.ckpt'
+         self.model = DPTDepthModel(backbone='vitb_rn50_384', num_channels=3)
+         self.model.to(torch.device('cpu'))
+-        checkpoint = torch.load(ckpt_path, map_location=torch.device('cpu'))
++        checkpoint = torch.load(ckpt_path, map_location=torch.device('cpu'), weights_only=False)
+         if 'state_dict' in checkpoint:
+             state_dict = {}
+             for k, v in checkpoint['state_dict'].items():
+diff --git a/modules/geo_predictors/omnidata/omnidata_predictor.py b/modules/geo_predictors/omnidata/omnidata_predictor.py
+index 34e4f22..d9e24cd 100644
+--- a/modules/geo_predictors/omnidata/omnidata_predictor.py
++++ b/modules/geo_predictors/omnidata/omnidata_predictor.py
+@@ -38,7 +38,7 @@ class OmnidataPredictor(GeoPredictor):
+         ckpt_path = './checkpoints/omnidata_dpt_depth_v2.ckpt'
+         self.model = DPTDepthModel(backbone='vitb_rn50_384', num_channels=1)
+         self.model.to(torch.device('cpu'))
+-        checkpoint = torch.load(ckpt_path, map_location=torch.device('cpu'))
++        checkpoint = torch.load(ckpt_path, map_location=torch.device('cpu'), weights_only=False)
+         if 'state_dict' in checkpoint:
+             state_dict = {}
+             for k, v in checkpoint['state_dict'].items():
+diff --git a/modules/geo_predictors/pano_geo_refiner.py b/modules/geo_predictors/pano_geo_refiner.py
+index f78af3d..aacd857 100644
+--- a/modules/geo_predictors/pano_geo_refiner.py
++++ b/modules/geo_predictors/pano_geo_refiner.py
+@@ -3,7 +3,7 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ from utils.camera_utils import *
+ from modules.geo_predictors.networks import VanillaMLP
+-import tinycudann as tcnn
++from modules.geo_predictors.torch_hashgrid import TorchHashGrid, eval_field_chunked  # 替代 tinycudann（sm_120 二阶反传不可用）
+ 
+ from tqdm import tqdm
+ 
+@@ -16,17 +16,14 @@ class SphereDistanceField(nn.Module):
+                  fine_res=4096):
+         super().__init__()
+         per_level_scale = np.exp(np.log(fine_res / base_res) / (n_levels - 1))
+-        self.hash_grid = tcnn.Encoding(
++        self.hash_grid = TorchHashGrid(
+             n_input_dims=3,
+-            encoding_config={
+-                "otype": "HashGrid",
+-                "n_levels": n_levels,
+-                "n_features_per_level": 2,
+-                "log2_hashmap_size": log2_hashmap_size,
+-                "base_resolution": base_res,
+-                "per_level_scale": per_level_scale,
+-                "interpolation": "Smoothstep",
+-            }
++            n_levels=n_levels,
++            n_features_per_level=2,
++            log2_hashmap_size=log2_hashmap_size,
++            base_resolution=base_res,
++            per_level_scale=per_level_scale,
++            interpolation="Smoothstep",
+         )
+ 
+         self.geo_mlp = VanillaMLP(dim_in=n_levels * 2 + 3,
+@@ -146,7 +143,7 @@ class PanoGeoRefiner:
+ 
+ 
+         # Get new distance map and normal map
+-        new_distances, new_grads = sp_dis_field(pano_dirs.reshape(-1, 3), requires_grad=True)
++        new_distances, new_grads = eval_field_chunked(sp_dis_field, pano_dirs.reshape(-1, 3))
+         new_distances = new_distances.detach().reshape(height, width, 1)
+         new_normals = self.grads_to_normal(new_grads.detach().reshape(height, width, 3))
+ 
+diff --git a/modules/geo_predictors/pano_joint_predictor.py b/modules/geo_predictors/pano_joint_predictor.py
+index 722289b..27f8034 100644
+--- a/modules/geo_predictors/pano_joint_predictor.py
++++ b/modules/geo_predictors/pano_joint_predictor.py
+@@ -10,7 +10,7 @@ from .omnidata.omnidata_predictor import OmnidataPredictor
+ from .omnidata.omnidata_normal_predictor import OmnidataNormalPredictor
+ 
+ from modules.geo_predictors.networks import VanillaMLP
+-import tinycudann as tcnn
++from modules.geo_predictors.torch_hashgrid import TorchHashGrid, eval_field_chunked  # 替代 tinycudann（sm_120 二阶反传不可用）
+ 
+ from utils.geo_utils import panorama_to_pers_directions
+ from utils.camera_utils import *
+@@ -29,17 +29,14 @@ class SphereDistanceField(nn.Module):
+                  fine_res=2048):
+         super().__init__()
+         per_level_scale = np.exp(np.log(fine_res / base_res) / (n_levels - 1))
+-        self.hash_grid = tcnn.Encoding(
++        self.hash_grid = TorchHashGrid(
+             n_input_dims=3,
+-            encoding_config={
+-                "otype": "HashGrid",
+-                "n_levels": n_levels,
+-                "n_features_per_level": 2,
+-                "log2_hashmap_size": log2_hashmap_size,
+-                "base_resolution": base_res,
+-                "per_level_scale": per_level_scale,
+-                "interpolation": "Smoothstep",
+-            }
++            n_levels=n_levels,
++            n_features_per_level=2,
++            log2_hashmap_size=log2_hashmap_size,
++            base_resolution=base_res,
++            per_level_scale=per_level_scale,
++            interpolation="Smoothstep",
+         )
+ 
+         self.geo_mlp = VanillaMLP(dim_in=n_levels * 2 + 3,
+@@ -295,7 +292,7 @@ class PanoJointPredictor(GeoPredictor):
+ 
+         # Get new distance map and normal map
+         pano_dirs = img_coord_to_pano_direction(img_coord_from_hw(height, width))
+-        new_distances, new_grads = sp_dis_field(pano_dirs.reshape(-1, 3), requires_grad=True)
++        new_distances, new_grads = eval_field_chunked(sp_dis_field, pano_dirs.reshape(-1, 3))
+         new_distances = new_distances.detach().reshape(height, width, 1)
+         new_normals = self.grads_to_normal(new_grads.detach().reshape(height, width, 3))
+ 
+diff --git a/modules/inpainters/SDFT_inpainter.py b/modules/inpainters/SDFT_inpainter.py
+index 73d2cf9..45ff4b8 100644
+--- a/modules/inpainters/SDFT_inpainter.py
++++ b/modules/inpainters/SDFT_inpainter.py
+@@ -10,7 +10,7 @@ class SDFTInpainter(Inpainter):
+     def __init__(self, subset_name=None):
+         super().__init__()
+ 
+-        SD_path = "stabilityai/stable-diffusion-2-inpainting"
++        SD_path = "sd2-community/stable-diffusion-2-inpainting"
+         pipe = StableDiffusionInpaintPipeline.from_pretrained(SD_path, torch_dtype=torch.float16, variant="fp16").to("cuda")
+ 
+         SDFT_path = f"output/SDFT_weights"
+diff --git a/modules/inpainters/lama/models/ade20k/base.py b/modules/inpainters/lama/models/ade20k/base.py
+index 8cdbe2d..ac08a39 100644
+--- a/modules/inpainters/lama/models/ade20k/base.py
++++ b/modules/inpainters/lama/models/ade20k/base.py
+@@ -91,7 +91,7 @@ class ModelBuilder:
+         if len(weights) > 0:
+             print('Loading weights for net_encoder')
+             net_encoder.load_state_dict(
+-                torch.load(weights, map_location=lambda storage, loc: storage), strict=False)
++                torch.load(weights, map_location=lambda storage, loc: storage, weights_only=False), strict=False)
+         return net_encoder
+ 
+     @staticmethod
+@@ -118,7 +118,7 @@ class ModelBuilder:
+         if len(weights) > 0:
+             print('Loading weights for net_decoder')
+             net_decoder.load_state_dict(
+-                torch.load(weights, map_location=lambda storage, loc: storage), strict=False)
++                torch.load(weights, map_location=lambda storage, loc: storage, weights_only=False), strict=False)
+         return net_decoder
+ 
+     @staticmethod
+diff --git a/modules/inpainters/lama/models/ade20k/utils.py b/modules/inpainters/lama/models/ade20k/utils.py
+index f337db7..ced40e2 100644
+--- a/modules/inpainters/lama/models/ade20k/utils.py
++++ b/modules/inpainters/lama/models/ade20k/utils.py
+@@ -20,7 +20,7 @@ def load_url(url, model_dir='./pretrained', map_location=None):
+     if not os.path.exists(cached_file):
+         sys.stderr.write('Downloading: "{}" to {}\n'.format(url, cached_file))
+         urlretrieve(url, cached_file)
+-    return torch.load(cached_file, map_location=map_location)
++    return torch.load(cached_file, map_location=map_location, weights_only=False)
+ 
+ 
+ def color_encode(labelmap, colors, mode='RGB'):
+diff --git a/modules/inpainters/lama/saicinpainting/evaluation/losses/lpips.py b/modules/inpainters/lama/saicinpainting/evaluation/losses/lpips.py
+index 4b19c04..f54d945 100644
+--- a/modules/inpainters/lama/saicinpainting/evaluation/losses/lpips.py
++++ b/modules/inpainters/lama/saicinpainting/evaluation/losses/lpips.py
+@@ -222,7 +222,7 @@ class BaseModel(torch.nn.Module):
+         save_filename = '%s_net_%s.pth' % (epoch_label, network_label)
+         save_path = os.path.join(self.save_dir, save_filename)
+         print('Loading network from %s' % save_path)
+-        network.load_state_dict(torch.load(save_path, map_location='cpu'))
++        network.load_state_dict(torch.load(save_path, map_location='cpu', weights_only=False))
+ 
+     def update_learning_rate():
+         pass
+@@ -291,7 +291,7 @@ class DistModel(BaseModel):
+                     os.path.join(os.path.dirname(__file__), '..', '..', '..', 'models', 'lpips_models', f'{net}.pth'))
+ 
+             if (not is_train):
+-                self.net.load_state_dict(torch.load(model_path, **kw), strict=False)
++                self.net.load_state_dict(torch.load(model_path, **kw, weights_only=False), strict=False)
+ 
+         elif (self.model == 'net'):  # pretrained network
+             self.net = PNetLin(pnet_rand=pnet_rand, pnet_type=net, lpips=False)
+diff --git a/modules/inpainters/lama/saicinpainting/training/data/aug.py b/modules/inpainters/lama/saicinpainting/training/data/aug.py
+index b124625..e5d451d 100644
+--- a/modules/inpainters/lama/saicinpainting/training/data/aug.py
++++ b/modules/inpainters/lama/saicinpainting/training/data/aug.py
+@@ -1,4 +1,22 @@
+-from albumentations import DualIAATransform, to_tuple
++# --- 5090 适配补丁 ---
++# albumentations 2.x 删除了 DualIAATransform（0.5 时代 API）。
++# IAAAffine2 / IAAPerspective2 只在训练增强 transform_variant='distortions' 下使用，
++# 推理走 'default' 分支，不会触及。这里降级为"用到才报错"的占位实现：
++# 推理照常，误用于训练时会立刻显式失败，而不是静默换掉增强行为。
++try:
++    from albumentations import DualIAATransform, to_tuple
++except ImportError:
++    from albumentations.core.utils import to_tuple  # 2.x 挪到了 core.utils
++    from albumentations.core.transforms_interface import DualTransform as _DT
++
++    class DualIAATransform(_DT):
++        def __init__(self, *args, **kwargs):
++            raise NotImplementedError(
++                "IAAAffine2/IAAPerspective2 依赖 albumentations<1.0 的 DualIAATransform，"
++                "当前版本已移除。仅训练增强 transform_variant='distortions' 会用到；"
++                "推理请使用 transform_variant='default'。"
++            )
++# --- 补丁结束 ---
+ import imgaug.augmenters as iaa
+ 
+ class IAAAffine2(DualIAATransform):
+diff --git a/modules/inpainters/lama/saicinpainting/training/trainers/__init__.py b/modules/inpainters/lama/saicinpainting/training/trainers/__init__.py
+index e8d3984..9dc8592 100644
+--- a/modules/inpainters/lama/saicinpainting/training/trainers/__init__.py
++++ b/modules/inpainters/lama/saicinpainting/training/trainers/__init__.py
+@@ -24,7 +24,7 @@ def make_training_model(config):
+ 
+ def load_checkpoint(train_config, path, map_location='cuda', strict=True):
+     model: torch.nn.Module = make_training_model(train_config)
+-    state = torch.load(path, map_location=map_location)
++    state = torch.load(path, map_location=map_location, weights_only=False)
+     model.load_state_dict(state['state_dict'], strict=strict)
+     model.on_load_checkpoint(state)
+     return model
+diff --git a/pano2room.py b/pano2room.py
+index 63838e2..1af9bf0 100644
+--- a/pano2room.py
++++ b/pano2room.py
+@@ -46,8 +46,12 @@ class Pano2RoomPipeline(torch.nn.Module):
+         self.faces_per_pixel = 8
+         self.fov = 90
+         self.R, self.T = torch.Tensor([[[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]]), torch.Tensor([[0., 0., 0.]])
+-        self.pano_width, self.pano_height = 1024 * 2, 512 * 2
+-        self.H, self.W = 512, 512
++        # 全景工作分辨率（原写死 2048x1024）。可用 PANO_W 覆盖，便于低分辨率快速验证。
++        # 约束：全景高 = 宽/2，立方体面边长 = 宽/4，三者必须同步。
++        self.pano_width = int(os.environ.get("PANO_W", 4608))
++        self.pano_height = self.pano_width // 2
++        # 立方体面边长 = 全景宽/4（原为 512↔2048）。同时是 mesh 光栅化和 3DGS 训练视角的分辨率。
++        self.H = self.W = self.pano_width // 4
+         self.device = "cuda:0"
+ 
+         # initialize
+@@ -60,7 +64,8 @@ class Pano2RoomPipeline(torch.nn.Module):
+ 
+         self.pose_scale = 0.6
+         self.pano_center_offset = (-0.2,0.3)
+-        self.inpaint_frame_stride = 20   
++        # 补洞站位 = 轨迹帧数 / 该步长。141/20≈8。调大 = 站位少 = 快，但覆盖范围小
++        self.inpaint_frame_stride = int(os.environ.get('PANO_STRIDE', 20))
+ 
+         # create exp dir
+         self.setting = f""
+@@ -68,7 +73,8 @@ class Pano2RoomPipeline(torch.nn.Module):
+         if apply_timestamp:
+             timestamp = str(int(time.time()))[-8:]
+             self.setting += f"-{timestamp}"
+-        self.save_path = f'output/Pano2Room-results'
++        # 可用环境变量 PANO_OUT 指定输出目录，便于多次实验并存
++        self.save_path = os.environ.get('PANO_OUT', 'output/Pano2Room-results')
+         self.save_details = False
+ 
+         if not os.path.exists(self.save_path):
+@@ -125,7 +131,7 @@ class Pano2RoomPipeline(torch.nn.Module):
+         torch.set_default_tensor_type('torch.FloatTensor')
+         pano_rgbd = cube2equi(cubemap_list,
+                                 "list",
+-                                1024,2048) #CHW
++                                self.pano_height, self.pano_width) #CHW
+         pano_rgb = pano_rgbd[:3,:,:]
+         pano_depth =  pano_rgbd[3:4,:,:].squeeze(0)
+         pano_mask =  pano_rgbd[4:,:,:].squeeze(0)
+@@ -322,7 +328,8 @@ class Pano2RoomPipeline(torch.nn.Module):
+         return inpainted_img, inpainted_distances, inpainted_normals
+ 
+     def load_pano(self):
+-        image_path = f"input/input_panorama.png"
++        # 可用环境变量 PANO_INPUT 指定输入全景，不设则用自带样例
++        image_path = os.environ.get("PANO_INPUT", "input/input_panorama.png")
+         image = Image.open(image_path)
+         if image.size[0] < image.size[1]:
+             image = image.transpose(Image.TRANSPOSE)
+@@ -334,7 +341,9 @@ class Pano2RoomPipeline(torch.nn.Module):
+ 
+         # get panofusion_distance
+         pano_fusion_distance_predictor = PanoFusionDistancePredictor()
+-        depth = pano_fusion_distance_predictor.predict(panorama_tensor.squeeze(0).permute(1,2,0)) #input:HW3
++        depth = pano_fusion_distance_predictor.predict(panorama_tensor.squeeze(0).permute(1,2,0),
++                                                      pano_width=self.pano_width,
++                                                      pano_height=self.pano_height) #input:HW3
+         depth = depth/depth.max() * depth_scale_factor
+         print(f"pano_fusion_distance...[{depth.min(), depth.mean(),depth.max()}]")
+         
+diff --git a/train_SDFT.py b/train_SDFT.py
+index 73216a3..5209df1 100644
+--- a/train_SDFT.py
++++ b/train_SDFT.py
+@@ -64,7 +64,7 @@ def parse_args(input_args=None):
+     parser.add_argument(
+         "--pretrained_model_name_or_path",
+         type=str,
+-        default="stabilityai/stable-diffusion-2-inpainting",
++        default="sd2-community/stable-diffusion-2-inpainting",
+         help="Path to pretrained model or model identifier from huggingface.co/models.",
+     )
+     parser.add_argument(

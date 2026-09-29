@@ -1,0 +1,24 @@
+diff --git a/src/depth_anything_3/model/da3.py b/src/depth_anything_3/model/da3.py
+index f9e5bd6..e21219b 100644
+--- a/src/depth_anything_3/model/da3.py
++++ b/src/depth_anything_3/model/da3.py
+@@ -365,6 +365,10 @@ class NestedDepthAnything3Net(nn.Module):
+         metric_output = self.da3_metric(x)
+ 
+         # Apply metric scaling and alignment
++        # 5090 patch: 官方把输入 intrinsics 标成 unused, 米制尺度只用预测焦距 (∝ focal/300).
++        # 已知内参时用已知焦距定尺度, 否则焦距估歪多少尺度就歪多少 (SpatialGen 90° 广角样例上预测焦距偏大 16%).
++        if intrinsics is not None:
++            output["intrinsics_for_metric"] = intrinsics
+         output = self._apply_metric_scaling(output, metric_output)
+         output = self._apply_depth_alignment(output, metric_output)
+         output = self._handle_sky_regions(output, metric_output)
+@@ -378,7 +382,7 @@ class NestedDepthAnything3Net(nn.Module):
+         # Scale metric depth based on camera intrinsics
+         metric_output.depth = apply_metric_scaling(
+             metric_output.depth,
+-            output.intrinsics,
++            output["intrinsics_for_metric"] if "intrinsics_for_metric" in output else output.intrinsics,  # 5090 patch (output 是 addict 字典, 缺 key 时 getattr 给空字典而不是 None, 不能用 getattr)
+         )
+         return output
+ 

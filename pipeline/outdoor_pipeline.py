@@ -51,6 +51,7 @@ import _common as _cm          # 设 CUR_STEP 用 —— 必须改模块上的�
 from _common import (LOCK, GpuLock, wait_gpu, sh, envcmd, stamp_path,
                      timing as _timing, resolve_cfg as _resolve_cfg,
                      write_frame_map, load_frame_map)
+import people_decisions           # 挑人闸的决策文件 + BODY_RUN 自动指向, 室内外共用
 
 HOME   = os.path.expanduser("~")
 SAM3D  = f"{HOME}/sam3d"
@@ -171,11 +172,22 @@ CFG = dict(
     # ★ 和室内同一套写法(indoor_pipeline 的 BODY_RUN) —— 两条链的人线必须一致,
     #   否则同一个 world_scale.py 在室外永远走不到"只用人"那个分支(soccer 踩过: 够格当
     #   尺子的家具只有 1 类, 直接硬停, 而画面主角恰恰是人)。
+    # ★ 2026-09-24 人体线接进主流程: PEOPLE=1 时 people_track(第 2 段)跟踪人、第 2 道闸挑人,
+    #   people_mesh(第 3 段, 尺度之前)出网格; BODY_RUN 空着就自动指向 <R1>/body4d。
+    #   一般不在这里改, 在启动页 / 第 1 道闸 / drive.py --people 1 设(写进本轮的 00_run_config.json)。
+    #   手工填了 BODY_RUN 的老轮次(soccer/office)不走这两步, 照旧读那个目录。
+    PEOPLE      = "0",
+    PEOPLE_MIN_AREA = "0.1",# 人体跟踪只丢最大面积不到画面这么多 % 的(碎片/误检), 其余全列到闸口让人勾。
+                            # body4d 自己的默认 1.0 是 mayday 近景调的, soccer 远处守门员 0.7% 被它静默丢了
     BODY_RUN    = "",
     RB_FRAMES   = "0,40,88,120,160",   # 渲染回图用哪几个机位
     WD_FRAMES   = "5",      # WildDet3D 每个实例问几帧, 取中位数
     WD_MINPIX   = "400",    # 2D 框小于这么多像素就不问, 问了也是噪声
     WD_DEPTH    = "1",      # 喂 DA3 深度钉尺度。不给内参它默认 focal=max(H,W), 尺度会整体偏
+    RECALL      = "0",      # 召回支路(detect/recall/recall_mask/recall_gen/recall_merge)开不开。
+                            # ★ 2026-09-24 默认关(用户拍板)。关着时五步照常盖完成戳但什么都不跑,
+                            #   组装只认 06_all_boxes.json(盘上留着的 merged 也不用), 驱动第 4 道闸不停。
+                            #   要开: 场景里写 RECALL="1", 或环境变量 RECALL=1。
     DET_STRIDE  = "5",      # 召回: 每隔几帧全图检一次 (180 帧不必全检)
     DET_SCORE   = "0.8",    # 召回: 检测分数下限。分数上限约 1.1 不是概率;
                             # 0.8 时每帧约 60 个, 和画面里实际物体数量级相当
@@ -204,7 +216,9 @@ CFG = dict(
 
 # 上面那些阈值是在 timesquare 这一个"游戏引擎渲染"素材上调出来的。换实拍素材(噪声更大、
 # 深度更差)多半要重调, 所以每个场景可以在这里覆盖, 不用去改 CFG 也不用每次敲环境变量。
-SCENE_TAG = {"timesquare": "ts", "warpengine": "we", "beach": "be", "carpark": "cp"}
+# ★ 没列在这里的场景标签取场景名前 3 个字母 —— nfl / nfl1 都会是 nfl_rN, 生成的 mesh 按标签存目录,
+#   撞了互相覆盖。前缀会撞的场景在这里配自己的标签(启动页开新轮次时也会查撞没撞)。
+SCENE_TAG = {"timesquare": "ts", "warpengine": "we", "beach": "be", "carpark": "cp", "nfl1": "nf1"}
 
 SCENES = {
     "timesquare": {},        # 基准场景 —— CFG 的默认值就是在它上面调的
@@ -212,7 +226,9 @@ SCENES = {
     #   不配 BODY_RUN 的话 scale 那步会硬停 —— 够格当尺子的家具只有 fence post 一类
     #   (球门/球网/围栏各只有 1 个实例, 袜子球鞋 0.15 m 太矮), 不够两类互相印证。
     #   相机轨迹只有 4.2 m, 视差很小, 朝向和尺度本来就不可靠, 更要靠人这把尺子。
-    "soccer":     dict(BODY_RUN=f"{SAM3D}/sam-body4d/outputs/soccer/b1"),
+    #   ★ 2026-09-24 b1 -> b2: b1 按默认面积门槛把守门员丢了, b2 补回来(3 人)。尺度是 b1 那两个
+    #     近处球员定的(k=0.864), 不重定 —— 守门员远、小, 当尺子不如他们准。
+    "soccer":     dict(BODY_RUN=f"{SAM3D}/sam-body4d/outputs/soccer/b2"),
     "warpengine": {},        # 还没跑过, 跑的时候把调出来的值填这里
     # 下面两个是 2026-09-07 新加的。素材 1920x1080, 比时代广场(1280x720)清晰但帧少
     # (beach 109 帧 / carpark 132 帧 vs 180)。阈值先沿用时代广场那套, 跑出来再按实际调。
@@ -300,6 +316,8 @@ class Ctx:
         self.R1  = f"{SAM3D}/data/outdoor/result/{scene}/{run}"
         self.LOG = f"{self.R1}/logs"
         self.cfg = resolve_cfg(scene, self.R1)   # R1 要先算出来: 人工闸的决策文件在它下面
+        # 人体线归不归这条流水线管; 顺带把 BODY_RUN 填成自动目录(或挑人闸一个没勾时置空)
+        self.body_auto = people_decisions.resolve_body_run(self.cfg, scene, run, self.R1)
 
 # ------------------------------------------------------------------ 各步骤
 def s_frames(c, dry):
@@ -454,6 +472,7 @@ def _boxes_arg(c):
     ★ 原来这里看的是环境变量 USE_RECALL, 而且默认关: 召回五步照跑、显存照烧, 结果永远
       进不了 07_scene.glb, 表面上还"全跑完了没报错"。室内一直是"文件在就用", 是对的,
       这里跟室内对齐。"""
+    if c.cfg["RECALL"] != "1": return {}     # 召回关: merged 即使在盘上也是以前留下的, 不用
     m = f"{c.R1}/06_all_boxes_merged.json"
     b = f"{c.R1}/06_all_boxes.json"
     if not os.path.exists(m): return {}
@@ -722,6 +741,40 @@ def s_vlm_sizes(c, dry):
     sh(envcmd(PY["trellis2"], f"{SCRIPTS}/vlm_sizes.py", dict(OD=c.R1)),
        f"{c.LOG}/06_vlm_sizes.log", dry)
 
+# ---------- 人体线: body4d_pipeline.py 的两半挂进主流程(2026-09-24) ----------
+# ★ 室内 indoor_pipeline.py 有一模一样的两步(o_people_track / o_people_mesh), 改一边要改另一边。
+# ★ 这两步不进 GPU_STEPS: 里面的 body4d_pipeline.py 自己会在 track/mesh 上拿同一把 GPU 锁
+#   (同一个锁文件), 外面再套一层就是自己等自己, 永远死锁。
+# ★ SCENE_R1=R1: 人体直接用场景的帧和相机, 每一帧人都对得上一个场景相机。自己抽帧的话对不齐 ——
+#   soccer b1 的 69 帧里只有 60 帧能对上。
+def _people_cmd(c, only, extra=None):
+    env = dict(SCENE_R1=c.R1, BODY_OUT=people_decisions.auto_dir(c.R1),
+               MIN_AREA_PCT=c.cfg["PEOPLE_MIN_AREA"], **(extra or {}))
+    return envcmd(PY["sam3d"], f"{PIPE}/body4d_pipeline.py", env,
+                  ["--scene", c.scene, "--run", c.run, "--only", only])
+
+def s_people_track(c, dry):
+    """人体1: SAM3 跟踪 person + 体检图, 出挑人决策 05_people.json(第 2 道闸在网页"人"那一栏勾)。
+    只丢面积不到 PEOPLE_MIN_AREA 的碎片, 其余全部列出来, 帧数够的默认勾上。"""
+    if not c.body_auto:
+        print("    这一轮没有人(PEOPLE=0), 或 BODY_RUN 是手工指定的, 跳过"); return
+    sh(_people_cmd(c, "frames,track,check"), f"{c.LOG}/05_people_track.log", dry)
+    if dry: return
+    d = people_decisions.build(c.R1, f"{people_decisions.auto_dir(c.R1)}/02_body4d")
+    print(f"    [挑人] 跟到 {len(d['人'])} 个人, 默认勾上 {people_decisions.keep_ids(c.R1)} -> {people_decisions.path(c.R1)}")
+
+def s_people_mesh(c, dry):
+    """人体2: 按第 2 道闸勾的人出网格(SAM 3D Body) + 对账。尺度那步拿人当尺子, 所以排在 scale 前。"""
+    if not c.body_auto:
+        print("    这一轮没有人(PEOPLE=0), 或 BODY_RUN 是手工指定的, 跳过"); return
+    keep = people_decisions.keep_ids(c.R1)
+    if keep == []:
+        print("    挑人闸一个都没勾, 当这一轮没有人, 跳过"); return
+    if keep is None and not dry:
+        raise SystemExit(f"[失败] 没有 {people_decisions.path(c.R1)} —— 先跑 people_track")
+    sh(_people_cmd(c, "pick,mesh,report", dict(PICK=",".join(map(str, keep or [])))),
+       f"{c.LOG}/05_people_mesh.log", dry)
+
 def s_scale(c, dry):
     """标定并施加全局尺度, 把 DA3 那层从"它以为的米"改成真米。
     DA3 自称米制, 但俯拍素材上判得离谱: carpark 的车量出来 0.23 m, 真车 1.48 m, 差 6.55 倍。
@@ -921,8 +974,16 @@ def s_building_scene(c, dry):
 #     帧 -> Qwen 列词 -> SAM3 跟踪       -> mask + track ID  ┐
 #                     -> WildDet3D 按词检测(原图)  -> 3D 框  ┤-> 合并
 #     两边都有 -> 用 SAM3 的 mask; 只有框没 mask -> 框喂回 SAM3 补抠 -> 捡回漏检
+RECALL_STEPS = ("detect", "recall", "recall_mask", "recall_gen", "recall_merge")
+
+def _recall_off(c):
+    """召回开关(CFG 的 RECALL)。关着就打一行跳过, 调用方直接 return —— 完成戳照盖, 和 building_scene 的条件跳过同一套。"""
+    if c.cfg["RECALL"] == "1": return False
+    print("    召回关(RECALL=0), 跳过", flush=True); return True
+
 def s_detect(c, dry):
     """召回1: WildDet3D 文本模式全图检测, 逐帧各检各的(它没有 track ID)。"""
+    if _recall_off(c): return
     sh(envcmd(PY["wilddet"], f"{SCRIPTS}/detect_wilddet.py",
               dict(R1=c.R1, FR=c.FR, WD3=WD3REPO, DET_STRIDE=c.cfg["DET_STRIDE"],
                    DET_SCORE=c.cfg["DET_SCORE"])), f"{c.LOG}/12_detect.log", dry)
@@ -930,6 +991,7 @@ def s_detect(c, dry):
 def s_recall(c, dry):
     """召回2: 逐帧检测按三维位置聚成实例(场景静止, 同一物体各帧世界坐标应重合),
     跨词去重, 再和 SAM3 已有实例比对, 挑出 SAM3 漏掉的。"""
+    if _recall_off(c): return
     # ★ FR 必须传: 二维那条要读原帧的尺寸。
     # MATCH_2D=1 是"和 SAM3 比对时用二维框 IoU, 不用三维距离"。三维那版有个必然的毛病 ——
     # 拿 WildDet3D 的三维位置去判"是不是同一个物体", 而它的三维位置本身就不准, 判出来的
@@ -944,6 +1006,7 @@ def s_recall(c, dry):
 def s_recall_mask(c, dry):
     """召回3: 漏检的只有框没 mask, 把框喂回 SAM3 补抠一张, 好让 SAM3D 能生成。
     ★ 框必须是"左上xywh 归一化", 且要在返回的一组候选里按 IoU 挑, 见脚本文件头。"""
+    if _recall_off(c): return
     sh(envcmd(PY["sam3"], f"{SCRIPTS}/mask_recall.py",
               dict(R1=c.R1, FR=c.FR, TAG=c.tag, REC_MIN_PCT=c.cfg["REC_MIN_PCT"],
                    REC_MIN_IOU=c.cfg["REC_MIN_IOU"],
@@ -952,12 +1015,14 @@ def s_recall_mask(c, dry):
 def s_recall_merge(c, dry):
     """召回5: 把召回实例的盒子并进主盒子文件 -> 06_all_boxes_merged.json。
     之后 assemble 传 BOXES 指向它, 召回的东西才会进场景。原文件不动, 随时能切回。"""
+    if _recall_off(c): return
     sh(envcmd(PY["sam3d"], f"{SCRIPTS}/merge_boxes_recall.py",
               dict(R1=c.R1, TAG=c.tag, GEN_OUT=f"{GEN}/outputs")),
        f"{c.LOG}/15_merge_boxes.log", dry)
 
 def s_recall_gen(c, dry):
     """召回4: 给补抠出来的漏检实例生成 mesh。清单在 logs/recall_jobs.txt。"""
+    if _recall_off(c): return
     jobs = f"{c.LOG}/recall_jobs.txt"
     names = open(jobs).read().split() if os.path.exists(jobs) else []
     _gen(c, [f"{GEN}/my_images/{n}" for n in names], f"{c.LOG}/14_recall_gen.log", dry)
@@ -1011,6 +1076,7 @@ STEPS = [
     ("da3",      "spatiallm", "DA3 米制深度 + 相机位姿",          s_da3),
     ("up",       "sam3d",     "定出真实的\"天\"(地面法向)",         s_up),
     ("track",    "sam3",      "SAM3 视频跟踪, 落盘",              s_track),
+    ("people_track","sam3d",  "人体1: 跟踪人 + 体检图 -> 挑人决策", s_people_track),
     ("dedup",    "sam3d",     "跨词去重(二维 mask), 判掉同义词",    s_dedup),
     ("relabel",  "sam3d",     "挪类别(闸口说这几个是别的东西)",   s_relabel),
     ("pick",     "sam3d",     "每类挑生成样本",                   s_pick),
@@ -1021,6 +1087,7 @@ STEPS = [
     ("meshes",   "sam3d",     "mesh 一览图",                      s_meshes),
     ("boxes",    "sam3d",     "反投影量盒子 + 跨词去重",           s_boxes),
     ("vlm_sizes","trellis2",  "问 VLM 要每个词的真实高度(尺子)",   s_vlm_sizes),
+    ("people_mesh","sam3d",   "人体2: 按闸口勾的人出网格(尺度前)", s_people_mesh),
     ("scale",    "sam3d",     "标定全局尺度 -> 真米 + 重量盒子",   s_scale),
     ("solo",     "sam3d",     "car 逐实例生成",                   s_solo),
     ("boxes_wd", "wilddet",   "量盒子(WildDet3D)",                s_boxes_wd),
@@ -1059,6 +1126,9 @@ ARTIFACTS = {
     "da3":      ["02_da3/cameras.json", "02_da3/depth"],
     "up":       ["02_da3/world_up.json"],
     "track":    ["03_masks"],
+    # 人体两步按条件跳过(没有人 / BODY_RUN 手工指定), 产物也不在 R1 底下 —— 只认完成戳
+    "people_track": [],
+    "people_mesh": [],
     "dedup":    ["03_dedup_words.json"],
     "pick":     ["04_picks/picks.json"],
     "verify":   ["04_picks/vlm_verify.json"],
@@ -1102,9 +1172,11 @@ DEPS = {
     "verify": ["pick"],       "override": ["verify"],
     "gen": ["override"],        "ratio": ["gen"],         "meshes": ["gen"],
     "boxes": ["track", "ratio", "up", "dedup", "relabel"],   # relabel 会搬 03_masks/*.npz, 而量盒子读的就是它
-    "vlm_sizes": ["vlm"],       "scale": ["boxes", "vlm_sizes"],
+    # 人体: track 吃 da3 的 frame_map/相机(SCENE_R1 模式); scale 拿人当尺子, 所以依赖 people_mesh
+    "people_track": ["da3"],    "people_mesh": ["people_track"],
+    "vlm_sizes": ["vlm"],       "scale": ["boxes", "vlm_sizes", "people_mesh"],
     "solo": ["scale"],          "assemble": ["scale", "solo", "verify", "recall_merge", "boxes"],
-    "people": ["assemble"],     "people_glb": ["phys", "people"],
+    "people": ["assemble", "people_mesh"],     "people_glb": ["phys", "people"],
     "phys": ["assemble", "people"],  "render": ["phys"],
     "boxes_wd": ["track", "da3", "up", "scale"],
     "compare": ["boxes", "boxes_wd", "up"],  "building_scene": ["assemble"],
@@ -1141,8 +1213,10 @@ def do_check(c):
             if _old or not g: bad += 1
             _n = f"  ← 比依赖的 {'/'.join(_old)} 旧, 该重跑" if _old else ""
             print(f"  {k:10s} {'有' if g else '缺':2s}  {len(g)} 个类 mesh{_n}"); continue
+        # 召回关着时那五步是条件跳过, 和 building_scene 一样只认完成戳, 不认产物
+        arts = [] if k in RECALL_STEPS and c.cfg["RECALL"] != "1" else ARTIFACTS.get(k, [])
         paths = [p.replace("@FR", c.FR) if p.startswith("@FR") else os.path.join(c.R1, p)
-                 for p in ARTIFACTS.get(k, [])]
+                 for p in arts]
         if not paths:
             # 没有声明产物的步骤(override / compare / recall_gen / building_scene ...)
             # ★ 也要判过期。原来这条分支只打印时间就 continue —— 于是这几步永远不会
@@ -1221,6 +1295,7 @@ def main():
     print(f"帧   {c.FR}")
     print(f"结果 {c.R1}")
     print(f"步骤 {' -> '.join(s[0] for s in sel)}" + ("   [干跑]" if g.dry_run else "") + "\n")
+    # ★ people_track / people_mesh 故意不在这里: body4d_pipeline.py 自己拿同一把锁, 套两层就死锁
     GPU_STEPS = {"vlm","vlm_sizes","da3","track","verify","gen","solo","boxes_wd","detect",
                  "recall_mask","recall_gen"}
     for k, e, d, fn in sel:

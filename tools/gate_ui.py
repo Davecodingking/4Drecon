@@ -16,8 +16,10 @@
 不做的事(边界, 别往里加):
   * 不写 05_review_applied.json —— 那是 review_gate --apply 的活, 它带着一堆校验
     (改类别+复用组冲突、改用+改类别冲突、召回待决...), 绕过去等于把校验废掉。
-  * 不起流水线子进程 —— 点完保存, 人回终端敲 drive.py --go。不管子进程是它能保持
-    "零风险"的前提: 没有子进程就没有僵尸、没有 GPU 争抢、没有"界面关了活还在跑"。
+  * 不持有流水线子进程。★ 2026-09-24 起本轮页(/run)和启动页(/new)能替人"开跑/继续",
+    但只通过 tools/drive_go.sh: 它把驱动挂进后台 tmux 就返回, 驱动和网页进程脱钩 ——
+    网页关了活照跑, 同一轮在跑就拒绝再起。所以仍然没有僵尸、没有"界面关了活跑一半"。
+    这部分的页面在 run_page.py, 逻辑在 run_ctl.py; 候选决策台本身照旧只碰决策文件。
   * 不碰 mask / 不起 GPU / 不改任何别的文件。
 
 ------------------------------------------------------------------ 抠图逻辑是抄来的
@@ -1003,7 +1005,7 @@ def run_dirs():
                     continue
                 decs = [f for f in ("05_review_afterrecall.json", "05_review.json") if os.path.exists(f"{R1}/{f}")]
                 state = f"{R1}/logs/.drive_state.json"
-                if not decs and not os.path.exists(state):
+                if not decs and not os.path.exists(state) and not os.path.exists(f"{R1}/00_run_config.json"):
                     continue
                 info = dict(scene=scene, run=run, indoor=indoor, R1=R1, 候选=None, 闸=None, 几何=geom_of(R1),
                             阶段=("post" if decs and decs[0].endswith("afterrecall.json") else "pre" if decs else None),
@@ -1075,7 +1077,7 @@ RUNS_PAGE = """<!doctype html><meta charset=utf-8><title>Gate runs</title>
  .none{color:var(--dim);padding:12px 14px}
 </style>
 <div class=wrap>
-<h1>Pick a run</h1>
+<h1>Pick a run <a href="/new" style="font-size:14px;font-weight:400;margin-left:10px">+ New run</a></h1>
 <p class=note>Every run on disk that has a decision file or driver state. Opening one only changes what this page shows —
 nothing on disk is touched, and each browser tab keeps its own run.</p>
 <!--ROWS-->
@@ -1098,7 +1100,9 @@ def runs_html(cur):
             gate = f'gate {r["闸"]}' if r["闸"] else "no decision file yet"
             seg = "" if r["段"] is None else f' · driver at segment {r["段"] + 1}{" (waiting)" if r["停在闸口"] else ""}'
             cand = "" if r["候选"] is None else f'{r["候选"]} candidates · '
-            out.append(f'<a class="row" href="/?{q}">'
+            # 闸 2 之前没有决策文件, 候选页没东西可看 —— 直接进本轮页
+            page = "/" if r["决策文件"] else "/run"
+            out.append(f'<a class="row" href="{page}?{q}">'
                        f'<span class="nm">{r["scene"]} <em>/</em> {r["run"]}'
                        f'{" <span class=cur>· open now</span>" if is_cur else ""}</span>'
                        f'<span class="right">{r["改过"] or ""}</span>'
@@ -1107,6 +1111,14 @@ def runs_html(cur):
         out.append("</div>")
     # 用替换不用 % 格式化: 这页的 CSS 里有 color-mix(... 8%) 这种百分号, % 格式化会当成占位符炸掉
     return RUNS_PAGE.replace("<!--ROWS-->", "\n".join(out))
+
+
+def _run_page():
+    """启动页/本轮页的路由模块。第一次用到才 import —— 它坏了, 候选页照常。"""
+    if "run_page" not in sys.modules:
+        if HERE not in sys.path: sys.path.insert(0, HERE)
+    import run_page
+    return run_page
 
 
 def make_handler(store):
@@ -1156,6 +1168,9 @@ def make_handler(store):
                     return self._send(200, "text/html; charset=utf-8", runs_html(cur).encode())
                 if u.path == "/api/runs":
                     return self._json(run_dirs())
+                # 启动页 /new、本轮页 /run 和它们的接口住在 run_page.py(逻辑在 run_ctl.py), 认得就答完
+                if _run_page().handle(self, "GET", u.path, q):
+                    return
                 st = self._store(q)              # 下面每一条都用这个轮次
                 if u.path.startswith("/3d"):
                     # 3D tab 住在 scene_view.py, 到这里才 import(懒加载): 不点它, 闸口不多读一个字节;
@@ -1167,7 +1182,12 @@ def make_handler(store):
                     if scene_view.handle(self, u.path, st.R1):
                         return
                 if u.path == "/api/state":
-                    d = st.load()
+                    try:
+                        d = st.load()
+                    except SystemExit as e:
+                        # ★ SystemExit 不是 Exception, 下面的 except 接不住, 请求线程会直接断 ——
+                        #   第 1 道闸时本来就没有决策文件, 这是常态不是故障: 让前端转去本轮页
+                        return self._json(dict(error=str(e), 无决策文件=True))
                     rows = d["候选"]
                     # 每条补上"这个词有几个实例" —— 类卡靠它显示分量, 前端不该自己再去数
                     for r in rows:
@@ -1260,9 +1280,11 @@ def make_handler(store):
             u = urllib.parse.urlparse(self.path)
             q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
             try:
-                st = self._store(q)
                 n = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(n) or b"{}")
+                if _run_page().handle(self, "POST", u.path, q, body):
+                    return
+                st = self._store(q)
                 if u.path == "/api/scale/preview":
                     return self._json(st.scale_preview(body.get("尺子") or {}))
                 # ★ 返回值别再叫 st —— 这里的 st 是这一轮的 Store, 覆盖掉之后下面取 st.DEC
@@ -1603,6 +1625,7 @@ PAGE = r"""<!doctype html>
   <span id="gate" class="ghd"></span>
   <span class="gsw" id="rcw"></span>
   <a id="to3d" class="ghd" target="_blank" hidden>3D ↗</a>
+  <a id="torun" class="ghd" title="Run control: config, people, continue the driver">Run ▸</a>
   <span id="stat" class="ghd dimly"></span>
   <span class="sp"></span>
   <span id="dec" class="path"></span>
@@ -2325,8 +2348,11 @@ async function boot(){
       'Check it, then reload this page.</div>';
     return;
   }
+  // 闸 2 之前还没有决策文件 —— 这一轮该看的是本轮页(配置 / 地基 / 开跑), 直接转过去
+  if(d.无决策文件){ location.replace(U('/run')); return; }
   if(d.error){ document.getElementById("grid").innerHTML =
     '<div class="empty">'+esc(d.error)+'</div>'; return; }
+  document.getElementById("torun").href = U('/run');
   S.meta = {TAG:d.TAG, 场景:d.场景, 场景名:d.场景名, 轮次:d.轮次,
             闸:d.闸, 阶段:d.阶段, 决策文件:d.决策文件,
             solo门槛px:d.solo门槛px, 可追加行:d.可追加行,
@@ -2859,10 +2885,15 @@ function 绑事件(root){
 function 画闸切换(){
   const el = document.getElementById("gsw");
   if (!el) return;
-  el.innerHTML = [['review','Candidates'], ['scale','Scale']]
+  // People 不在这一页里: 挑人在本轮页(/run#people), 按钮直接跳过去
+  el.innerHTML = [['review','Candidates'], ['people','People'], ['scale','Scale']]
     .map(([k,t]) => '<button data-gate="'+k+'" class="'+(GATE===k?'on':'')+'">'+t+'</button>').join('');
   el.querySelectorAll("[data-gate]").forEach(b => b.onclick = () => {
     if (GATE === b.dataset.gate) return;
+    if (b.dataset.gate === 'people'){
+      if (dirty && !confirm("You have unsaved changes on this gate. Leave anyway?")) return;
+      location.href = U('/run') + '#people'; return;
+    }
     // ★ 切闸前拦一下没保存的改动 —— 两道闸写的是不同的文件, 切过去就看不见了
     const 脏 = GATE==='review' ? dirty : scDirty();
     if (脏 && !confirm("You have unsaved changes on this gate. Switch anyway?")) return;
@@ -3189,9 +3220,13 @@ def main():
     a = ap.parse_args()
 
     st = Store(a.scene, a.run, a.indoor, a.stage, a.solo_min_px)
-    d = st.load()                    # 起服务之前先把决策文件读通, 免得页面开出来才报错
-    print(f"场景 {a.scene} 轮次 {a.run}   闸 {2 if st.stage=='pre' else 4} ({st.stage})")
-    print(f"决策 {st.DEC}   {len(d['候选'])} 个候选")
+    try:
+        d = st.load()                # 起服务之前先把决策文件读通, 免得页面开出来才报错
+        print(f"场景 {a.scene} 轮次 {a.run}   闸 {2 if st.stage=='pre' else 4} ({st.stage})")
+        print(f"决策 {st.DEC}   {len(d['候选'])} 个候选")
+    except SystemExit:
+        # 闸 2 之前本来就没有决策文件 —— 照样起服务, 候选页会转去本轮页 /run
+        print(f"场景 {a.scene} 轮次 {a.run}   还没有决策文件(闸 2 之前), 候选页先不可用, 用本轮页 /run")
     print(f"帧   {st.FR}")
     print(f"  闸 3 尺子: {st.scale_paths()[0]}")
     print(f"\n  http://localhost:{a.port}" + ("#scale" if a.gate=="scale" else "") + "\n")

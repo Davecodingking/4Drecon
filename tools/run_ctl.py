@@ -1,0 +1,445 @@
+#!/usr/bin/env python
+"""本轮控制 —— 闸口网页里启动页 /new 和本轮页 /run 的后端(2026-09-24)。
+
+gate_ui.py 只接路由, 逻辑都在这里, 方便单测(tools/tests/test_run_ctl.py)。管四件事:
+  本轮配置 00_run_config.json   有没有人 / 开不开召回(规则在 _common.update_run_config, 和 drive.py 同一套)
+  挑人决策 05_people.json       第 2 道闸勾人(pipeline/people_decisions.py)
+  驱动状态                      logs/.drive_state.json + 有没有驱动进程在跑
+  开跑 / 继续                   只通过 tools/drive_go.sh
+
+★ 为什么只通过 drive_go.sh 起驱动: 它把驱动放进后台 tmux、和网页进程脱钩 —— 网页关了活照跑,
+  网页不持有任何子进程, 也就没有僵尸、没有"界面关了活还在跑一半"。gate_ui 原来"不起流水线子进程"
+  那条边界的本意就是这个; 现在放开的只有"让 drive_go.sh 替人敲一次 --go", 同一轮在跑就拒绝。
+"""
+import glob, importlib.util, json, os, re, subprocess, sys, time
+
+SAM3D = os.path.expanduser("~/sam3d")
+sys.path.insert(0, f"{SAM3D}/pipeline")
+import _common, people_decisions        # noqa: E402
+
+# 类型 -> (数据集根, 结果根)。和 drive.py / pipeline 的路径一致; 测试会把它指到临时目录。
+ROOTS = {"outdoor": (f"{SAM3D}/data/outdoor/dataset", f"{SAM3D}/data/outdoor/result"),
+         "indoor":  (f"{SAM3D}/data/indoor/dataset", f"{SAM3D}/data/indoorOutput")}
+PIPES = {"outdoor": f"{SAM3D}/pipeline/outdoor_pipeline.py", "indoor": f"{SAM3D}/pipeline/indoor_pipeline.py"}
+PY = os.path.expanduser("~/miniforge3/envs/sam3d/bin/python")
+DRIVE_GO = f"{SAM3D}/tools/drive_go.sh"
+# 场景名/轮次名会进路径、进 drive_go.sh 拼的 tmux 命令行 —— 只许这几种字符, 不许 ../ 和空格引号
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def _check_name(*names):
+    for n in names:
+        if not NAME.match(n or ""):
+            raise ValueError(f"名字只能用字母数字和 _ . -(不能以符号开头): {n!r}")
+
+
+def r1_of(kind, scene, run):
+    return f"{ROOTS[kind][1]}/{scene}/{run}"
+
+
+_DRIVE = None
+def _segments(kind):
+    """段数问 drive.py 的 SEGMENTS, 别自己抄一份。"""
+    global _DRIVE
+    if _DRIVE is None:
+        p = f"{SAM3D}/.claude/skills/run-recon-pipeline/drive.py"
+        spec = importlib.util.spec_from_file_location("drive", p)
+        _DRIVE = importlib.util.module_from_spec(spec); spec.loader.exec_module(_DRIVE)
+    return _DRIVE.SEGMENTS[kind]
+
+
+def _next_run(res, sc):
+    n = 1
+    while os.path.exists(f"{res}/{sc}/r{n}"):
+        n += 1
+    return f"r{n}"
+
+
+def datasets():
+    """两个数据集根下有哪些场景, 以及每个场景下一个没用过的轮次名。
+    场景 = 子目录里有 frames/ 或视频; ★ 根目录下散放的视频(nfl1.mp4)也算, 标"新视频" ——
+    选它开跑时 new_run 会建 <场景>/video.mp4。和某个子目录同名的散放视频不重复列, 子目录说了算。"""
+    out = {}
+    for kind, (ds, res) in ROOTS.items():
+        rows = []
+        names = sorted(os.listdir(ds)) if os.path.isdir(ds) else []
+        for sc in names:
+            d = f"{ds}/{sc}"
+            if sc.startswith(".") or not os.path.isdir(d):
+                continue
+            if not (os.path.isdir(f"{d}/frames") or any(f.lower().endswith((".mp4", ".mov")) for f in os.listdir(d))):
+                continue
+            rows.append({"场景": sc, "下一轮": _next_run(res, sc)})
+        for f in names:
+            stem, ext = os.path.splitext(f)
+            if ext.lower() in (".mp4", ".mov") and os.path.isfile(f"{ds}/{f}") \
+                    and not os.path.exists(f"{ds}/{stem}") and NAME.match(stem):
+                rows.append({"场景": stem, "下一轮": _next_run(res, stem), "新视频": f})
+        out[kind] = sorted(rows, key=lambda r: r["场景"])
+    return out
+
+
+def running(scene, run):
+    """这一轮有没有驱动进程在跑。和 drive_go.sh 用同一个判据。"""
+    pat = f"drive.py.*--scene {re.escape(scene)}( |$).*--run {re.escape(run)}( |$)"
+    return subprocess.run(["pgrep", "-f", pat], capture_output=True).returncode == 0
+
+
+# ---------------------------------------------------------------- 挑卡(2026-09-24)
+# 每张卡一把 GPU 锁(_common.lock_path), 各轮次钉在不同的卡上才能真并行。开跑时由 drive_go.sh
+# 调 pick_gpu() 挑一张: 没有别的驱动在用、也没有别人占着显存的那张里, 卡号最小的。
+FREE_MB = 2000          # 卡上已用显存超过这么多, 就当有别人在用(比如渲染农场的容器)
+
+
+def gpu_cards():
+    """[(卡号, 已用显存 MB)], nvidia-smi 的顺序(PCI 顺序, 跑的时候配 CUDA_DEVICE_ORDER=PCI_BUS_ID)。"""
+    r = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+                       capture_output=True, text=True)
+    return [(a.strip(), int(b)) for a, b in (l.split(",") for l in r.stdout.strip().splitlines() if l.strip())]
+
+
+def _driver_procs():
+    """正在跑的驱动进程: {pid: (cmdline 参数表, 它的 CUDA_VISIBLE_DEVICES 第一个卡号)}。
+    ★ 只认 python 本身 —— tmux 里套的那层 bash 命令行里也有 drive.py, 但它的环境里没有卡号。"""
+    out = {}
+    r = subprocess.run(["pgrep", "-f", "run-recon-pipeline/drive.py"], capture_output=True, text=True)
+    for pid in r.stdout.split():
+        try:
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+            env = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        if not os.path.basename(argv[0]).startswith(b"python"):
+            continue
+        cvd = next((e.split(b"=", 1)[1].decode() for e in env if e.startswith(b"CUDA_VISIBLE_DEVICES=")), "")
+        out[pid] = ([a.decode(errors="replace") for a in argv], cvd.split(",")[0].strip() or "0")
+    return out
+
+
+def busy_gpus():
+    """正在跑的驱动各占哪张卡。看进程环境不看本轮配置: 命令行起的轮次没有记录, 进程环境才是真相。"""
+    return {g for _, g in _driver_procs().values()}
+
+
+def run_gpu(scene, run):
+    """这一轮的驱动在哪张卡上跑; 没在跑返回 None。"""
+    for argv, g in _driver_procs().values():
+        if "--scene" in argv and "--run" in argv and argv[argv.index("--scene") + 1] == scene \
+                and argv[argv.index("--run") + 1] == run:
+            return g
+    return None
+
+
+def pick_gpu(cards=None, busy=None):
+    """挑一张空卡。cards / busy 不给就现查(测试时注入)。一张都没有就抛 ValueError。"""
+    cards = gpu_cards() if cards is None else cards
+    busy = busy_gpus() if busy is None else busy
+    for idx, used in cards:
+        if idx not in busy and used < FREE_MB:
+            return idx
+    raise ValueError(f"没有空闲的卡: 在跑的驱动占着 {sorted(busy)}, 其余的卡已用显存都超过 {FREE_MB} MB")
+
+
+def _drive_state(R1):
+    try:
+        s = json.load(open(f"{R1}/logs/.drive_state.json"))
+        return int(s.get("段", 0)), bool(s.get("停在闸口"))
+    except (OSError, ValueError):
+        return 0, False
+
+
+def _effective(kind, scene, run):
+    """没有本轮配置的老轮次: 问 pipeline 要生效的配置(场景 SCENES 里可能手工配了 BODY_RUN)。"""
+    cmd = [PY, PIPES[kind], "--scene", scene, "--run", run, "--dump-cfg"] + (["--chain", "obj"] if kind == "indoor" else [])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return json.loads(r.stdout)
+    except Exception:
+        return {}
+
+
+def state(kind, scene, run):
+    """本轮页要的全部: 类型、有没有人、开不开召回、哪些还能改、驱动停在哪、在不在跑、挑人表。"""
+    _check_name(scene, run)
+    R1 = r1_of(kind, scene, run)
+    rc = _common.load_run_config(R1)
+    seg, stop = _drive_state(R1)
+    done = seg + (1 if stop else 0)
+    busy = running(scene, run)
+    if rc is not None:
+        over = rc.get("覆盖", {})
+        people, recall, manual = over.get("PEOPLE", "0"), over.get("RECALL", "0"), False
+    else:
+        cfg = _effective(kind, scene, run)
+        manual = bool(cfg.get("BODY_RUN", "").strip()) and cfg.get("PEOPLE") != "1"
+        people = "1" if (cfg.get("PEOPLE") == "1" or manual) else "0"
+        recall = cfg.get("RECALL", "0")
+    until = _common.EDITABLE_UNTIL
+    total = len(_segments(kind))
+    body = people_decisions.auto_dir(R1)
+    return {"场景": scene, "轮次": run, "类型": (rc or {}).get("类型", kind), "配置文件": rc is not None,
+            "有人": people, "召回": recall, "手工人体": manual,
+            "可改": {"PEOPLE": not busy and not manual and done <= until["PEOPLE"],
+                     "RECALL": not busy and done <= until["RECALL"]},
+            "段": seg, "停在闸口": stop, "闸": seg + 1 if stop else None, "已跑完": done, "总段数": total,
+            "在跑": busy, "GPU": run_gpu(scene, run) if busy else None,
+            "段列表": segments_view(kind, scene, run, seg, stop, busy, recall),
+            "下一步": None if busy else next_action(kind, seg, stop, recall),
+            "能继续": not busy and seg < total and os.path.isdir(R1),
+            "人": people_decisions.load(R1),
+            "图": {"地基": os.path.exists(f"{R1}/02_ground_check.jpg"),
+                   "体检": os.path.exists(f"{body}/03_check.jpg"),
+                   "跟踪视频": os.path.exists(f"{body}/03_track.mp4")}}
+
+
+# ---------------------------------------------------------------- 本轮页的"一步步"视图(2026-09-24)
+# 每道闸摆什么图/视频。键是 /run/media?what= 的白名单, 路径只在这里拼, 不收任意路径。
+def media_paths(kind, scene, run):
+    R1 = r1_of(kind, scene, run); body = people_decisions.auto_dir(R1)
+    return {"ground":    (f"{R1}/02_ground_check.jpg", "地基核对图: 抽帧 + 点云俯视(相机轨迹) + 侧视(地面线)"),
+            "sheet":     (f"{R1}/05_review_sheet.jpg", "候选联络图(改决定在候选页)"),
+            "check":     (f"{body}/03_check.jpg", "人体跟踪体检图"),
+            "track":     (f"{body}/03_track.mp4", "人体跟踪视频"),
+            "overlay":   (f"{body}/05_mesh_overlay.mp4", "人体网格叠回原片"),
+            "recall2d":  (f"{R1}/95_recall_check_2d.jpg", "召回核对图"),
+            "render":    (f"{R1}/08_render_back_phy.jpg", "渲染回图: 实拍 | 重建 | 叠加"),
+            "people4d":  (f"{R1}/09_people_check.mp4", "带人的验收视频: 原片 | 重建+人 | 叠加"),
+            "people4d_prev": (f"{R1}/09_people_check_prev.mp4", "上一版带人验收视频(重跑前的, 对比用)"),
+            "render_wd": (f"{R1}/18_render_back_wd_phy.jpg", "WildDet3D 对照版渲染回图")}
+
+GATE_MEDIA = {"check_ground": ["ground"], "check_picks": ["sheet", "check", "track"], "check_scale": ["overlay"],
+              "check_recall": ["recall2d"], "check_scene": ["render", "people4d", "people4d_prev"], "check_final": ["render_wd"]}
+
+
+_PIPE_MOD = {}
+def _pipe(kind):
+    """pipeline 模块本身(只读它的表: STEPS / SCENE_TAG), 别自己抄一份。"""
+    if kind not in _PIPE_MOD:
+        spec = importlib.util.spec_from_file_location(f"_{kind}_pipeline_for_run_ctl", PIPES[kind])
+        m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+        _PIPE_MOD[kind] = m
+    return _PIPE_MOD[kind]
+
+
+def _step_desc(kind):
+    """步骤说明问 pipeline 的 STEPS(和 --list 打的是同一份)。"""
+    m = _pipe(kind)
+    return {k: d for k, _e, d, _f in (m.STEPS if kind == "outdoor" else m.STEPS_OBJ)}
+
+
+def tag_of(kind, scene, run):
+    """生成的 mesh 按这个标签存目录(sam-3d-objects/my_images/<标签>_*)。公式和两个 pipeline 的 Ctx 一样。"""
+    return f"{_pipe(kind).SCENE_TAG.get(scene, scene[:3])}_{run}"
+
+
+def _tag_clash(kind, scene, run):
+    """新轮次的标签和盘上已有的哪一轮撞了(室内外共用 my_images, 两边都查)。没撞返回 None。"""
+    mine = tag_of(kind, scene, run)
+    for k, (_ds, res) in ROOTS.items():
+        for sc in sorted(os.listdir(res)) if os.path.isdir(res) else []:
+            if (k, sc) != (kind, scene) and os.path.isdir(f"{res}/{sc}/{run}") and tag_of(k, sc, run) == mine:
+                return f"{sc}/{run}"
+    return None
+
+
+def _latest_log(R1):
+    logs = sorted(glob.glob(f"{R1}/logs/drive_*.log"))
+    if not logs:
+        return None, None
+    try:
+        first = open(logs[-1], errors="ignore").readline()
+        t0 = time.mktime(time.strptime(first.split("]", 1)[1].strip(), "%Y-%m-%d %H:%M:%S"))
+    except (IndexError, ValueError):
+        t0 = os.path.getmtime(logs[-1])
+    return logs[-1], t0
+
+
+def _timing(R1):
+    """logs/timing.tsv 里每步最后一次的耗时(秒)。"""
+    out = {}
+    try:
+        for ln in open(f"{R1}/logs/timing.tsv", errors="ignore").read().splitlines()[1:]:
+            c = ln.split("\t")
+            if len(c) >= 7:
+                out[c[0]] = float(c[4])
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def gate_report(R1, gate, total):
+    """驱动打在日志里的第 gate 道闸的报告(最新那次), 去掉路径和 3D 提示 —— 那些在页面上另有地方。"""
+    head = f"闸 {gate}/{total} — "
+    for p in sorted(glob.glob(f"{R1}/logs/drive_*.log"), reverse=True):
+        lines = open(p, errors="ignore").read().splitlines()
+        idx = [i for i, l in enumerate(lines) if l.startswith(head)]
+        if not idx:
+            continue
+        out = []
+        for l in lines[idx[-1] + 2:]:
+            if l.startswith("★") or l.strip() == "该看的图:":
+                break
+            if l.strip() and not l.startswith("[3D 页]") and not l.strip().startswith("3D: open"):
+                out.append(l.strip())
+        return out
+    return []
+
+
+def _gate_extra(check, kind, scene, run):
+    """闸口要单独摆出来的结构化数字(报告原文之外)。"""
+    R1 = r1_of(kind, scene, run)
+    if check == "check_picks":
+        # ★ 按**现在盘上**的决策文件算, 不用驱动日志里那份闸口报告 —— 那是到闸时的快照,
+        #   人之后在候选页改的决定不在里面(nfl1 上就是: 报告写 25 个, 实际只剩 1 个)。
+        #   语义和 review_gate 落地一样: 整词作废 = 这个词所有行都不生成; 共用 = 这个词只出一个 mesh。
+        try:
+            rows = json.load(open(f"{R1}/05_review.json")).get("候选") or []
+        except (OSError, ValueError):
+            return {}
+        dead = sorted({r["词"] for r in rows if r.get("决定") == "drop-word"})
+        live = [r for r in rows if r.get("决定") not in ("drop", "drop-word") and r["词"] not in dead]
+        shared = {r["词"] for r in rows if r.get("决定") == "shared"}
+        per = {}
+        for r in live:
+            per[r["词"]] = 1 if r["词"] in shared else per.get(r["词"], 0) + 1
+        return {"候选决定": {"候选": len(rows), "会生成": sum(per.values()), "按词": per, "作废词": dead}}
+    if check == "check_scale":
+        try:
+            w = json.load(open(f"{R1}/02_da3/world_scale.json"))
+        except (OSError, ValueError):
+            return {}
+        per = (w.get("人") or {}).get("每人") or {}
+        return {"尺度": {"k": w.get("k"), "来源": w.get("来源") or "家具",
+                         "每人": {i: v.get("场景深度比模型") for i, v in per.items()}}}
+    if check == "check_scene":
+        try:
+            sk = json.load(open(f"{R1}/07_scene_skipped.json")).get("skipped", [])
+        except (OSError, ValueError):
+            sk = []
+        return {"跳过的物体": [{"词": x.get("word"), "实例": x.get("obj_id"), "原因": x.get("why"),
+                                "尺寸": x.get("ext")} for x in sk]}
+    return {}
+
+
+def segments_view(kind, scene, run, seg, stop, busy, recall):
+    """六段(室内五段)各自的状态、步骤、闸口报告、产出。状态: done / waiting(停在这一段的闸)
+    / running / stopped(这一段开过头但没跑完, 多半失败了) / pending。"""
+    R1 = r1_of(kind, scene, run)
+    log, t0 = _latest_log(R1)
+    cur = None
+    if busy and log:
+        hits = re.findall(r"^== (\S+)  \[", open(log, errors="ignore").read(), re.M)
+        cur = hits[-1] if hits else None
+    tm, desc, media = _timing(R1), _step_desc(kind), media_paths(kind, scene, run)
+    out = []
+    for i, (name, steps, check) in enumerate(_segments(kind)):
+        if i < seg:
+            st = "done"
+        elif i == seg:
+            st = "waiting" if stop else "running" if busy else "stopped" if os.path.exists(f"{R1}/logs/.stamp_{steps[0]}") and seg else "pending"
+        else:
+            st = "pending"
+        rows = []
+        for k in steps:
+            stamp = f"{R1}/logs/.stamp_{k}"
+            if st in ("done", "waiting"):
+                s_ = "done"
+            elif st == "running":
+                s_ = "running" if k == cur else "done" if os.path.exists(stamp) and t0 and os.path.getmtime(stamp) >= t0 else "pending"
+            else:
+                s_ = "pending"
+            rows.append({"步骤": k, "说明": desc.get(k, ""), "状态": s_,
+                         "耗时": tm.get(k) if s_ == "done" else None})
+        gate = ("跳过" if check == "check_recall" and recall != "1" and (st == "done" or i > seg or st != "waiting")
+                else "等你" if st == "waiting" else "通过" if st == "done" else None)
+        item = {"段": i + 1, "名": name, "状态": st, "闸": gate, "步骤": rows,
+                "报告": gate_report(R1, i + 1, len(_segments(kind))) if st in ("done", "waiting") else [],
+                "产出": [{"what": w, "说明": media[w][1], "视频": media[w][0].endswith(".mp4")}
+                         for w in GATE_MEDIA.get(check, []) if os.path.exists(media[w][0])]}
+        if st in ("done", "waiting"):
+            item.update(_gate_extra(check, kind, scene, run))
+        if st == "running" and t0:
+            done_t = [os.path.getmtime(f"{R1}/logs/.stamp_{r['步骤']}") for r in rows if r["状态"] == "done"]
+            item["已用秒"] = round(time.time() - max([t0] + done_t))
+        out.append(item)
+    return out
+
+
+def next_action(kind, seg, stop, recall):
+    """Continue 之后会跑哪一段、停在哪道闸(召回关时第 4 道闸不停, 顺延到下一道)。"""
+    segs = _segments(kind)
+    i = seg + 1 if stop else seg
+    if i >= len(segs):
+        return None
+    j = i
+    while j < len(segs) - 1 and segs[j][2] == "check_recall" and recall != "1":
+        j += 1
+    steps = segs[i][1] + [x for k in range(i + 1, j + 1) for x in segs[k][1]]
+    if recall != "1":       # 召回关时这五步只打一行"跳过", 不列给人看
+        steps = [x for x in steps if x not in ("detect", "recall", "recall_mask", "recall_gen", "recall_merge")]
+    return {"段": i + 1, "名": segs[i][0], "步骤": steps, "停在": j + 1}
+
+
+def set_config(kind, scene, run, changes):
+    _check_name(scene, run)
+    if running(scene, run):
+        raise ValueError("驱动正在跑这一轮, 等它停在闸口再改")
+    R1 = r1_of(kind, scene, run)
+    seg, stop = _drive_state(R1)
+    return _common.update_run_config(R1, kind, {k: str(v) for k, v in changes.items()}, seg + (1 if stop else 0))
+
+
+def set_people(kind, scene, run, changes):
+    _check_name(scene, run)
+    if running(scene, run):
+        raise ValueError("驱动正在跑这一轮(可能正在按旧决定出网格), 等它停在闸口再改")
+    return people_decisions.save_decisions(r1_of(kind, scene, run), {int(k): v for k, v in changes.items()})
+
+
+def go(kind, scene, run):
+    """开跑 / 继续 = 替人敲一次 drive_go.sh <场景> <轮次> [--indoor]。它自己会把驱动挂进 tmux 就返回。"""
+    _check_name(scene, run)
+    if running(scene, run):
+        raise ValueError("这一轮的驱动已经在跑了")
+    if not os.path.isdir(r1_of(kind, scene, run)):
+        raise ValueError(f"没有这个轮次: {r1_of(kind, scene, run)}")
+    # ★ 网页进程自己的 CUDA_VISIBLE_DEVICES 不传下去: 传了所有轮次都挤在那一张卡上。
+    #   不给卡号, drive_go.sh 就调 pick_gpu() 挑一张空的。
+    env = {k: v for k, v in os.environ.items() if k != "CUDA_VISIBLE_DEVICES"}
+    r = subprocess.run(["bash", DRIVE_GO, scene, run] + (["--indoor"] if kind == "indoor" else []),
+                       capture_output=True, text=True, timeout=60, env=env)
+    if r.returncode != 0:
+        raise ValueError((r.stdout + r.stderr).strip() or f"drive_go.sh 退出码 {r.returncode}")
+    return (r.stdout + r.stderr).strip()
+
+
+def new_run(kind, scene, run, people, recall):
+    """启动页: 建轮次目录, 写本轮配置, 开跑第 1 段。"""
+    if kind not in ROOTS:
+        raise ValueError(f"类型只能是 {sorted(ROOTS)}")
+    _check_name(scene, run)
+    rows = {x["场景"]: x for x in datasets()[kind]}
+    if scene not in rows:
+        raise ValueError(f"{ROOTS[kind][0]} 下没有场景 {scene}(类型选对了吗?)")
+    R1 = r1_of(kind, scene, run)
+    if os.path.isdir(R1) and os.listdir(R1):
+        raise ValueError(f"轮次已经存在: {R1}")
+    # ★ 标签默认取场景名前 3 个字母(nfl / nfl1 都是 nfl_r1), 撞了生成的 mesh 会互相覆盖, 而且不报错
+    clash = _tag_clash(kind, scene, run)
+    if clash:
+        raise ValueError(f"标签 {tag_of(kind, scene, run)} 和已有的 {clash} 撞了, 生成的 mesh 会互相覆盖。"
+                         f"在 pipeline 的 SCENE_TAG 里给 {scene} 配一个自己的标签, 或者换个轮次名")
+    if rows[scene].get("新视频"):
+        # 散放的视频: 建场景文件夹, 视频以 video.mp4 放进去(抽帧那步认这个名字)。
+        # 硬链接: 不占第二份空间, 也不动原文件; 跨盘链不了就复制
+        ds = ROOTS[kind][0]
+        os.makedirs(f"{ds}/{scene}", exist_ok=True)
+        try:
+            os.link(f"{ds}/{rows[scene]['新视频']}", f"{ds}/{scene}/video.mp4")
+        except OSError:
+            import shutil
+            shutil.copy2(f"{ds}/{rows[scene]['新视频']}", f"{ds}/{scene}/video.mp4")
+    os.makedirs(f"{R1}/logs", exist_ok=True)
+    _common.update_run_config(R1, kind, {"PEOPLE": str(people), "RECALL": str(recall)}, 0)
+    go(kind, scene, run)
+    return R1

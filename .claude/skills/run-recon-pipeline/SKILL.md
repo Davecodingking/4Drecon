@@ -168,7 +168,35 @@ $PY $D --scene cyberpunk --indoor --status
 
 ---
 
+## 本轮配置 / 人体线 / 网页开跑(2026-09-24)
+
+- **每轮一份 `<R1>/00_run_config.json`**:`{"类型": "outdoor", "覆盖": {"PEOPLE": "1", "RECALL": "0"}}`。
+  "覆盖"就是持久化的 CFG 覆盖,写错键名直接报错。生效顺序
+  `默认 ← SCENES ← 本轮配置 ← 人工闸决策 ← 环境变量`(`_common.resolve_cfg`)。
+  写它的三处用同一套规则(`_common.update_run_config`):启动页 `/new`、本轮页 `/run`、
+  `drive.py --people 0/1 --recall 0/1`。有没有人要在第 2 段之前定,召回要在第 4 段之前定,过了就拒绝。
+- **人体线在主流程里**:`PEOPLE=1` 时第 2 段 `people_track`(SAM3 跟踪人,复用场景的帧和相机)、
+  第 2 道闸挑人(网页 `/run#people`,文件 `05_people.json`)、第 3 段 `people_mesh`(尺度之前出网格)。
+  `BODY_RUN` 自动指向 `<结果目录>/<场景>/<轮次>/body4d`(跟踪视频、网格叠回原片都在这);一个都没勾 = 这一轮没有人。
+  跟踪只丢面积 < `PEOPLE_MIN_AREA`(0.1%)的碎片,其余全列出来、帧数够的默认勾上 ——
+  soccer 的守门员就是被 body4d 默认的 1% 门槛静默丢掉的。过了闸 2 再改挑人,`--go` 会重跑出网格和摆人那几步。
+  有本轮配置的新轮次不认 `SCENES` 里写死的 `BODY_RUN`;没有配置文件的老轮次(soccer r1、office)照旧。
+- **网页能开跑了**:`gate_ui.py` 的 `/new`(新建一轮)和 `/run`(本轮页:配置、地基图、挑人、
+  Start/Continue)。开跑只通过 `tools/drive_go.sh`(后台 tmux,会话名 `run_<场景>_<轮次>`),
+  同一轮在跑就拒绝。页面在 `tools/run_page.py`,逻辑在 `tools/run_ctl.py`。
+- **多卡并行**:GPU 锁是**每张卡一把**(`_common.lock_path()`,`/tmp/outdoor_pipeline_gpu<卡号>.lock`,
+  shell 的 `gpulock.sh` 同一规则)。`drive_go.sh` 没拿到 `CUDA_VISIBLE_DEVICES` 就自动挑一张空卡
+  (`run_ctl.pick_gpu()`:没有别的驱动在用、已用显存 < 2GB 的里面卡号最小的),网页开跑也走这条;
+  想钉某张卡就 `CUDA_VISIBLE_DEVICES=3 tools/drive_go.sh <场景> <轮次>`。所以不同场景可以同时开跑、各占一张卡。
+  本轮页状态条会显示这一轮在哪张卡上。
+
 ## Gotchas
+
+- **召回默认关(2026-09-24 起)。** 两条 pipeline 的 CFG 都有 `RECALL="0"`:召回五步
+  (`detect`/`recall`/`recall_mask`/`recall_gen`/`recall_merge`)照常盖完成戳但什么都不跑,
+  组装和室内房间壳只认 `06_all_boxes.json`,驱动的第 4 道闸不停、它的决策也不落地。
+  下面讲闸 4、召回联络图的段落只在召回打开时适用。要开:场景配置里写 `RECALL="1"`,
+  或者临时用环境变量 `RECALL=1`。测试在 `tools/tests/test_recall_switch.py`。
 
 - **场景名打错会被挡住。** `outdoor_pipeline.py` 拿默认配置照跑不误,干跑还看着像成功。
   驱动先检查 `data/outdoor/dataset/<场景>/` 存不存在,不存在就退出码 1 并列出现有场景。

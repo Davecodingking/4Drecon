@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# 实时看流水线在跑什么。用法:  tools/watch_run.sh [场景] [轮次] [--indoor]
+# 真正的实现在 watch_run.py(rich 看板): 段 / 步骤耗时 / 当前物体进度 / 显卡 / 闸口。只读, 随时开关。
+exec "$HOME/miniforge3/envs/sam3d/bin/python" "$HOME/sam3d/tools/watch_run.py" \
+     --scene "${1:-pedestrian}" --run "${2:-r2}" ${3:+"$3"}

@@ -20,8 +20,9 @@
     中途走进画面的人永远跟不到。我们用 SAM 3 的文字提示替掉了这一段。
   * 帧目录在结果树底下 (00_frames/), 不在 dataset/<scene>/frames。因为这里的帧是
     抽稀+缩放过的, 和 outdoor 那套原分辨率全帧不是一回事, 同名会互相污染。
-  * 产物落在 ~/sam3d/sam-body4d/outputs/<场景>/<轮次>/, 不在 data/outdoor/result/。
-    跟 sam-3d-objects 一样, 第三方仓库的产物留在它自己树里。
+  * 单跑时产物落在 ~/sam3d/sam-body4d/outputs/<场景>/<轮次>/(老轮次 b1/b2 都在这)。
+    主流程拉起时(people_track / people_mesh)给 BODY_OUT, 落在场景轮次底下的 body4d/ ——
+    一轮的东西都在 data/outdoor/result/<场景>/<轮次>/ 里, 看视频不用去第三方仓库里翻。
 
 坑
   * ★ body4d 必须是独立 conda 环境。sam-body4d 仓库内嵌了另一份 SAM 3, 包名同样叫 sam3,
@@ -128,6 +129,10 @@ SCENES = {
     # 室内办公室, 1920x1080。人既有走动的也有坐着的。帧和焦距都直接取场景 r1 那套,
     # 人最后要放回这个场景里 (body_into_scene / indoor_pipeline 的 people 步)。
     "office": dict(SCENE_R1=f"{SAM3D}/data/indoorOutput/office/r1"),
+
+    # 足球场远景, 1280x720 / 205 帧。★ 守门员离得远, 最大面积只有 0.7%, 默认 1.0% 会把他整条丢掉
+    #   (b1 就这么丢的)。0.2% 以下那两个是碎片/误检。1/2 是近处两个球员, 3 是守门员(像素高中位 115, 69 帧全出网格)。
+    "soccer": dict(MIN_AREA_PCT="0.2", PICK="1,2,3"),
 }
 
 
@@ -145,7 +150,7 @@ class Ctx:
         # ★ 这两段素材叫 <scene>.mp4, 不是 outdoor 写死的 video.mp4
         cand = [f"{d}/{scene}.mp4", f"{d}/video.mp4"] + sorted(glob.glob(f"{d}/*.mp4"))
         self.VID = next((p for p in cand if os.path.exists(p)), cand[0])
-        self.R1 = f"{OUTROOT}/{scene}/{run}"
+        self.R1 = os.environ.get("BODY_OUT") or f"{OUTROOT}/{scene}/{run}"
         self.LOG = f"{self.R1}/logs"
         self.FR = f"{self.R1}/00_frames"
         self.TRK = f"{self.R1}/02_body4d"
@@ -177,14 +182,15 @@ da3 = {g["SCENE_R1"] + "/02_da3"!r}
 fm = load_frame_map(da3)
 src = json.load(open(da3 + "/frame_map.json")).get("frames_dir") if os.path.exists(da3 + "/frame_map.json") else None
 src = src or json.load(open(da3 + "/cameras.json"))["source"]
-names = sorted(fm)
-if names != [f"{{i:04d}}.jpg" for i in range(len(names))]:
-    raise SystemExit(f"[失败] 场景帧不是 0000.jpg 起连续编号, body4d 按位置序号读帧会错位: {{names[:5]}}")
+names = sorted(fm, key=lambda n: fm[n])
 out = {c.FR!r}; os.makedirs(out, exist_ok=True)
 for f in os.listdir(out):
     if f.endswith((".jpg", ".json")): os.remove(os.path.join(out, f))
-for n in names:
-    os.symlink(os.path.join(src, n), os.path.join(out, n))
+# ★ 软链按位置重编号成 0000..N-1: body4d 按位置序号读帧。室外场景帧按原视频帧号命名且不连续
+#   (soccer: 0000 0001 0002 0003 0005 ...), 原样链过来就对不上; 室内本来就连续, 重编号等于没变。
+#   帧和相机的对应靠 kept_indices(原视频帧号), 不靠文件名 —— body_into_scene 就是按它找相机的。
+for i, n in enumerate(names):
+    os.symlink(os.path.join(src, n), os.path.join(out, f"{{i:04d}}.jpg"))
 from PIL import Image
 W, H = Image.open(os.path.join(src, names[0])).size
 # 帧率给动画时间轴用(原视频帧号 / fps)。frame_map 里没记的话去数据集找原视频读
@@ -200,7 +206,7 @@ if not fps:
 json.dump(dict(scene_r1={g["SCENE_R1"]!r}, frames_dir=src, out_wh=[W, H], n_frames=len(names),
                src_fps=float(fps),
                kept_indices=[int(fm[n]) for n in names],
-               note="帧是场景 frames_r1 的软链, kept_indices = 场景 frame_map 里的原视频帧号"),
+               note="帧是场景帧的软链(按位置重编号), kept_indices = 场景 frame_map 里的原视频帧号"),
           open(os.path.join(out, "frames.json"), "w"), ensure_ascii=False, indent=1)
 print(f"[场景帧] {{len(names)}} 帧 {{W}}x{{H}} <- {{src}}  (软链, 原视频帧号 {{fm[names[0]]}}..{{fm[names[-1]]}})")
 '''

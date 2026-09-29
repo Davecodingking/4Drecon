@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# 人看完闸口, 继续跑下一段 —— 放进后台 tmux, 关掉终端也不断; 输出写进 logs/drive_<时间>.log,
+# watch_run.py 看板靠这份日志的 [开始]/[结束] 和步骤行画进度, 每步耗时另记在 logs/timing.tsv。
+# 用法:  tools/drive_go.sh <场景> <轮次> [--indoor]
+#   跑的时候:  tmux attach -t watch_<场景>   看板(没开会顺手开一个)
+#   驱动本身:  tmux attach -t run_<场景>     一般不用看, 输出都在日志里
+set -eu
+SC=${1:?场景}; RUN=${2:?轮次}; IN=${3:-}
+PY=$HOME/miniforge3/envs/sam3d/bin/python
+if [ "$IN" = "--indoor" ]; then R1=$HOME/sam3d/data/indoorOutput/$SC/$RUN; else R1=$HOME/sam3d/data/outdoor/result/$SC/$RUN; fi
+[ -d "$R1" ] || { echo "没有这个轮次: $R1"; exit 1; }
+if pgrep -f "drive.py.*--scene $SC( |$).*--run $RUN" >/dev/null; then echo "$SC/$RUN 的驱动已经在跑了"; exit 1; fi
+LOG=$R1/logs/drive_$(date +%m%d_%H%M%S).log
+tmux kill-session -t "run_$SC" 2>/dev/null || true
+tmux new-session -d -s "run_$SC" \
+  "{ echo \"[开始] \$(date '+%F %T')\"; $PY -u $HOME/sam3d/.claude/skills/run-recon-pipeline/drive.py --scene $SC --run $RUN $IN --go; echo \"[结束] \$(date '+%F %T') 退出码 \$?\"; } > $LOG 2>&1"
+tmux has-session -t "watch_$SC" 2>/dev/null || \
+  tmux new-session -d -s "watch_$SC" -x 120 -y 45 "$PY $HOME/sam3d/tools/watch_run.py --scene $SC --run $RUN $IN"
+echo "已继续: $SC/$RUN  日志 $LOG"
+echo "看进度: tmux attach -t watch_$SC   (Ctrl-b d 退出看板, 不影响运行)"

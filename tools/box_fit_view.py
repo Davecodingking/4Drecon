@@ -303,7 +303,9 @@ def find_floor(P, seed=0, iters=4000, cone=25.0, tol=0.04):
         if best is None or k > best[0]: best = (k, n, s3[0])
     if best is None: return None
     Q = P[np.abs((P - best[2]) @ best[1]) < tol]
-    n = np.linalg.svd(Q - Q.mean(0))[2][2]; n *= np.sign(n[1])
+    # ★ full_matrices=False: 默认会顺手算 N×N 的 U —— nfl1 球场地面内点 11 万, 那就是 100 GB,
+    #   跑了近 5 分钟、峰值 194 GB, 驱动卡在闸口。这里只要 Vt 的最后一行(法向)。
+    n = np.linalg.svd(Q - Q.mean(0), full_matrices=False)[2][2]; n *= np.sign(n[1])
     return n, Q.mean(0), len(Q)
 notice = ""
 def T3(x): return np.asarray(x, float)             # 不转正时就是原样
@@ -389,6 +391,9 @@ if bdir and bdir != "off":
         world = bis.apply_corr(bpeople, corr, cams, vid2key, kept, roots)
         nv = len(next(iter(next(iter(world.values())).values())))
         vsel = np.sort(rng.choice(nv, min(nv, a.body_pts), replace=False))   # 每帧同一批顶点, 动起来才连贯
+        # ★ 走过的线按骨盆中心画, 不按全身外接框中心: 手臂一甩框中心就跟着摆, 线上全是小锯齿
+        #   (09-28 soccer r2: 框中心偏离平滑路径 5.9~6.4 cm, 骨盆中心 2.5~3.4 cm)
+        pel = bis.load_parts()["pelvis"]
         for pid in sorted(world, key=lambda x: int(x) if x.isdigit() else 1 << 30):
             fr = world[pid]; vfs = sorted(fr)
             bxs, pts, path, dims, tall = [], [], [], [], []
@@ -402,7 +407,8 @@ if bdir and bdir != "off":
                 c8 = [[cx + e1[0] * rw * sx + e2[0] * rh * sy, (y0 + y1) / 2 + (y1 - y0) * sz, cz + e1[1] * rw * sx + e2[1] * rh * sy]
                       for sx in (-.5, .5) for sy in (-.5, .5) for sz in (-.5, .5)]
                 bxs.append(np.round(c8, 3).tolist()); dims.append((rw, rh, y1 - y0))
-                pts.append(V[vsel]); path.append([round(float(cx), 3), round(y0, 3), round(float(cz), 3)])
+                pc = V[pel].mean(0)
+                pts.append(V[vsel]); path.append([round(float(pc[0]), 3), round(y0, 3), round(float(pc[2]), 3)])
             dims = np.array(dims); P = np.concatenate(pts)
             steps = np.linalg.norm(np.diff(np.array(path)[:, [0, 2]], axis=0), axis=1) if len(path) > 1 else np.zeros(1)
             r = rep.get(pid, {})

@@ -18,9 +18,17 @@ import fcntl, json, os, shlex, subprocess, time
 
 
 # ==================================================================== GPU 排队
-# ★ 两条流水线(以及 body4d 那条)共用同一把锁。锁文件名是字面值, 一个字都不能改 ——
-#   改了就等于又分成两个队, 而分成两个队的后果见文件头。
-LOCK = "/tmp/outdoor_pipeline_gpu.lock"
+# ★ 两条流水线(以及 body4d 那条)在**同一张卡上**共用同一把锁。锁文件名的规则一个字都不能改 ——
+#   改了就等于同一张卡又分成两个队, 而分成两个队的后果见文件头。shell 那边(gpulock.sh)是同一个规则。
+# ★ 2026-09-24 从"整台机器一把锁"改成"每张卡一把": 8x3090 上各轮次钉在不同的卡上
+#   (drive_go.sh 开跑时挑空闲的卡), 锁只该挡同一张卡上的人。卡号取 CUDA_VISIBLE_DEVICES 的第一个
+#   (torch 的 cuda:0), 不设就是 0 —— 和 wait_gpu() 看的是同一张卡。
+def lock_path():
+    dev = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip() or "0"
+    return f"/tmp/outdoor_pipeline_gpu{dev}.lock"
+
+
+LOCK = lock_path()      # 老的 import 名; 进程的卡在启动时就定了, 算一次就够
 
 
 class GpuLock:
@@ -34,7 +42,7 @@ class GpuLock:
       wait_gpu 管"流水线之外的第三方进程" —— 那些进程不会来拿这把锁, 只能靠查显存看见
     """
     def __enter__(self):
-        self.f = open(LOCK, "a+")
+        self.f = open(lock_path(), "a+")
         try:
             fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -53,23 +61,29 @@ def wait_gpu(need_mb, dry=False, timeout=10800):
       一半时又把显存吃回去(实测被这么坑过, DA3 前向到 dinov2 attention 才炸)。
       所以要等到**没有别的进程占着卡**。
     ★ 只等不杀 —— 别人的活不归我们管。
+    ★ 2026-09-24 迁到 8x3090 共享机: 只看 CUDA_VISIBLE_DEVICES 的第一张卡(torch 的 cuda:0)。
+      原来数的是**所有卡**上的进程、查的是 0 号卡的余量 —— 别的卡上有人(UnrealEditor)就永远
+      轮不上, 排满 3 小时报失败。配 CUDA_DEVICE_ORDER=PCI_BUS_ID, nvidia-smi 的编号才和 CUDA 一致。
     """
     if dry:
         return
     me, t0 = os.getpid(), time.time()
+    dev = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0].strip() or "0"
     while True:
-        q = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory",
+        g = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,memory.used,memory.total",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True)
+        rows = [[x.strip() for x in l.split(",")] for l in g.stdout.strip().splitlines() if l.strip()]
+        row = next((r for r in rows if dev in (r[0], r[1]) or (dev.startswith("GPU-") and r[1].startswith(dev))), rows[0])
+        uuid, used, total = row[1], int(row[2]), int(row[3])
+        q = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory",
                             "--format=csv,noheader,nounits"], capture_output=True, text=True)
         others = 0
         for line in q.stdout.strip().splitlines():
             if not line.strip():
                 continue
-            pid, mb = [int(x) for x in line.split(",")]
-            if pid != me and mb > 2000:
-                others += mb
-        g = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total",
-                            "--format=csv,noheader,nounits"], capture_output=True, text=True)
-        used, total = [int(x) for x in g.stdout.strip().splitlines()[0].split(",")]
+            u, pid, mb = [x.strip() for x in line.split(",")]
+            if u == uuid and int(pid) != me and int(mb) > 2000:
+                others += int(mb)
         if not others and total - used >= need_mb:
             return
         if time.time() - t0 > timeout:
@@ -119,9 +133,14 @@ def sh(cmd, log=None, dry=False, cwd=None, sep=None, env=None):
             _SEP_DONE.add(_k)
             with open(log, "a") as f:
                 f.write(f"\n== {CUR_STEP or '?'}  {time.strftime('%F %T')}\n")
-    run_env = None
+    # ★ 2026-09-24: 每一步默认 HF_HUB_OFFLINE=1。权重全在 ~/.cache/huggingface, 但 transformers
+    #   装模型时每个文件都要上网 HEAD 一次核对版本; 本机直连不了 huggingface.co, 只能走 ~/.bashrc
+    #   的代理(借用户电脑的网), 隧道一卡就 10 s 超时 × 重试 5 次 —— nfl1 的 verify 验 1 个实例
+    #   用了 18 分钟。以前只有 SAM3D 生成那步单独加了, Qwen-VL 那几步(vlm/verify/vlm_sizes)漏了;
+    #   放在这里所有步骤一起管。要下新模型: 环境变量或 env= 里显式给 HF_HUB_OFFLINE=0。
+    run_env = dict(os.environ); run_env.setdefault("HF_HUB_OFFLINE", "1")
     if env:
-        run_env = dict(os.environ); run_env.update(env)
+        run_env.update(env)
         if "CUDA_HOME" in env:
             run_env["PATH"] = env["CUDA_HOME"] + "/bin:" + run_env.get("PATH", "")
     with (open(log, "a") if log else open(os.devnull, "w")) as f:
@@ -143,18 +162,72 @@ def envcmd(py, script, env=None, args=None):
         shlex.quote(str(x)) for x in (args or []))
 
 
+# ==================================================================== 每轮配置
+# ★ 2026-09-24: <R1>/00_run_config.json —— 这一轮的配置, 启动页 / 驱动命令行写, 第 1 道闸可改。
+#   {"类型": "outdoor"|"indoor", "覆盖": {CFG 键: 值}}
+#   "覆盖"就是持久化的 CFG 覆盖(效果同环境变量, 但重跑不丢), 以后调一轮的参数不用再改 SCENES。
+RUN_CONFIG = "00_run_config.json"
+
+
+def load_run_config(R1):
+    p = f"{R1}/{RUN_CONFIG}"
+    return json.load(open(p)) if R1 and os.path.exists(p) else None
+
+
+def save_run_config(R1, d):
+    os.makedirs(R1, exist_ok=True)
+    tmp = f"{R1}/{RUN_CONFIG}.tmp"
+    json.dump(d, open(tmp, "w"), ensure_ascii=False, indent=1)
+    os.replace(tmp, f"{R1}/{RUN_CONFIG}")
+
+
+# 启动页 / 闸 1 网页 / drive.py 命令行能改的项, 以及"跑完第几段之后就不许改"。
+# 有没有人: people_track 在第 2 段(下标 1), 跑完 >1 段再改不会生效; 召回在第 4 段(下标 3)。
+EDITABLE_UNTIL = {"PEOPLE": 1, "RECALL": 3}
+
+
+def update_run_config(R1, kind, changes, done):
+    """改本轮配置, 驱动命令行和网页共用这一套规则。done = 已经跑完的段数。
+    类型开跑后锁定; 过了那一段还改的直接拒绝(改了也不会生效, 让人新开一轮)。不合规矩抛 ValueError。"""
+    rc = load_run_config(R1) or {"类型": kind, "覆盖": {}}
+    if rc.get("类型") != kind:
+        raise ValueError(f"这一轮是 {rc.get('类型')}, 这里给的是 {kind}。类型开跑后不能改, 新开一轮")
+    over = rc.setdefault("覆盖", {})
+    for key, val in changes.items():
+        if key not in EDITABLE_UNTIL:
+            raise ValueError(f"{key} 不在可改的项里: {sorted(EDITABLE_UNTIL)}")
+        if val not in ("0", "1"):
+            raise ValueError(f"{key} 只能是 0 或 1, 给的是 {val!r}")
+        if over.get(key) == val:
+            continue
+        if done > EDITABLE_UNTIL[key]:
+            raise ValueError(f"{key} 的那一段已经跑过了(已跑完 {done} 段), 现在改不会生效 —— 新开一轮")
+        over[key] = val
+    save_run_config(R1, rc)
+    return rc
+
+
 # ==================================================================== 配置 / 戳 / 计时
 def resolve_cfg(CFG, SCENES, scene, R1=None, review=None):
-    """生效顺序: CFG 默认值 <- 场景覆盖 <- 人工闸决策 <- 环境变量。
+    """生效顺序: CFG 默认值 <- 场景覆盖 <- 本轮配置 <- 人工闸决策 <- 环境变量。
 
     人工闸排在环境变量之前 —— 临时敲一个环境变量试值, 应该压得过闸的决定;
     但闸的决定要压得过写死在 SCENES 里的默认, 否则人在闸口做的判断永远轮不上。
+    本轮配置(00_run_config.json)在场景之后、闸之前: 它是开跑时人对这一轮定的调子。
 
     ★ 环境变量那一层只认已经在 CFG 里的键, 所以 CFG 同时也是"可调参数白名单"。
       写错名字的环境变量会被静默忽略 —— 这是故意的, 否则整个 os.environ 都会灌进来。
+    ★ 本轮配置里写错键**直接报错**: 它是人写进盘里要长期生效的, 静默忽略等于这个设置从来没生效过。
     """
     cfg = dict(CFG)
     cfg.update(SCENES.get(scene, {}))
+    rc = load_run_config(R1)
+    if rc:
+        over = rc.get("覆盖", {})
+        bad = sorted(k for k in over if k not in CFG)
+        if bad:
+            raise SystemExit(f"[失败] {R1}/{RUN_CONFIG} 的覆盖里有不认识的键: {bad}")
+        cfg.update({k: str(v) for k, v in over.items()})
     if R1 and review is not None:
         review.apply_to_cfg(cfg, R1)
     cfg.update({k: v for k, v in os.environ.items() if k in CFG})

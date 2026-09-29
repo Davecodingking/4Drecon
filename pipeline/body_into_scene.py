@@ -13,6 +13,9 @@
   一个盒子。pedestrian 实测 14 个 person 里有 11.78x1.83x3.26m 的"人";
   realstreet 4 个 person 没一个尺寸对。所以走动的人**本来就不该**走静态物体那条路。
 
+★ 被挡住的人: SAM 3D Body 会把挡在前面的人当成他重建(位置跳到别人那儿、动作换成别人的)。
+  套得稳(跟着邻居走)的不动; 在两个人之间来回认、身体朝向一帧翻 30° 以上的段换掉 —— 见"翻转补帧"那节。
+
 用法(不碰流水线, 独立跑):
   python body_into_scene.py --r1 <场景结果目录> --body <body4d轮次目录> [--out <输出目录>]
   python body_into_scene.py --r1 ~/sam3d/data/outdoor/result/pedestrian/r2sim_vggt \
@@ -193,6 +196,198 @@ def depth_ratio(pid, bis, roots, mesh_run, da3, vid2key, kept):
     return out
 
 
+DIST_HALF = 0.17    # 秒: 逐帧场景距离先取前后各这么久的中位数(24 fps 约 ±4 帧, 即原来的 9 帧窗),
+                    # 压掉单帧 mask 糊到背景上的测量。★ 09-28 从"9 帧"改成按秒: office 约 7 fps, 9 帧是 1.3 秒
+DIST_SIGMA = 0.3    # 然后再按时间做高斯平滑的 σ(秒, ±2σ 约 1 秒)。只平滑"离相机多远"这一个方向:
+                    # 远处 VGGT 深度有 ±1 m 的噪声, 中位数会把它变成台阶(soccer r2 守门员 139->140 帧
+                    # 画面里挪 3 px, 距离 21.1 -> 22.3 m); 人前后方向 1/20 秒挪不了 1 m, 放心平滑。
+                    # 左右上下(画面里的位置)不动 —— 那是准的, 扑救这种快动作靠它。按秒不按帧: 室内约 8 fps, 室外约 21 fps
+
+
+def frame_ratios(bis, ratios, z, R, half=DIST_HALF, t=None, sigma=DIST_SIGMA, trust=None):
+    """每帧的远近比例 {bi: r}: 人离相机 r*z 米, 由这一帧前后 half 秒里**场景深度量到的距离**的中位数定。
+    ★ 2026-09-24 以前每人只取一个比例 R, 距离 = R × 模型逐帧估的距离 z。模型的 z 是按"人在画面里多大"
+      猜的, 人一倒地/蜷起来就塌: soccer r2 守门员扑救那 30 帧 z 从 19 m 掉到 8~11 m, 场景深度一直 19~22 m,
+      固定的 R 把他往相机拉近 10 m, 俯视图上一条长线。平滑后最大一步 3.02 m -> 0.54 m, 近处的人几乎不变。
+    ★ 平滑的是距离(物理上连续), 不是比例 —— 比例在模型塌陷的边界上本来就该跳。
+    窗口里一帧都没量到(被挡住) -> 模型这帧可信, 就用这个人的整体比例 R(= R × 模型的距离);
+      模型不可信(trust 之外: 翻转补帧的帧, 模型在两个人之间来回认) -> 不碰模型的距离, 按时间接上前后已经定了的
+      距离(量到的, 或可信帧的 R × 模型距离)。
+      ★ 09-28 nfl1 人 3 片尾 36 帧被挡得只剩 100~500 像素、量不到深度, 退回模型的距离一帧跳 ±1.8 m, 人前后来回晃;
+        人 4(自己量的深度离群, ratios 传空)补帧段模型的距离一帧跳 28 m。
+    t: {bi: 秒}(原视频帧号 / fps), 给高斯平滑用; 不给就按 24 fps 算。trust: 模型距离可信的帧, 不给 = 全可信。"""
+    t = t or {b: b / 24.0 for b in bis}
+    meas = {b: ratios[b] * z[b] for b in ratios}
+    med = {}
+    for b in bis:
+        win = [meas[x] for x in bis if x in meas and abs(t[x] - t[b]) <= half + 1e-9]
+        if win:
+            med[b] = float(np.median(win))
+    have = [b for b in bis if b in med]
+    tt = np.array([t[b] for b in have]); dd = np.array([med[b] for b in have])
+    ds = {b: float((k * dd).sum() / k.sum()) for b in have
+          for k in [np.exp(-0.5 * ((tt - t[b]) / sigma) ** 2)]}
+    out = {}
+    for b in bis:
+        if b in ds:
+            out[b] = ds[b] / z[b]
+        elif trust is None or b in trust:
+            out[b] = R
+    known = [b for b in bis if b in out]
+    for b in bis:
+        if b not in out:
+            out[b] = (float(np.interp(t[b], [t[x] for x in known], [out[x] * z[x] for x in known])) / z[b]
+                      if known else R)
+    return out
+
+
+# ------------------------------------------------------------------ 翻转补帧
+# ★ 人被挡住大半时, SAM 3D Body 有时会把**挡在前面的那个人**当成他重建。两种后果完全不同:
+#   - 稳定地套到邻居身上(soccer r2 人 1 在 13~45 帧套到人 2 身上): 邻居就在旁边、深度差不多、动作连贯,
+#     看着是平滑的, 用户验收说没问题 —— 不动。
+#     ★ 09-27 试过按"网格投影落在自己 mask 上的比例 < 0.5"把这种段整段换掉(两头插值/定住):
+#       人 1 被补成僵住的动作, 比套到邻居身上难看得多, 用户否了。
+#   - 每帧在两种理解之间来回认(守门员扑倒时一个近 10 m、看着大三倍的球员从前面穿过):
+#     身体朝向一帧翻 30~118°, 这才是"鬼畜"。露全身时三个人每帧最多转 14°(中位 1~2°),
+#     被挡但套得稳的人 1 最多 21°。
+#   判据: 骨盆朝向转得比 FLIP_RATE 还快就在这儿断开; 断开后连续稳不到 MIN_RUN_S 的小段 = 翻来翻去, 换掉。
+#   怎么换见 occ_plan: 两头都有好帧 -> 插值; 只剩一头(守门员翻到片尾) -> 动作定在最后一个好帧、位置跟 mask 走
+#   (守门员扑倒以后本来就躺在地上, 定住反而是对的)。换掉的帧在轨迹整理里算"不可信"(见 tidy_track)。
+#   ★ 09-28 从"一帧 30°、稳 10 帧"改成按秒(24 fps 下一模一样): office 约 7 fps, 按帧的话正常转身也会被当成翻
+FLIP_RATE = 720.0   # 度/秒(24 fps 一帧 30°)。露全身的人一帧最多转 14°, 即约 340°/秒
+MIN_RUN_S = 0.4     # 秒(24 fps 约 10 帧)。守门员 147 帧以后最长的一段只有 8 帧; 正常的人整段一次都不断
+
+
+def _rot_deg(A, B):
+    return float(np.degrees(np.arccos(np.clip((np.trace(A.T @ B) - 1) / 2, -1, 1))))
+
+
+def pelvis_rots(Ws):
+    """每帧骨盆朝向(按 MHR 骨盆那圈顶点和静止姿势对齐)。"""
+    P = load_parts()
+    return [_kabsch(P["rest_pelvis"], W[P["pelvis"]]) for W in Ws]
+
+
+def flip_segments(rots, t=None, rate=FLIP_RATE, min_run=MIN_RUN_S):
+    """rots: 按帧顺序的骨盆朝向; t: 秒(不给按 24 fps)。返回要换掉的段 [(i0, i1)](闭区间, 下标)。
+    一段够长的都没有(从头翻到尾) -> 不知道该信谁, 返回 []。"""
+    n = len(rots)
+    if n < 2:
+        return []
+    t = np.arange(n) / 24.0 if t is None else np.asarray(t, float)
+    dt = np.diff(t)
+    cuts = [0] + [i for i in range(1, n) if _rot_deg(rots[i - 1], rots[i]) > rate * dt[i - 1]] + [n]
+    runs = [(a, b - 1) for a, b in zip(cuts[:-1], cuts[1:])]
+    long_ = lambda a, b: (b - a + 1) * float(np.median(dt)) >= min_run - 1e-9      # 帧数 × 帧间隔
+    if not any(long_(a, b) for a, b in runs):
+        return []
+    segs = []
+    for a, b in runs:
+        if long_(a, b):
+            continue
+        if segs and a == segs[-1][1] + 1:
+            segs[-1][1] = b
+        else:
+            segs.append([a, b])
+    return [tuple(x) for x in segs]
+
+
+def load_focals(mesh_run):
+    """每人每帧 SAM 3D Body 自己估的焦距(像素), 和 load_roots 同一批 json。"""
+    root = f"{mesh_run}/focal_4d_individual"
+    return {pid: {int(f[:-5]): float(json.load(open(f"{root}/{pid}/{f}"))["focal_length"])
+                  for f in os.listdir(f"{root}/{pid}") if f.endswith(".json")}
+            for pid in os.listdir(root)}
+
+
+def occ_plan(bis, segs, t, rootW, mask_root):
+    """每个不可信帧怎么补: {str(bi): [A, B, w, 根的世界坐标]}, 存进 10_people.json, apply_corr 按它重放。
+    动作 = A、B 两个好帧之间按 w 过渡(见 blend_pose); 根的位置:
+      两头都有好帧 -> 按时间线性插值(1~2 秒里人基本走直线, 比被挡时的任何观测都可靠);
+      只有一头(片头/片尾) -> 动作定在那个好帧(A = B), 位置跟着自己的 mask 走:
+        mask_root[bi] = 沿 mask 质心那条视线、按场景深度量的距离; 减去锚点那帧"mask 质心 vs 真根"的差,
+        接缝处不跳。mask 空了(整个人被挡没了)就停在上一帧。
+    一整段都不可信(没有锚) -> 不补, 返回里没有这段。"""
+    out = {}
+    for i0, i1 in segs:
+        A = bis[i0 - 1] if i0 > 0 else None
+        B = bis[i1 + 1] if i1 + 1 < len(bis) else None
+        if A is None and B is None:
+            continue
+        seg = bis[i0:i1 + 1]
+        if A is not None and B is not None:
+            for b in seg:
+                w = (t[b] - t[A]) / (t[B] - t[A])
+                out[str(b)] = [A, B, round(w, 5), ((1 - w) * rootW[A] + w * rootW[B]).round(5).tolist()]
+            continue
+        K = A if A is not None else B
+        mk = (mask_root or {}).get(K)
+        off = rootW[K] - mk if mk is not None else np.zeros(3)
+        prev = rootW[K]
+        for b in (seg if A is not None else seg[::-1]):             # 从锚点往外走, "停在上一帧"才有上一帧
+            m = (mask_root or {}).get(b)
+            if m is not None:
+                prev = m + off
+            out[str(b)] = [K, K, 0.0, np.asarray(prev).round(5).tolist()]
+    return out
+
+
+def mask_roots(pid, bis, rt, rf, focal, mesh_run, cams, vid2key, kept):
+    """逐帧"沿自己 mask 质心那条视线、按场景深度"的根 {bi: 世界坐标, mask 空了是 None}。
+    质心按 body4d 的画面算(和网格同一个像素系, 主点在画面中心); 距离用 frame_ratios 那套
+    (rf × 模型的 z = 自己 mask 里的场景深度)。"""
+    from PIL import Image
+    out = {}
+    for bi in bis:
+        mp = f"{mesh_run}/masks/{bi:08d}.png"
+        own = (np.array(Image.open(mp)) == int(pid)) if os.path.exists(mp) else None
+        if own is None or not own.any():
+            out[bi] = None
+            continue
+        H, W_ = own.shape
+        ys, xs = np.nonzero(own)
+        z = rf[bi] * float(rt[bi][2])
+        pc = np.array([(xs.mean() - W_ / 2) / focal[bi] * z, (ys.mean() - H / 2) / focal[bi] * z, z])
+        c2w = np.linalg.inv(np.array(cams[vid2key[kept[bi]]]["extrinsic_w2c_4x4"], float))
+        out[bi] = pc @ c2w[:3, :3].T + c2w[:3, 3]
+    return out
+
+
+def _fix_report(occ, flips, kept):
+    """报告: 补了哪几段(原视频帧号)、怎么补的、段里最大的一翻(度)。"""
+    bs = sorted(int(k) for k in occ)
+    segs = []
+    for b in bs:
+        if segs and b == segs[-1][-1] + 1:
+            segs[-1].append(b)
+        else:
+            segs.append([b])
+    return [dict(帧=[int(kept[x[0]]), int(kept[x[-1]])], 帧数=len(x),
+                 补法="两头插值" if occ[str(x[0])][0] != occ[str(x[0])][1] else "动作定住+跟mask",
+                 最大一翻=round(max(flips.get(b, 0.0) for b in x))) for x in segs]
+
+
+def blend_pose(LA, LB, w):
+    """两帧人体(各自减掉根)按 w 过渡: 先把 B 转回 A 的朝向逐顶点插值, 再整体转过去 w 那么多。
+    ★ 直接逐顶点插值, 转身 90° 时中间帧会被压扁; 分开转和形变就不会。"""
+    from scipy.spatial.transform import Rotation
+    cA, cB = LA.mean(0), LB.mean(0)
+    R = _kabsch(LA - cA, LB)                                        # (LB - cB) ≈ (LA - cA) @ R.T
+    M = (1 - w) * (LA - cA) + w * ((LB - cB) @ R)
+    Rw = Rotation.from_rotvec(Rotation.from_matrix(R).as_rotvec() * w).as_matrix()
+    return M @ Rw.T + (1 - w) * cA + w * cB
+
+
+def fill_occluded(W, rootW, occ):
+    """W, rootW: {bi: 世界系顶点 / 根}; occ: occ_plan 的结果。返回新的 W, 只换不可信帧。"""
+    out = dict(W)
+    for k, (A, B, w, r) in occ.items():
+        b = int(k)
+        if b in W:
+            out[b] = blend_pose(W[A] - rootW[A], W[B] - rootW[B], w) + np.asarray(r)
+    return out
+
+
 def _smooth(P, w_med=5, w_avg=3):
     """逐帧位置 (N,3): 先滑动中位数压掉单帧跳变, 再滑动平均去抖。两端用可用的邻居。"""
     n = len(P)
@@ -202,13 +397,197 @@ def _smooth(P, w_med=5, w_avg=3):
     return np.array([med[max(0, i - w_avg // 2):i + w_avg // 2 + 1].mean(0) for i in range(n)])
 
 
-def _med1(x, w=5):
-    return np.array([np.median(x[max(0, i - w // 2):i + w // 2 + 1]) for i in range(len(x))])
+# ------------------------------------------------------------------ 姿势平滑
+# ★ SAM 3D Body 是单帧模型, 每帧从零估: 四肢和身体朝向一帧一晃。骨盆系里的高频抖动(09-28 实测)
+#   soccer 1.4~2.1 cm/顶点, nfl1 抱摔那堆人 4~6.5 cm, 手脚 11~13 cm。SAM-Body4D 自带的平滑只在 8 帧一批里
+#   往前看, 批和批不连; 这里以前只平滑"人在哪"(位置/远近), 姿势本身对站着走着的人没人管。
+#   做法: 拆成 骨盆中心(不动, 归位置平滑管) + 骨盆朝向(四元数) + 骨盆系里的四肢(逐顶点), 各算两版:
+#   强平滑(σ=POSE_SIGMA) 和 几乎不平滑(σ=POSE_SIGMA_MIN), 按**各自**动得多快混合 —— 慢的用强平滑版,
+#   快的用原样(One Euro Filter 的思路, Casiez CHI 2012)。逐顶点混合: 甩出去的那条腿保持原样, 身体别处照样去抖;
+#   只按整个人的平均速度调, 一条腿甩得再快平均下来也不快, 会被抹软(测试里只留住 66%)。
+POSE_SIGMA = 0.08       # 秒: 慢的部分的平滑强度(24 fps 约 2 帧)
+POSE_SIGMA_MIN = 0.02   # 秒: 快的部分基本不平滑(约半帧)
+POSE_V0 = 1.5           # m/s: 骨盆系里一个顶点动到这么快, 两版各一半
+POSE_W0 = 3.0           # rad/s: 身体朝向转到这么快(约 170°/s), 两版各一半
+
+
+def _gauss_t(Y, t, sig):
+    """Y: (T, ...) 按时间 t(秒)做高斯加权平均, 每帧用自己的 σ(秒)。"""
+    out = np.empty_like(Y)
+    for i in range(len(t)):
+        m = np.abs(t - t[i]) <= 3 * sig[i]
+        w = np.exp(-0.5 * ((t[m] - t[i]) / sig[i]) ** 2)
+        out[i] = np.tensordot(w / w.sum(), Y[m], axes=1)
+    return out
+
+
+def _pose_split(Ws):
+    """(T,NV,3) 世界系 -> 骨盆中心 (T,1,3)、骨盆朝向 (T,3,3)、骨盆系里的四肢 (T,NV,3)。"""
+    X = np.stack(Ws)
+    C = X[:, load_parts()["pelvis"]].mean(1, keepdims=True)
+    R = np.stack(pelvis_rots(list(X)))
+    return C, R, np.einsum("tvi,tij->tvj", X - C, R)
+
+
+def smooth_pose(Ws, t, sigma=POSE_SIGMA, sigma_min=POSE_SIGMA_MIN, v0=POSE_V0, w0=POSE_W0):
+    """Ws: 按时间排的 (NV,3) 世界系顶点; t: 秒。返回同样的列表: 骨盆中心不动, 朝向和四肢按时间平滑,
+    动得快的顶点/转得快的帧少平滑。不到 5 帧的不动。"""
+    from scipy.spatial.transform import Rotation
+    if len(Ws) < 5:
+        return list(Ws)
+    t = np.asarray(t, float); T = len(t)
+    dt = np.maximum(np.diff(t), 1e-6)
+    def near(x):
+        """这一帧的快慢 = 前后 2σ 里最快的那一段: 甩到最远那一刻速度是 0, 只看自己会被当成慢的, 峰被削平。"""
+        x = np.maximum(np.r_[x[:1], x], np.r_[x, x[-1:]])
+        return np.stack([x[np.abs(t - ti) <= 2 * sigma].max(0) for ti in t])
+    C, R, L = _pose_split(Ws)
+    Ls = _gauss_t(L, t, np.full(T, sigma))                         # 速度按强平滑版求, 不然抖动本身就被当成"快"
+    a = v0 / (v0 + near(np.linalg.norm(np.diff(Ls, axis=0), axis=2) / dt[:, None]))[..., None]
+    L = a * Ls + (1 - a) * _gauss_t(L, t, np.full(T, sigma_min))
+    q = Rotation.from_matrix(R).as_quat()
+    for i in range(1, T):                                          # q 和 -q 是同一个朝向, 先接成连续的再平均
+        if q[i] @ q[i - 1] < 0:
+            q[i] = -q[i]
+    qs = _gauss_t(q, t, np.full(T, sigma))
+    qs /= np.linalg.norm(qs, axis=1, keepdims=True)
+    w = near(2 * np.arccos(np.clip(np.abs((qs[1:] * qs[:-1]).sum(1)), 0, 1)) / dt)
+    b = (w0 / (w0 + w))[:, None]
+    q = b * qs + (1 - b) * _gauss_t(q, t, np.full(T, sigma_min))
+    Rs = Rotation.from_quat(q / np.linalg.norm(q, axis=1, keepdims=True)).as_matrix()
+    return list(np.einsum("tvj,tij->tvi", L, Rs) + C)
+
+
+def pose_jitter(Ws, t):
+    """姿势的高频抖动(米/顶点): 去掉骨盆中心后, 和 1.5 帧(24 fps)高斯平滑版的平均差。报告和测试用。"""
+    if len(Ws) < 5:
+        return 0.0
+    t = np.asarray(t, float)
+    X = np.stack(Ws); X = X - X[:, load_parts()["pelvis"]].mean(1, keepdims=True)
+    return float(np.linalg.norm(X - _gauss_t(X, t, np.full(len(t), 1.5 / 24)), axis=2).mean())
+
+
+# ------------------------------------------------------------------ 轨迹整理(位置 + 贴地 + 腾空)
+# ★ 09-28 以前这里是几层各干各的: 翻转补帧 / 腾空 / 位置平滑(只管水平) / 去尖刺 / 兜底 —— 互相不知道对方的
+#   假设, 改一层踩一层: 位置平滑只管水平, 上下交给 5 帧中位贴地, nfl1 人 3 躺着不动却一帧上下跳 22 cm;
+#   腾空不知道哪些帧是补过的, 把补过的帧抬到空中 20 cm; 去尖刺把整个窗口剔光, 人 4 被放到相机上。
+#   现在统一成 tidy_track: 每帧先有一个可信度 conf(1 = 模型这帧可信; CONF_SUB = 翻转补帧换掉的帧, 动作是
+#   定住/插值出来的、位置是插值或跟 mask 的), 然后
+#     1) 骨盆中心**三个方向一起**做局部二次拟合(smooth_track), conf 当权重 —— 补过的帧少算;
+#     2) 脚底离地高度同样平滑后再贴地 —— 贴地量本身是平滑的, 不再把噪声一帧帧带回来;
+#     3) 高出平时脚底的部分当腾空留在空中(airborne), 只有可信的帧能判腾空, 平时脚底也只按可信的帧算。
+#   以前的位置平滑是 _smooth(5 帧中位 + 3 帧平均, 前后约 0.1 秒): 只压单帧尖刺, 来回晃几帧的锯齿原样留着
+#   (soccer r2 骨盆中心偏离平滑路径 2.5~5 cm, 相机本身很稳)。
+#   局部二次拟合: 普通平均会把扑救的起点终点抹圆; 二次拟合对匀速、匀加速是精确的, 只去掉来回晃。
+POS_SIGMA = 0.08   # 秒: 拟合窗口的高斯 σ(取前后 3σ)。测试里的取舍: 0.08 -> 锯齿剩 30%, 0.3 秒横移 1.5 m 的扑救
+                   #   最多偏 4 cm; 0.15 -> 锯齿剩 22%, 扑救偏 16 cm。再宽锯齿只多去几个点, 快动作被抹得多
+POS_MIN_FRAMES = 1.5   # σ 至少是这么多个帧间隔: office 约 6 fps(一帧 0.17 秒), 0.08 秒的窗口里只有 3 帧,
+                       # 凑不够拟合就整段跳过不平滑 —— 09-28 office 走路的人上下一帧跳 49 cm。24 fps 时不起作用
+POS_SPIKE = 0.3    # 米: 第一遍拟合后偏出去超过这么多的帧当尖刺, 第二遍不算它(正常锯齿、扑救都在 10 cm 以内)
+CONF_SUB = 0.2     # 翻转补帧换掉的帧的可信度: 平滑里只算 1/5、窗口 5 倍长(见 tidy_track), 不能判腾空, 不参与"平时脚底"
+
+
+def smooth_track(P, t, sigma=POS_SIGMA, spike=POS_SPIKE, wt=None):
+    """P: (T,D) 逐帧位置; t: 秒; sigma: 秒, 一个数或逐帧给; wt: 每帧可信度(不给 = 全 1)。
+    返回局部二次拟合后的位置。不到 5 帧的不动。
+    ★ 拟合两遍, 第二遍把尖刺的权重压到 0(双平方权重): 二次拟合本身不防尖刺 —— nfl1 人 3 翻转补帧那段跟着 mask 走,
+      人堆里 mask 忽大忽小, 有几帧单独跳出去 1~2 m 又回来, 直接拟合会被拖偏 1 m 多。
+      先过 5 帧中位数也试过: 来回交替的锯齿中位数去不掉, 反而更差。
+    ★ 两个兜底(09-28 nfl1 人 4: 一段连着十几帧跳出去 28 m, 第二遍把整个窗口都剔光了, 拟合退化成 0,
+      人被放到世界原点 = 第一台相机上):
+      - 窗口里还算数的帧不到 4 个, 不重拟, 用第一遍的结果;
+      - 拟合相对本帧的第一遍结果做, 就算退化也只会退回它, 不会被拉向原点。"""
+    P = np.asarray(P, float); t = np.asarray(t, float)
+    if len(t) < 5:
+        return P.copy()
+    sig = np.maximum(np.broadcast_to(np.asarray(sigma, float), t.shape),
+                     POS_MIN_FRAMES * float(np.median(np.diff(t))))
+    wt = np.ones(len(t)) if wt is None else np.asarray(wt, float)
+    out, rw = P.copy(), np.ones(len(t))
+    for it in range(2):
+        ref, out = out, out.copy()
+        for i in range(len(t)):
+            s = sig[i]
+            m = np.abs(t - t[i]) <= 3 * s
+            k = rw[m] * wt[m]
+            if m.sum() < 4 or (k > 0).sum() < 4:
+                continue
+            d = t[m] - t[i]
+            w = np.sqrt(np.exp(-0.5 * (d / s) ** 2) * k)[:, None]
+            # 片头片尾窗口只有一边有数据, 二次曲线在边上会翘(09-28 office 人 2 头两帧脚离地 38 cm): 那里用直线。
+            # 按"短的那一边伸出去几个 σ"渐变: 最边上一帧全用直线, 1σ 以上全用二次。不能在某一帧突然换 ——
+            # 窗口一长两种拟合在弯路上差几厘米, 换的那一帧人跳一下(09-28 nfl1 人 3 片尾前 10 帧跳 4 cm)。
+            # 实测(6 fps / 24 fps 加噪声各跑 100~200 次)片头片尾的偏差和原来的硬切一样, 弯路上的跳 3.6 -> 0.4 cm
+            a = float(np.clip(min(-d.min(), d.max()) / s, 0, 1))
+            A, y = np.stack([d ** p for p in range(3)], 1) * w, (P[m] - ref[i]) * w
+            lin = np.linalg.lstsq(A[:, :2], y, rcond=None)[0][0]
+            quad = np.linalg.lstsq(A, y, rcond=None)[0][0] if a > 0 else lin
+            out[i] = ref[i] + a * quad + (1 - a) * lin
+            # 二次拟合碰到台阶会冲过头(28 m 的跳变冲出去 0.8 m): 夹在窗口里这些位置的范围内
+            out[i] = np.clip(out[i], P[m].min(0), P[m].max(0))
+        rw = np.clip(1 - (np.linalg.norm(P - out, axis=1) / spike) ** 2, 0, None) ** 2
+    return out
+
+
+AIR_WIN = 2.0    # 秒: "平时脚底有多高"看前后各这么久(飞扑一整段约 2 秒, 窗要比它宽才看得到落地的帧)
+AIR_PCT = 20     # 取这个百分位当平时的脚底
+AIR_TOL = 0.15   # 米: 高出平时脚底不到这么多 = 深度噪声, 照旧贴地; 超出的部分当真离地
+AIR_MIN_S = 0.4  # 秒: 离地要连着这么久才算腾空。一两帧的"离地"是噪声(nfl1 人 3 可信帧里零星两帧 15 cm);
+                 # nfl1 人 5 飞扑 1.7 秒, 人跳起来的滞空也有 0.4 秒以上
+AIR_MIN_FRAMES = 5   # 而且至少这么多帧: office 约 6 fps, 刚走进画面的 3 帧身体估歪了(脚离地 37 cm)也有 0.5 秒。
+                     # 帧率低, 3 帧不够当"跳起来"的证据; 24 fps 时 0.4 秒已经是 10 帧, 这条不起作用
+
+
+def airborne(f, t, win=AIR_WIN, pct=AIR_PCT, tol=AIR_TOL, ok=None):
+    """每帧该留在空中多高(米)。f: 逐帧最低点离地(已平滑), t: 秒; ok: 哪些帧可信(不给 = 全可信)。
+    ★ 09-28 以前每帧都把最低点压到地上: nfl1 人 5 飞扑时脚离地 0.4~0.8 m, 被一帧帧按回地面。
+      走路的人高出平时脚底都在噪声以内, 结果和以前一样。
+    ★ 不可信的帧不能判腾空, "平时脚底"也只按可信的帧算: nfl1 人 3 翻转补帧那段(动作定住、位置跟 mask),
+      乱数据显示脚离地 20 cm, 以前就被当成腾空抬了起来。开关按时间软化(σ 0.1 秒), 进出那段时不会一帧掉下来。"""
+    f, t = np.asarray(f, float), np.asarray(t, float)
+    ok = np.ones(len(t), bool) if ok is None else np.asarray(ok, bool)
+    base = []
+    for ti in t:
+        m = np.abs(t - ti) <= win
+        base.append(np.percentile(f[m & ok] if (m & ok).any() else f[m], pct))
+    air = np.maximum(0.0, f - np.array(base) - tol)
+    dt = float(np.median(np.diff(t))) if len(t) > 1 else 0.0
+    i = 0
+    while i < len(air):                                            # 连着离地不够 AIR_MIN_S 的一段 = 噪声
+        j = i
+        while j < len(air) and air[j] > 0:
+            j += 1
+        if j > i and ((j - i) * dt < AIR_MIN_S - 1e-9 or j - i < AIR_MIN_FRAMES):
+            air[i:j] = 0.0
+        i = max(j, i + 1)
+    if not ok.all():
+        air *= _gauss_t(ok.astype(float), t, np.full(len(t), 0.1))
+    return air
+
+
+def tidy_track(W, bis, t, conf, UP, GH):
+    """一个人整段的位置整理(姿势已经整理完)。W: {bi: 世界系顶点}; t: 秒; conf: 每帧可信度(和 bis 同顺序)。
+    返回每帧的整体平移 delta (T,3): 骨盆中心三个方向一起平滑 + 脚底贴地 + 可信的腾空留在空中。见本节开头。"""
+    t, conf = np.asarray(t, float), np.asarray(conf, float)
+    pel = load_parts()["pelvis"]
+    P = np.array([W[b][pel].mean(0) for b in bis])
+    # ★ 不可信的帧参考更长的时间: 可信度 1/5 -> 窗口 5 倍长(σ 0.4 秒, 前后约 1.2 秒)。只降权重不够 ——
+    #   一整段都是补过的帧时大家一样轻, 互相比没差别(09-28 nfl1 人 3 片尾跟着 mask 露出的一小块走,
+    #   ±0.24 秒的窗口里平滑完一帧还前后晃 15~22 cm)。可信的帧窗口不变, 快动作照旧保住。
+    #   只用在骨盆位置上: 贴地量要紧跟(已经平滑过的)脚, 再用长窗口平滑一遍就跟不上, 补过的帧脚离地 11 cm。
+    #   窗口在交界处按时间渐变(可信度先做 0.1 秒高斯): 一帧里从 0.08 秒跳到 0.4 秒, 两边估法对不齐,
+    #   人在交界那帧跳一下(09-28 nfl1 人 3 第 58 帧往下 4.9 cm)
+    sig = POS_SIGMA / np.maximum(_gauss_t(conf, t, np.full(len(t), 0.1)), CONF_SUB)
+    delta = smooth_track(P, t, sigma=sig, wt=conf) - P
+    foot = np.array([float(((W[b] + d) @ UP).min() - GH) for b, d in zip(bis, delta)])
+    fs = smooth_track(foot[:, None], t, wt=conf)[:, 0]
+    air = airborne(fs, t, ok=conf >= 1.0)
+    return delta - (fs - air)[:, None] * UP[None, :]
 
 
 # ------------------------------------------------------------------ 坐着的人
-# ★ 为什么单独摆: 坐着的人腿被桌子挡住, SAM 3D Body 每帧重猜一次腿。下面 solve_people 第 3 步
-#   "逐帧最低点贴地"会把腿的变化放大成整个人上下跳 —— office 1 号: 头顶高度跳了 0.46m,
+# ★ 为什么单独摆: 坐着的人腿被桌子挡住, SAM 3D Body 每帧重猜一次腿。solve_people 里的贴地
+#   (以前是逐帧最低点贴地, 现在见 tidy_track)会把腿的变化放大成整个人上下跳 —— office 1 号: 头顶高度跳了 0.46m,
 #   屁股陷进椅面 15cm; 可她的头顶相对骨盆一直很稳(全程只差 6cm)。所以坐着的人换一种摆法:
 #     下半身(骨盆+腿)整段用同一帧的姿势, 只像转椅子那样绕竖轴转; 屁股放在椅面上(没椅子就脚着地);
 #     上身保留每帧的动作, 跟着骨盆走, 再做一次时间平滑。两半按蒙皮权重在腰部软拼。
@@ -376,8 +755,10 @@ def _seat_report(old, new, UP, GH, fix):
 
 
 def solve_people(people, roots, cams, vid2key, kept, UP, GH, mesh_run, da3, FLIP, chairs,
-                 seats=None, seat_h_default=0.45):
+                 seats=None, seat_h_default=0.45, fps=24.0, focals=None, pose_smooth=False):
     """算每个人的校正, 不动顶点。返回 (校正表, 报告)。校正表可 JSON 化, 合成那步按它重放。
+    focals: 给了就做翻转补帧(见 flip_segments / occ_plan); None = 老行为。
+    pose_smooth: True = 姿势平滑(见 smooth_pose), 在翻转补帧之后、位置平滑和贴地之前。
     chairs: {节点名: (矩形中心 xz, 两个轴, 半长)}, 取自物理之前的 07_scene.glb (glTF 系)。
     seats: chair_seats() 的结果; 给了就对坐着的人做坐姿修正(见 seat_fix), None = 老行为。"""
     R3 = FLIP[:3, :3]
@@ -399,21 +780,47 @@ def solve_people(people, roots, cams, vid2key, kept, UP, GH, mesh_run, da3, FLIP
         frames, rt = people[pid], roots[pid]
         R_own = float(np.median(list(ratios.values()))) if ratios else R_all
         R = R_own if abs(R_own / R_all - 1.0) <= RATIO_TOL else R_all
-        # 1) 远近按场景深度: 沿视线平移 (根平移乘 R), 人体不缩放
+        tt = [kept[b] / fps for b in bis]
+        c2w = {bi: np.linalg.inv(np.array(cams[vid2key[kept[bi]]]["extrinsic_w2c_4x4"], float)) for bi in bis}
+        # 0) 先找翻转段(见 flip_segments): 骨盆朝向一帧翻 30° 以上、稳不住 10 帧的段。只看朝向, 和远近无关。
+        #    这些帧模型在两个人之间来回认: 动作和位置在 1b 换掉, 远近也不能退回它估的距离(见 frame_ratios 的 trust)
+        segs, flips = [], {}
+        if focals is not None:
+            rots = pelvis_rots([frames[bi] @ GL2CV @ c2w[bi][:3, :3].T for bi in bis])
+            flips = {b: (_rot_deg(rots[i - 1], rots[i]) if i else 0.0) for i, b in enumerate(bis)}
+            segs = flip_segments(rots, tt)
+        bad = {bis[i] for i0, i1 in segs for i in range(i0, i1 + 1)}
+        # 1) 远近按**每一帧**的场景深度(见 frame_ratios): 沿视线平移 (根平移乘 r), 人体不缩放。
+        #    整个人离群(R != R_own)说明他自己的深度测量不可信, 那就不用逐帧的(ratios 传空), 整段用全体的 R;
+        #    翻转段照样不用模型的距离
+        rf = frame_ratios(bis, ratios if R == R_own else {}, {b: float(rt[b][2]) for b in bis}, R,
+                          t={b: kept[b] / fps for b in bis}, trust=set(bis) - bad)
         W, root = {}, []
         for bi in bis:
-            c2w = np.linalg.inv(np.array(cams[vid2key[kept[bi]]]["extrinsic_w2c_4x4"], float))
-            Vc = frames[bi] @ GL2CV + (R - 1.0) * rt[bi]
-            W[bi] = Vc @ c2w[:3, :3].T + c2w[:3, 3]
-            root.append(R * rt[bi] @ c2w[:3, :3].T + c2w[:3, 3])
+            Vc = frames[bi] @ GL2CV + (rf[bi] - 1.0) * rt[bi]
+            W[bi] = Vc @ c2w[bi][:3, :3].T + c2w[bi][:3, 3]
+            root.append(rf[bi] * rt[bi] @ c2w[bi][:3, :3].T + c2w[bi][:3, 3])
+        # 1b) 翻转补帧: 翻转段的位置和动作都换掉(见 occ_plan)。后面的平滑/贴地/路线都吃补过的
+        occ = {}
+        if segs:
+            rootW = dict(zip(bis, root))
+            mroot = mask_roots(pid, bis, rt, rf, focals[pid], mesh_run, cams, vid2key, kept)
+            occ = occ_plan(bis, segs, {b: kept[b] / fps for b in bis}, rootW, mroot)
+            W = fill_occluded(W, rootW, occ)
+            root = [np.asarray(occ[str(b)][3]) if str(b) in occ else rootW[b] for b in bis]
+        # 1c) 姿势平滑: 朝向和四肢按时间平滑, 快动作少平滑(见 smooth_pose)
+        ps, jit = None, None
+        if pose_smooth and len(bis) >= 5:
+            ps = dict(fps=fps, sigma=POSE_SIGMA, sigma_min=POSE_SIGMA_MIN, v0=POSE_V0, w0=POSE_W0)
+            j0 = pose_jitter([W[b] for b in bis], tt)
+            W = dict(zip(bis, smooth_pose([W[b] for b in bis], tt)))
+            jit = [round(100 * j0, 1), round(100 * pose_jitter([W[b] for b in bis], tt), 1)]
         root = np.array(root)
-        # 2) 位置轨迹平滑 (整帧平移, 不动姿势)
-        delta = _smooth(root) - root
-        # 3) 逐帧脚着地: 最低点贴地, 贴地量再做一次滑动中位数, 免得一帧一跳
-        foot = np.array([float(((W[bi] + d) @ UP).min() - GH) for bi, d in zip(bis, delta)])
-        lift = _med1(foot)
-        delta = delta - lift[:, None] * UP[None, :]
-        # 4) 坐着的判断 + 坐的是哪把椅子
+        # 2) 轨迹整理(整帧平移, 不动姿势): 骨盆中心三个方向一起平滑 + 贴地 + 腾空, 翻转补帧换掉的帧少算、
+        #    不能判腾空(见 tidy_track)
+        conf = np.array([CONF_SUB if str(b) in occ else 1.0 for b in bis])
+        delta = tidy_track(W, bis, tt, conf, UP, GH)
+        # 3) 坐着的判断 + 坐的是哪把椅子
         ext = np.array([float(np.ptp(W[bi] @ UP)) for bi in bis])
         seated = ext < SEAT_EXTENT
         chair, votes = None, {}
@@ -436,7 +843,7 @@ def solve_people(people, roots, cams, vid2key, kept, UP, GH, mesh_run, da3, FLIP
                 votes[best[1]] = votes.get(best[1], 0) + 1
         if votes and seated.mean() > 0.5:
             chair = max(votes, key=votes.get)
-        # 5) 走过的路线: 站/走着的帧, 离地 FOOT_BAND 以内的点的水平最小外接矩形 (glTF 系)
+        # 4) 走过的路线: 站/走着的帧, 离地 FOOT_BAND 以内的点的水平最小外接矩形 (glTF 系)
         prints = []
         for bi, d, s_ in zip(bis, delta, seated):
             if s_:
@@ -452,7 +859,8 @@ def solve_people(people, roots, cams, vid2key, kept, UP, GH, mesh_run, da3, FLIP
         feet_after = [float(((W[bi] + d) @ UP).min() - GH) for bi, d in zip(bis, delta)]
         step = np.linalg.norm(np.diff(root + delta, axis=0), axis=1) if len(bis) > 1 else np.zeros(1)
         step0 = np.linalg.norm(np.diff(root, axis=0), axis=1) if len(bis) > 1 else np.zeros(1)
-        corr[pid] = dict(ratio=R, frames=[int(b) for b in bis],
+        corr[pid] = dict(ratio=R, ratio_frame={str(int(b)): round(rf[b], 5) for b in bis}, occ=occ, pose_smooth=ps,
+                         frames=[int(b) for b in bis],
                          delta={str(int(b)): np.round(d, 4).tolist() for b, d in zip(bis, delta)},
                          seated=bool(chair is not None or seated.mean() > 0.5), chair=chair,
                          footprints=prints)
@@ -465,9 +873,19 @@ def solve_people(people, roots, cams, vid2key, kept, UP, GH, mesh_run, da3, FLIP
                         校正后脚离地中位=round(float(np.median(feet_after)), 3),
                         校正后脚离地范围=[round(min(feet_after), 3), round(max(feet_after), 3)],
                         帧间位移最大_前=round(float(step0.max()), 3), 帧间位移最大_后=round(float(step.max()), 3),
-                        坐着的帧=int(seated.sum()), 椅子=chair, 路线脚印=len(prints))
-        # 6) 坐着的人换一种摆法。delta / footprints / 椅子 都不动 —— 物理的输入逐位不变
-        if seats is not None and corr[pid]["seated"]:
+                        坐着的帧=int(seated.sum()), 椅子=chair, 路线脚印=len(prints),
+                        翻转补帧=_fix_report(occ, flips, kept), 姿势抖动_cm=jit,
+                        可信帧比例=round(float((conf >= 1.0).mean()), 2))
+        # 可疑的人: 数据从头到尾就不对, 整理只能遮丑(nfl1 人 4: 画面里 54 px, 深度离群, 位置跳 28 m) —— 报告里点名,
+        # 建议在挑人那一步去掉。不自动删: 删不删人是闸口上人拍板的事
+        why = ([f"自己量的深度离群(比例 {R_own:.2f}, 全体 {R_all:.2f})"] if R != R_own else []) \
+            + ([f"只有 {rep[pid]['可信帧比例']:.0%} 的帧模型可信"] if rep[pid]["可信帧比例"] < 0.5 else []) \
+            + ([f"模型原始位置一帧跳 {step0.max():.1f} m"] if step0.max() > 2.0 else [])
+        rep[pid]["可疑"] = why
+        # 5) 坐着的人换一种摆法。delta / footprints / 椅子 都不动 —— 物理的输入逐位不变
+        # ★ 场景里一把椅子都没有就不做(09-28 nfl1): 飞扑/被撞倒的人竖直跨度也小于 SEAT_EXTENT, 会被当成坐着,
+        #   腿换成整段里站着跑的那一帧、骨盆掰直 —— 横着飞的人被折成反着的蹲姿。office 有椅子, 照旧(人 3 没对上椅子也照旧)
+        if seats and corr[pid]["seated"]:
             X = np.stack([W[b] for b in bis])
             st = seats.get(chair) if chair else None
             fix, diag = seat_fix(X, bis, UP, GH, FLIP, (chair, st[0], st[1]) if st else None, seat_h_default)
@@ -482,11 +900,23 @@ def apply_corr(people, corr, cams, vid2key, kept, roots):
     world = {}
     for pid, c in corr.items():
         R, fr, raw = c["ratio"], {}, []
+        rf = c.get("ratio_frame") or {}          # 老的 10_people.json 没有逐帧比例, 整段用 ratio
+        rootW = {}
         for bi in c["frames"]:
             c2w = np.linalg.inv(np.array(cams[vid2key[kept[bi]]]["extrinsic_w2c_4x4"], float))
-            Vc = people[pid][bi] @ GL2CV + (R - 1.0) * roots[pid][bi]
+            r = rf.get(str(bi), R)
+            Vc = people[pid][bi] @ GL2CV + (r - 1.0) * roots[pid][bi]
             raw.append(Vc @ c2w[:3, :3].T + c2w[:3, 3])
-            fr[kept[bi]] = raw[-1] + np.asarray(c["delta"][str(bi)])
+            rootW[bi] = r * roots[pid][bi] @ c2w[:3, :3].T + c2w[:3, 3]
+        if c.get("occ"):                             # 翻转补帧(见 flip_segments / occ_plan), 老文件没有这项
+            Wd = fill_occluded(dict(zip(c["frames"], raw)), rootW, c["occ"])
+            raw = [Wd[bi] for bi in c["frames"]]
+        ps = c.get("pose_smooth")                    # 姿势平滑(见 smooth_pose), 老文件没有这项
+        if ps:
+            raw = smooth_pose(raw, [kept[bi] / ps["fps"] for bi in c["frames"]],
+                              ps["sigma"], ps["sigma_min"], ps["v0"], ps["w0"])
+        for bi, V in zip(c["frames"], raw):
+            fr[kept[bi]] = V + np.asarray(c["delta"][str(bi)])
         if c.get("seat_fix"):                        # 坐着的人: delta 不用, 按坐姿修正重算
             Y = apply_seat_fix(np.stack(raw), c["frames"], c["seat_fix"])
             fr = {kept[bi]: Y[t] for t, bi in enumerate(c["frames"])}
@@ -711,6 +1141,11 @@ def main():
     ap.add_argument("--fr", default=None, help="原始帧目录, --render 时要")
     ap.add_argument("--seat-fix", choices=["on", "off"], default="on",
                     help="place 用: 坐着的人按椅面定高度、腿取整段稳定姿势、上身整段平滑; off = 老行为(逐帧脚着地)")
+    ap.add_argument("--pose-smooth", choices=["on", "off"], default="on",
+                    help="place 用: 朝向和四肢按时间平滑、快动作少平滑(SAM 3D Body 逐帧估, 一帧一晃), 见 smooth_pose; off = 老行为")
+    ap.add_argument("--flip-fix", choices=["on", "off"], default="on",
+                    help="place 用: 身体朝向一帧翻 30° 以上、稳不住 10 帧的段(被挡时模型在两个人之间来回认)"
+                         "换掉位置和动作, 见 flip_segments; off = 老行为")
     a = ap.parse_args()
 
     print("== 读 ==")
@@ -734,7 +1169,9 @@ def main():
         # 没坐在椅子正上方的人按"脚着地", 选腿时的目标落差用场景里椅面高度的中位数
         seat_h0 = float(np.median([s[0] for s in seats.values()])) if seats else 0.45
         corr, rep = solve_people(people, roots, cams, vid2key, kept, UP, GH, mesh_run, da3, FLIP, chairs,
-                                 seats=seats, seat_h_default=seat_h0)
+                                 seats=seats, seat_h_default=seat_h0, fps=fps,
+                                 focals=load_focals(mesh_run) if a.flip_fix == "on" else None,
+                                 pose_smooth=a.pose_smooth == "on")
         if not corr:
             raise SystemExit("[失败] 人体的帧和场景的相机一帧都对不上 —— 检查是不是同一段素材")
         for pid, r in rep.items():
@@ -745,6 +1182,12 @@ def main():
                   f"最大一步 {r['帧间位移最大_前']:.2f} -> {r['帧间位移最大_后']:.2f}m  "
                   + (f"坐在 {r['椅子']} ({r['坐着的帧']} 帧)" if r["椅子"] else
                      (f"坐着 {r['坐着的帧']} 帧但没找到椅子" if r["坐着的帧"] > r["帧数"] / 2 else f"路线 {r['路线脚印']} 个脚印")))
+            if r.get("姿势抖动_cm"):
+                print(f"         姿势平滑: 抖动 {r['姿势抖动_cm'][0]} -> {r['姿势抖动_cm'][1]} cm/顶点")
+            if r.get("可疑"):
+                print(f"         ★可疑: {'; '.join(r['可疑'])} —— 建议在挑人那一步去掉")
+            for g in r.get("翻转补帧") or []:
+                print(f"         翻转补帧: 第 {g['帧'][0]}~{g['帧'][1]} 帧({g['帧数']} 帧, 段里最大一翻 {g['最大一翻']}°) {g['补法']}")
             q = r.get("坐姿修正")
             if q:
                 print(f"         坐姿修正: 高度按 {q['高度来源']}" + ("" if q["离椅面中心"] is None else f"(骨盆离椅面中心 {q['离椅面中心']}m)")

@@ -84,6 +84,9 @@ fps = json.load(open(f"{a.body}/00_frames/frames.json"))["src_fps"] * len(cams) 
 import imageio_ffmpeg
 ff = imageio_ffmpeg.get_ffmpeg_exe()
 out = f"{a.r1}/{a.out}"
+# ★ 上一版不覆盖: 挪成 <名字>_prev.mp4(只留一份), 网页上和新的并排看改了什么
+if os.path.exists(out):
+    os.replace(out, out[:-4] + "_prev.mp4")
 # ★ H.264 + yuv420p + 宽高偶数, 浏览器才认 (cv2 的 mp4v 不报错但放不了)
 subprocess.run([ff, "-y", "-loglevel", "error", "-framerate", f"{fps:.3f}", "-i", f"{tmp}/%05d.jpg",
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", out], check=True)

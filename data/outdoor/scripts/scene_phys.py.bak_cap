@@ -1,0 +1,372 @@
+#!/usr/bin/env python
+"""物理修正: 落地 + 推开穿模。读 07_scene.glb, 出 07_scene_phy.glb。
+
+落地: 每个物体的最低点吸到地面上。本来就该悬空的(雨篷/红绿灯/树冠)按"离地超过阈值就不管"放过。
+穿模: 用世界系 AABB 找重叠, 沿最小平移方向水平推开; 体积大的当静止, 小的让路; 迭代几轮。
+不用物理引擎, 纯几何 —— 室外地面是一个平面, 比室内简单。
+
+节点分三类, 靠名字认 (assemble_scene 建的时候就是这么命名的):
+  ground / floor   地面, 只当高度参照, 不参与推开
+  wall_*           ★ 静态碰撞体: 不落地、不被推、原样带到输出, 只把物体往屋里推
+  其余             可动物体
+墙为什么不能走 AABB —— 斜墙的 AABB 是覆盖整条对角线的大方块, 会把几米外的物体乱推;
+轴对齐的零厚度墙 AABB 在法向上 extent 恰好为 0, `if (ov<=0).any(): continue` 永远成立,
+一次都推不动。所以墙走 2D 线段-有向距离, 判据和 layout_clash_fix_5090.py 一致: 物体中心投到墙的 u/n
+局部系, t 落在 (0,L) 内且 |有向距离| 小于 半宽+半墙厚 才算碰, 沿 n 推出去。
+线段是从 wall_* 节点的几何直接反推的 (水平投影做 SVD 取主方向), 不再读 json ——
+省掉复算 zup->DA3->FLIP 那条变换链, 少一处能对不上的地方。
+推的方向取"物体现在在墙的哪一侧就往哪一侧推", 即隔断墙的双向推开。房间壳是点云足迹
+围出来的, 物体本来就都在里面, 所以这等价于"推回屋内"; 真有物体在屋外, 这条会把它推得
+更远 —— 那种情况是盒子量错了, 该在量盒子那步修, 不该靠物理硬拽。
+场景里没有 wall_* 节点就整段跳过 (室外没有墙, 行为逐位不变)。
+"""
+import os, sys, re, json, numpy as np, trimesh
+R1   = os.environ.get("R1","/home/jincheng/sam3d/data/outdoor/result/timesquare/r1")
+SNAP = float(os.environ.get("SNAP","0.8"))    # 底面离支撑面在这个范围内才吸附
+# 支撑面: 东西可以落在这些类的顶面上, 不是只能落地 (桌上的杯子不该被传送到地板)
+SUPP = {x.strip() for x in os.environ.get("SUPPORT_LABELS","").split(",") if x.strip()}
+# 挂墙/吊顶物: 本来就不落地
+HUNG = {x.strip() for x in os.environ.get("HUNG_LABELS","").split(",") if x.strip()}
+OVERLAP = float(os.environ.get("SUPPORT_OVERLAP","0.35"))   # 水平重叠占自身多少才算被托住
+# ★ 给了 HUNG_LABELS 就关掉"离得远=本来悬空"这条兜底: 那条规则分不开"量歪了"和"真的挂着",
+#   实测 37 个物体里 32 个被它当成吊灯放过, 全悬在半空(最高 98cm)。既然已经能按词点名
+#   哪些是挂的, 就不该再让距离替它猜。没给 HUNG_LABELS 的(室外)保持原行为, 逐位不变。
+FREE_FALL = bool(HUNG)
+ITERS= int(os.environ.get("ITERS","12"))
+MARGIN=float(os.environ.get("MARGIN","0.02")) # 推开后留的缝
+
+SRC=os.environ.get("SCENE_IN","07_scene.glb")
+sc=trimesh.load(f"{R1}/{SRC}")
+# 收集每个节点的世界系网格 (07_scene.glb 已按 glTF 约定 y 朝上)
+items=[]; ground=None; walls=[]
+for node in sc.graph.nodes_geometry:
+    T,gname=sc.graph[node]
+    g=sc.geometry[gname].copy(); g.apply_transform(T)
+    # ★ 必须整名匹配, 不能用 startswith —— "floor_lamp_10012".startswith("floor") 是真,
+    #   落地灯会被当成地面吞掉 (实测: 组装 37 个物体, 物理之后只剩 36, 少的就是它)。
+    #   节点名的规矩见 assemble_scene: 物体是 "<词>_<实例号>", 房间壳是 "floor"/"wall_<N>"。
+    base=re.sub(r"_\d+$", "", node.split("/")[-1])
+    if base in ("ground", "floor"): ground=g if ground is None else ground
+    elif base == "wall": walls.append([node, g])
+    else: items.append([node, g])
+assert ground is not None, "场景里没有 ground / floor 节点"
+gy=float(np.median(ground.vertices[:,1]))     # 地面高度 (平面近似水平)
+print(f"[地面] y = {gy:.2f} m,  {len(items)} 个物体, {len(walls)} 面墙(静态)")
+
+# ---- 墙线: 2D 线段 + 半厚, 在 xz 平面上 (glTF y 朝上) ----
+# 墙线 json 存的是 z 朝上系的 (x,y); 导出到 glTF 之后水平面变成 (x,z)。
+# 所以这里不直接吃 json 的坐标, 改从 wall_* 节点的实际几何反推 —— 那是场景里真正的位置,
+# 不用再复算一遍 zup->DA3->FLIP 的变换链, 少一处能对不上的地方。
+segs=[]
+for name,g in walls:
+    P=g.vertices[:,[0,2]]                      # 水平投影
+    c=P.mean(0); Q=P-c
+    d=np.linalg.svd(Q, full_matrices=False)[2][0]; d=d/np.linalg.norm(d)  # 主方向=墙的走向
+    t=Q@d; half_w=float(np.abs(Q@np.array([-d[1],d[0]])).max())   # 垂直方向的最大偏移=半厚
+    segs.append(dict(a=c+t.min()*d, b=c+t.max()*d, d=d, L=float(t.max()-t.min()),
+                     n=np.array([-d[1],d[0]]), hw=half_w, name=name))
+if segs:
+    print(f"[墙] 从几何反推出 {len(segs)} 条墙线, 长 "
+          f"{min(s_['L'] for s_ in segs):.2f}~{max(s_['L'] for s_ in segs):.2f}m, "
+          f"半厚 {np.median([s_['hw'] for s_ in segs]):.3f}m")
+
+def push_out_of_walls(g):
+    """物体和墙相交就沿墙法向推到屋内一侧。返回是否推过。"""
+    b=g.bounds; ctr=np.array([(b[0][0]+b[1][0])/2, (b[0][2]+b[1][2])/2])
+    rad=float(max(b[1][0]-b[0][0], b[1][2]-b[0][2]))/2
+    mv=np.zeros(2)
+    for s_ in segs:
+        q=ctr-s_["a"]; t=float(q@s_["d"])
+        if t<-rad or t>s_["L"]+rad: continue    # 投影落在墙段外, 不算碰
+        sd=float(q@s_["n"])                     # 有向距离
+        need=rad+s_["hw"]+MARGIN-abs(sd)
+        if need<=0: continue
+        mv += s_["n"]*np.sign(sd if abs(sd)>1e-6 else 1.0)*need
+    if np.linalg.norm(mv)<1e-6: return False
+    g.apply_translation([mv[0],0,mv[1]]); return True
+
+# ---- 落地: 从低到高, 先找支撑台面, 找不到才落地面 ----
+# 顺序必须从低到高 —— 桌子先落到地上, 桌上的东西才能落到它已经摆正的桌面上。
+cls_of=lambda n: re.sub(r"_\d+$","",n.split("/")[-1])
+def land():
+    """落一遍。室内推开之后还要再落一遍, 所以做成函数。返回 (吸附数, 落台面数, 没落的, 真挪了高度的)。"""
+    snapped=onsupp=0; skipped=[]; moved=[]
+    for name,g in sorted(items, key=lambda d: float(d[1].vertices[:,1].min())):
+        if cls_of(name) in HUNG: skipped.append((cls_of(name),"挂的")); continue
+        V=g.vertices; low=float(V[:,1].min())
+        lo,hi=V[:,[0,2]].min(0), V[:,[0,2]].max(0)
+        target=gy; tname="地面"
+        # ★ 台面自己不落在别的台面上 —— 否则桌子会摞到桌子上 (实测 table_10 落到了
+        #   dining_table_5 的桌面上, 悬空 48cm)。只有"被摆在台面上的小东西"才找台面。
+        for on,og in ([] if cls_of(name) in SUPP else items):
+            if og is g or cls_of(on) not in SUPP: continue
+            Vo=og.vertices; lo2,hi2=Vo[:,[0,2]].min(0), Vo[:,[0,2]].max(0)
+            ov=np.minimum(hi,hi2)-np.maximum(lo,lo2)
+            if (ov<=0).any(): continue
+            if (ov[0]*ov[1])/max((hi[0]-lo[0])*(hi[1]-lo[1]),1e-9) < OVERLAP: continue
+            z_top=float(Vo[:,1].max())
+            if z_top <= low+0.02 and z_top > target: target,tname=z_top,cls_of(on)
+        d=low-target
+        if not FREE_FALL and abs(d)>SNAP:
+            skipped.append((cls_of(name), round(d,2))); continue
+        g.apply_translation([0,-d,0]); snapped+=1; onsupp += tname!="地面"
+        if abs(d)>0.01: moved.append((name,tname,round(d,2)))
+    return snapped,onsupp,skipped,moved
+# ======== 室内: 支撑按真实表面找, 推开用跟着物体转的盒子 ========
+# 室外(没给 HUNG_LABELS)一行都不走这里, 逐位不变。
+# 为什么不用包围盒 (实测 office r1): 斜放桌子的包围盒比桌子大一大圈, table_10 的包围盒体积是
+#   网格的 38 倍。落地拿它判"脚下有没有桌子": 桌子本体早不在显示器脚下了, 包围盒还罩着,
+#   5 个东西停在桌面高度悬空。推开拿它判相交: 两张桌子只陷了几厘米, 被横推一两米, 桌上的东西
+#   全甩下去。
+# 做法移植自 sam-3d-objects/scene_phys.py (单图那条线的 find_support 和规则三):
+#   落地  底座(最低 20% 高度的点)投到水平面, 看多大比例压在支撑物"朝上的真实表面"上;
+#         不够就朝台面挪, 最多 SUPPORT_SHIFT —— 生成的桌子常比真桌子小一圈, 杯子在桌沿会判空。
+#   推开  水平投影的最小外接矩形(跟着物体转) x 竖直区间。托着/被托着的不推; 竖直陷得比水平浅的
+#         也不推(那是落地的事, 横着推要推一米); 桌子被推时, 桌上的东西跟着走。
+#   推完  再落一遍, 被挤下桌沿的重新找台面, 找不到才落地板。
+INDOOR   = FREE_FALL                                         # 室内流水线才给 HUNG_LABELS
+CELL     = 0.02                                              # 覆盖率按 2cm 格子算
+SHIFT    = float(os.environ.get("SUPPORT_SHIFT","0.15"))     # 找台面时底座最多水平挪多少(=对生成错位的容忍度)
+SETTLE   = 0.75                                              # 挪到这个覆盖率就停
+MIN_TOP  = 0.08                                              # 台面至少离地这么高(桌脚、底框的朝上面不算)
+ELEVATED = 0.05                                              # 底部离地超过这个才允许挪去找台面
+
+def up_points(g):
+    """g 朝上的表面(法向离竖直 45° 以内)按面积撒点, 约 1cm² 一个。种子固定, 每次撒得一样。"""
+    m=g.face_normals[:,1]>0.7
+    if not m.any(): return np.zeros((0,3))
+    tri=g.triangles[m]; ar=g.area_faces[m]
+    n=int(np.clip(ar.sum()/1e-4, 200, 300000))
+    rng=np.random.default_rng(0); f=rng.choice(len(tri), n, p=ar/ar.sum())
+    r1,r2=rng.random(n),rng.random(n); s=np.sqrt(r1)
+    return tri[f,0]*(1-s)[:,None]+tri[f,1]*(s*(1-r2))[:,None]+tri[f,2]*(s*r2)[:,None]
+
+def find_support(g, low, sup):
+    """在 sup={名字: 朝上表面点} 里找托住 g 的台面。返回 (台面高, 水平挪动 dxz, 支撑名) 或 None。
+    台面高 = 底座正下方最高的真实表面(95 分位, 抗毛刺); 覆盖率 = 底座格子里贴着这个高度(3cm 内)的比例。
+    多个支撑都行时取台面最高的 —— 自由落体先碰到的那个。"""
+    V=g.vertices; top=float(V[:,1].max())
+    base=V[V[:,1]<=low+0.2*(top-low)][:,[0,2]]
+    c0=base.mean(0); span=float((base.max(0)-base.min(0)).max())
+    sink=min(max(0.05, 0.25*(top-low)), 0.10)                # 量得陷进台面多深还认 (实测陷 1~5cm)
+    def at(hm, off):
+        bk=np.unique(np.floor((base+off)/CELL).astype(np.int64), axis=0)
+        hs=np.array([hm.get((i,j), -np.inf) for i,j in bk]); ok=np.isfinite(hs)
+        if ok.sum()<3: return None, 0.0
+        s_h=float(np.percentile(hs[ok],95)); return s_h, float((hs[ok]>=s_h-0.03).sum()/len(bk))
+    best=None
+    for on,U in sup.items():
+        U=U[(U[:,1]<=low+sink)&(U[:,1]>=gy+MIN_TOP)]
+        U=U[np.linalg.norm(U[:,[0,2]]-c0,axis=1)<=span/2+SHIFT+CELL]
+        if len(U)<20: continue                                   # 附近没有高度合适的朝上面
+        k=np.floor(U[:,[0,2]]/CELL).astype(np.int64); o=np.argsort(U[:,1])
+        hm=dict(zip(map(tuple,k[o].tolist()), U[o,1]))           # 每格最高的表面(按高度升序写, 高的覆盖低的)
+        shift=np.zeros(2); s_h,f=at(hm,shift)
+        if f<OVERLAP:                                            # 第二关: 朝台面挪, 1cm 一步
+            if low-gy<=ELEVATED: continue                        # 已经在地上的不往台面上拽
+            dv=U[:,[0,2]].mean(0)-c0; dv/=max(np.linalg.norm(dv),1e-9)
+            bf,bst=f,0
+            for st in range(1,int(round(SHIFT/0.01))+1):
+                _,f2=at(hm,dv*st*0.01)
+                if f2>bf+1e-9: bf,bst=f2,st
+                if f2>=SETTLE: break
+            if bf<OVERLAP: continue
+            shift=dv*bst*0.01; s_h,f=at(hm,shift)
+        if s_h is not None and (best is None or s_h>best[0]): best=(s_h,shift,on)
+    return best
+
+def land_surf():
+    """室内落地。台面类先全落到地板(台面不摞台面, 见 land() 的注释), 再把其余的按底从低到高落到
+    正下方最高的真实台面上, 没有才落地板。台面先落完, 找台面时就不怕顺序。
+    返回 (托着关系 {物体: 支撑名 或 None}, 真挪了的 [(名字, 落到哪, 往下 m, 水平 m)], 挂着的)。"""
+    parent={}; moved=[]; hung=[]
+    sups=[(n,g) for n,g in items if cls_of(n) in SUPP]
+    for name,g in sups:
+        if cls_of(name) in HUNG: hung.append(name); continue
+        d=float(g.vertices[:,1].min())-gy; g.apply_translation([0,-d,0]); parent[name]=None
+        if abs(d)>0.01: moved.append((name,"地面",round(d,2),0.0))
+    sup={n:up_points(g) for n,g in sups if n not in hung}
+    for name,g in sorted([(n,g) for n,g in items if cls_of(n) not in SUPP],
+                         key=lambda d: float(d[1].vertices[:,1].min())):
+        if cls_of(name) in HUNG: hung.append(name); continue
+        low=float(g.vertices[:,1].min()); r=find_support(g, low, sup)
+        if r is None: t=np.array([0.0,gy-low,0.0]); parent[name]=None; tn="地面"
+        else: t=np.array([r[1][0],r[0]-low,r[1][1]]); parent[name]=r[2]; tn=cls_of(r[2])
+        g.apply_translation(t)
+        if abs(t[1])>0.01 or np.hypot(t[0],t[2])>0.005:
+            moved.append((name,tn,round(-float(t[1]),2),round(float(np.hypot(t[0],t[2])),2)))
+    return parent, moved, hung
+
+if INDOOR:
+    parent,mv1,hung=land_surf()
+    on_=sum(1 for n,p in parent.items() if p); nud=sum(1 for m in mv1 if m[3]>0.005)
+    print(f"[落地] {len(parent)} 个吸附 (其中 {on_} 个落在别的物体台面上, {nud} 个在台面边上"
+          f"挪了 ≤{SHIFT*100:.0f}cm 才站稳), {len(hung)} 个没落 (挂的: {sorted({cls_of(h) for h in hung})})")
+else:
+    snapped,onsupp,skipped,_=land()
+    print(f"[落地] {snapped} 个吸附 (其中 {onsupp} 个落在别的物体台面上), "
+          f"{len(skipped)} 个没落" + (f" (挂的: {sorted({x[0] for x in skipped})})" if FREE_FALL else
+                                      f" (离支撑面超过 {SNAP}m)"))
+
+# ---- 推开穿模 ----
+# ---- 人 (body_into_scene.py --mode place 写的 10_people.json) ----
+# 人走过的地方一定是空地, 人坐的椅子不能被推走。所以:
+#   路线脚印 = 静态路障: 只把家具推出去, 脚印本身不动 (和墙一样)
+#   坐着的人那把椅子 = 钉住: 不被推, 碰到别人时别人让它
+# 脚印只管贴地那一层 (离地 0.6m 内, 和 body_into_scene 的 FOOT_BAND 一致): 桌上的显示器不算挡路。
+# 没给 PEOPLE 时这一段整个不生效, 行为逐位不变。
+PEOPLE=os.environ.get("PEOPLE","")
+PINNED=set(); PRINTS=[]
+if INDOOR and PEOPLE and os.path.exists(PEOPLE):
+    _pj=json.load(open(PEOPLE)); _fy=float(_pj.get("floor_y", gy))
+    PINNED=set(_pj.get("pinned_chairs", []))
+    for _p in _pj["people"].values():
+        for fp in _p["footprints"]:
+            PRINTS.append(dict(c=np.asarray(fp["c"],float), ax=np.asarray(fp["ax"],float),
+                               h=np.asarray(fp["h"],float), y0=_fy, y1=_fy+0.6))
+    print(f"[人] {os.path.basename(PEOPLE)}: 路线脚印 {len(PRINTS)} 个当路障, 钉住椅子 {sorted(PINNED)}")
+_pin=lambda n: n.split("/")[-1] in PINNED
+
+if INDOOR:
+    kids={}
+    for c_,p_ in parent.items():
+        if p_: kids.setdefault(p_,[]).append(c_)
+    def _anc(n):
+        out=set()
+        while parent.get(n): n=parent[n]; out.add(n)
+        return out
+    anc={n:_anc(n) for n,_ in items}
+    G=dict(items); RC={}
+    for n,g in items:                                        # 水平投影的最小外接矩形 + 竖直区间
+        T2,ext=trimesh.bounds.oriented_bounds_2D(g.vertices[:,[0,2]]); R2=T2[:2,:2]
+        RC[n]=dict(c=-R2.T@T2[:2,2], ax=R2.copy(), h=np.asarray(ext,float)/2,
+                   y0=float(g.vertices[:,1].min()), y1=float(g.vertices[:,1].max()))
+    c_start={n:RC[n]["c"].copy() for n in RC}
+    def move(n,t):
+        """平移 n, 连带它托着的东西(递归) —— 桌子被推走, 桌上的东西跟着走。"""
+        G[n].apply_translation(t); r=RC[n]; r["c"]=r["c"]+t[[0,2]]; r["y0"]+=t[1]; r["y1"]+=t[1]
+        for k_ in kids.get(n,[]): move(k_,t)
+    def sat(A,B):
+        """两个矩形的最小穿透深度, 和把 A 推离 B 的单位方向。不相交返回 None。"""
+        d=A["c"]-B["c"]; best=None
+        for u in (A["ax"][0],A["ax"][1],B["ax"][0],B["ax"][1]):
+            ov=(A["h"][0]*abs(A["ax"][0]@u)+A["h"][1]*abs(A["ax"][1]@u)
+                +B["h"][0]*abs(B["ax"][0]@u)+B["h"][1]*abs(B["ax"][1]@u)-abs(d@u))
+            if ov<=0: return None
+            if best is None or ov<best[0]: best=(ov, u*(1.0 if d@u>=0 else -1.0))
+        return best
+    names=[n for n,_ in items]
+    vol={n:4*RC[n]["h"][0]*RC[n]["h"][1]*(RC[n]["y1"]-RC[n]["y0"]) for n in names}
+    ppl=0
+    for it_ in range(ITERS):
+        worst=0.0; hit=0; stacked=0
+        for i in range(len(names)):
+            for j in range(i+1,len(names)):
+                a_,b_=names[i],names[j]
+                if a_ in anc[b_] or b_ in anc[a_]: continue          # 托着/被托着
+                A,B=RC[a_],RC[b_]
+                dy=min(A["y1"],B["y1"])-max(A["y0"],B["y0"])
+                if dy<=0: continue
+                s_=sat(A,B)
+                if s_ is None: continue
+                pen,u=s_
+                # 叠放 = 一个的底在另一个的半腰以上(搁在它上面), 且竖着陷得比横着浅 -> 归落地管, 不横推。
+                # ★ 只看"竖着比横着浅"不够: 两张桌子并排挤着、横着叠一米多时, 竖向重叠就是桌高,
+                #   更浅, 会被误当成叠放一个都不推 (实测 office: 5 对桌子互相插着没动)。
+                if dy<pen and (A["y0"]>=B["y0"]+0.5*(B["y1"]-B["y0"]) or B["y0"]>=A["y0"]+0.5*(A["y1"]-A["y0"])):
+                    stacked+=1; continue
+                pa,pb=_pin(a_),_pin(b_)
+                if pa and pb: continue                                 # 两把都有人坐, 谁也不动
+                hit+=1; worst=max(worst,pen); push=pen+MARGIN
+                wa=vol[b_]/(vol[a_]+vol[b_]); wb=1.0-wa             # 小的多让
+                if pa: wa,wb=0.0,1.0                                   # 有人坐的椅子不让
+                if pb: wa,wb=1.0,0.0
+                move(a_, np.array([u[0],0.0,u[1]])*push*wa)
+                move(b_,-np.array([u[0],0.0,u[1]])*push*wb)
+        for n_ in (names if PRINTS else []):                          # 推离人走过的路
+            A=RC[n_]
+            if _pin(n_) or A["y0"]>=PRINTS[0]["y1"] or A["y1"]<=PRINTS[0]["y0"]: continue
+            for P in PRINTS:
+                if np.linalg.norm(A["c"]-P["c"]) > np.linalg.norm(A["h"])+np.linalg.norm(P["h"]): continue
+                s_=sat(A,P)
+                if s_ is None: continue
+                pen,u=s_; hit+=1; worst=max(worst,pen); ppl+=1
+                move(n_, np.array([u[0],0.0,u[1]])*(pen+MARGIN))
+        if worst<0.01: break
+    print(f"[推开] {it_+1} 轮, 最后一轮最深穿模 {worst:.3f} m, 共 {hit} 对仍相交"
+          f" (另有 {stacked} 对是叠放, 不横推)")
+    if PRINTS or PINNED:
+        print(f"[人] 家具被推离人走过的路 {ppl} 次; 钉住的椅子没动: "
+              f"{[n_ for n_ in names if _pin(n_) and np.linalg.norm(RC[n_]['c']-c_start[n_])<1e-6]}")
+else:
+    def aabb(g): b=g.bounds; return b[0],b[1]
+    vol=[np.prod(g.extents) for _,g in items]
+    order=np.argsort(vol)[::-1]                   # 体积大的先固定
+    moved=0
+    for it_ in range(ITERS):
+        worst=0.0; hit=0
+        for a in range(len(items)):
+            for b in range(a+1,len(items)):
+                lo1,hi1=aabb(items[a][1]); lo2,hi2=aabb(items[b][1])
+                ov=np.minimum(hi1,hi2)-np.maximum(lo1,lo2)
+                if (ov<=0).any(): continue
+                hit+=1
+                # 只水平推: 在 x / z 里挑代价最小的方向
+                ax=0 if ov[0]<ov[2] else 2
+                push=ov[ax]+MARGIN; worst=max(worst,ov[ax])
+                sign=1.0 if (items[a][1].centroid[ax] > items[b][1].centroid[ax]) else -1.0
+                va,vb=np.prod(items[a][1].extents), np.prod(items[b][1].extents)
+                wa=vb/(va+vb); wb=va/(va+vb)      # 小的多让
+                t=np.zeros(3); t[ax]=push*sign*wa; items[a][1].apply_translation(t); 
+                t=np.zeros(3); t[ax]=-push*sign*wb; items[b][1].apply_translation(t)
+                moved+=1
+        if worst<0.01: break
+    print(f"[推开] {it_+1} 轮, 最后一轮最深穿模 {worst:.3f} m, 共 {hit} 对仍相交")
+
+# ---- 推回屋内 ----
+# 放在物体之间推开之后: 先让物体互相让开, 再统一把越界的推回来。反过来做的话,
+# 推回屋内的位移会被下一轮物体互推再顶出去。
+def push_out_of_walls_rect(n):
+    """室内版: 物体用跟着它转的矩形, 沿墙方向/法向的半长按矩形投影算, 不再拿包围盒的大边当半径。"""
+    r=RC[n]; mv=np.zeros(2)
+    if _pin(n): return False                    # 有人坐着的椅子不挪, 人是量出来的
+    for s_ in segs:
+        rd=r["h"][0]*abs(r["ax"][0]@s_["d"])+r["h"][1]*abs(r["ax"][1]@s_["d"])
+        rn=r["h"][0]*abs(r["ax"][0]@s_["n"])+r["h"][1]*abs(r["ax"][1]@s_["n"])
+        q=r["c"]-s_["a"]; t=float(q@s_["d"])
+        if t<-rd or t>s_["L"]+rd: continue
+        sd=float(q@s_["n"]); need=rn+s_["hw"]+MARGIN-abs(sd)
+        if need<=0: continue
+        mv+=s_["n"]*np.sign(sd if abs(sd)>1e-6 else 1.0)*need
+    if np.linalg.norm(mv)<1e-6: return False
+    move(n, np.array([mv[0],0.0,mv[1]])); return True
+if segs:
+    nw=sum(push_out_of_walls_rect(n) for n,_ in items) if INDOOR else sum(push_out_of_walls(g) for _,g in items)
+    print(f"[墙] {nw}/{len(items)} 个物体穿墙, 已推回屋内")
+if INDOOR:
+    dd=sorted(((float(np.linalg.norm(RC[n]["c"]-c_start[n])),n) for n in RC), reverse=True)
+    print(f"[挪动] 推开+推墙后水平挪动: 中位 {np.median([x for x,_ in dd]):.2f} m, "
+          f">0.3m 的 {sum(x>0.3 for x,_ in dd)} 个, 最多 {dd[0][0]:.2f} m ({dd[0][1].split('/')[-1]})")
+
+# 推开之后再落一次。
+# ★ 室内要把完整的落地重跑一遍, 不能只吸回地面: 推开只管水平, 被挤下桌沿的东西会停在原桌面
+#   高度悬空。老兜底只吸地面、只管离地 SNAP 以内的, 够不着桌面高度, 全放过了。
+#   也不能改成"先推后落": 组装后杯子是陷在桌面里的, 先推会被当成撞车横推下桌。
+# ★ 室外(FREE_FALL 关)这里必须和老代码逐字一致: abs(d)<=SNAP 就吸, 埋地的(d<0)也要抬回来。
+if INDOOR:
+    _,mv2,_=land_surf()
+    print(f"[再落地] 推开后重落一遍: {len(mv2)} 个挪了 "
+          f"(落台面 {sum(m[1]!='地面' for m in mv2)}, 落地面 {sum(m[1]=='地面' for m in mv2)})"
+          + (f": {[(m[0].split('/')[-1],)+m[1:] for m in mv2]}" if mv2 else ""))
+else:
+    for name,g in items:
+        if cls_of(name) in HUNG: continue
+        d=float(g.vertices[:,1].min())-gy
+        if abs(d)<=SNAP: g.apply_translation([0,-d,0])
+
+out=trimesh.Scene()
+for name,g in items: out.add_geometry(g,node_name=name)
+out.add_geometry(ground,node_name="ground" if not walls else "floor")
+for name,g in walls: out.add_geometry(g,node_name=name)   # ★ 原样带过去, 一个顶点都没动
+dst=f"{R1}/"+os.environ.get("PHY_OUT", SRC.replace(".glb","_phy.glb")); out.export(dst)
+print(f"[done] -> {dst}")

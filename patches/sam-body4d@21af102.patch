@@ -1,0 +1,84 @@
+diff --git a/configs/body4d.yaml b/configs/body4d.yaml
+index 43079e4..179383c 100644
+--- a/configs/body4d.yaml
++++ b/configs/body4d.yaml
+@@ -8,7 +8,7 @@
+ 
+ paths:
+   # Set your global checkpoint root directory here
+-  ckpt_root: "path to global checkpoint root"
++  ckpt_root: "/home/jincheng/sam3d/sam-body4d/checkpoints"
+ 
+ sam3:
+   # download: https://huggingface.co/facebook/sam3
+@@ -25,7 +25,7 @@ sam_3d_body:
+   segmentor_path: ""
+ 
+ runtime:
+-  output_dir: ./outputs
++  output_dir: /home/jincheng/sam3d/sam-body4d/outputs
+ 
+ completion:
+   enable: true
+diff --git a/models/sam3/sam3/model/sam3_video_base.py b/models/sam3/sam3/model/sam3_video_base.py
+index e61969f..908bde6 100644
+--- a/models/sam3/sam3/model/sam3_video_base.py
++++ b/models/sam3/sam3/model/sam3_video_base.py
+@@ -1124,7 +1124,12 @@ class Sam3VideoBase(nn.Module):
+                 tqdm_disable=True,
+                 run_mem_encoder=run_mem_encoder,
+             ):
+-                out_frame_idx, out_obj_ids, out_low_res_masks, _, out_obj_scores = out
++                # ★ 5090 patch: 上游 bug。sam3_tracking_predictor.propagate_in_video
++                #   yield 的是 6 个值 (末位新增 iou_scores, 见该文件 877 行),
++                #   offline_app.py 也是按 6 个解包的; 只有这条"文字提示"路径
++                #   忘了跟着改, 还按 5 个解, 一走文字 prompt 就 ValueError。
++                #   他们自己只用框提示所以从没踩到。
++                out_frame_idx, out_obj_ids, out_low_res_masks, _, out_obj_scores, *_iou = out
+                 num_frames_propagated += 1
+ 
+             # only 1 frames should be propagated
+diff --git a/models/sam_3d_body/notebook/utils.py b/models/sam_3d_body/notebook/utils.py
+index a552bea..0d8a3a4 100644
+--- a/models/sam_3d_body/notebook/utils.py
++++ b/models/sam_3d_body/notebook/utils.py
+@@ -233,11 +233,19 @@ def save_mesh_results(
+         tmesh = renderer.vertices_to_trimesh(
+             person_output["pred_vertices"], person_output["pred_cam_t"], color
+         )
+-        mesh_path = f"{save_dir}/{pid+1}/{os.path.basename(image_path)[:-4]}.ply"
++        # ★ 5090 patch: 上游 bug —— 原来写的是 f"{save_dir}/{pid+1}/"。
++        #   pid 是 enumerate(outputs) 的序号, 而 outputs 只含**这一帧存在的人**。
++        #   有人中途消失, 后面所有人的目录号就往前挪一位, 于是同一个目录里
++        #   前半段是甲后半段是乙 —— 身份被写串了, 而且一声不吭。
++        #   实测: 挑 1/2/4 三个人, 原id2 在第 66 帧走出画面, 之后目录 2 装的是原id4。
++        #   id_current[pid] 才是真实 id (他们自己选颜色时就是这么用的, 见上面几行),
++        #   只是写路径时忘了用。
++        _pid = id_current[pid]
++        mesh_path = f"{save_dir}/{_pid}/{os.path.basename(image_path)[:-4]}.ply"
+         tmesh.export(mesh_path)
+ 
+         focal_length = {'focal_length': person_output["focal_length"].item(), 'camera': [float(x) for x in person_output['pred_cam_t']]}
+-        with open(f"{focal_dir}/{pid+1}/{os.path.basename(image_path)[:-4]}.json", "w") as f:
++        with open(f"{focal_dir}/{_pid}/{os.path.basename(image_path)[:-4]}.json", "w") as f:
+             json.dump(focal_length, f, indent=4)
+ 
+ 
+diff --git a/scripts/offline_app.py b/scripts/offline_app.py
+index 45be5a3..a2f30e4 100644
+--- a/scripts/offline_app.py
++++ b/scripts/offline_app.py
+@@ -461,9 +461,12 @@ class OfflineApp:
+ 
+                 # save rendered frames for individual person
+                 rend_img_list = visualize_sample(img, mask_output, self.sam3_3d_body_model.faces, id_current)
++                # ★ 5090 patch: 同 save_mesh_results 那个 bug, ri+1 是位置序号不是 id。
++                #   人中途消失会把后面的人写进别人的目录。id_current 才是真实 id。
+                 for ri, rend_img in enumerate(rend_img_list):
++                    _rid = id_current[ri] if id_current is not None else ri + 1
+                     cv2.imwrite(
+-                        f"{self.OUTPUT_DIR}/rendered_frames_individual/{ri+1}/{os.path.basename(image_path)[:-4]}_{ri+1}.jpg",
++                        f"{self.OUTPUT_DIR}/rendered_frames_individual/{_rid}/{os.path.basename(image_path)[:-4]}_{_rid}.jpg",
+                         rend_img.astype(np.uint8),
+                     )
+                 # save mesh for individual person

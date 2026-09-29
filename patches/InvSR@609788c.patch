@@ -1,0 +1,410 @@
+diff --git a/src/diffusers.egg-info/PKG-INFO b/src/diffusers.egg-info/PKG-INFO
+index b5e51f3..b669c72 100644
+--- a/src/diffusers.egg-info/PKG-INFO
++++ b/src/diffusers.egg-info/PKG-INFO
+@@ -1,4 +1,4 @@
+-Metadata-Version: 2.1
++Metadata-Version: 2.4
+ Name: diffusers
+ Version: 0.30.0.dev0
+ Summary: State-of-the-art diffusion in PyTorch and JAX.
+@@ -102,242 +102,126 @@ Requires-Dist: accelerate>=0.31.0; extra == "dev"
+ Requires-Dist: jax>=0.4.1; extra == "dev"
+ Requires-Dist: jaxlib>=0.4.1; extra == "dev"
+ Requires-Dist: flax>=0.4.1; extra == "dev"
++Dynamic: author
++Dynamic: author-email
++Dynamic: classifier
++Dynamic: description
++Dynamic: description-content-type
++Dynamic: home-page
++Dynamic: keywords
++Dynamic: license
++Dynamic: license-file
++Dynamic: provides-extra
++Dynamic: requires-dist
++Dynamic: requires-python
++Dynamic: summary
++
++# Arbitrary-steps Image Super-resolution via Diffusion Inversion (CVPR 2025)
++
++[Zongsheng Yue](https://zsyoaoa.github.io/), [Kang Liao](https://kangliao929.github.io/), [Chen Change Loy](https://www.mmlab-ntu.com/person/ccloy/) 
++
++[![arXiv](https://img.shields.io/badge/arXiv%20paper-2412.09013-b31b1b.svg)](https://arxiv.org/abs/2412.09013) [![Replicate](https://img.shields.io/badge/Demo-%F0%9F%9A%80%20Replicate-blue)](https://replicate.com/zsyoaoa/invsr) <a href="https://colab.research.google.com/drive/1hjgCFnAU4oUUhh9VRfTwsFN1AiIjdcSR?usp=sharing"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="google colab logo"></a> ![visitors](https://visitor-badge.laobi.icu/badge?page_id=zsyOAOA/InvSR)
++
++<!--[![Replicate](https://img.shields.io/badge/Demo-%F0%9F%9A%80%20Replicate-blue)](https://replicate.com/cjwbw/resshift)-->
++
++
++:star: If you've found InvSR useful for your research or projects, please show your support by starring this repo. Thanks! :hugs: 
++
++---
++>This study presents a new image super-resolution (SR) technique based on diffusion inversion, aiming at harnessing the rich image priors encapsulated in large pre-trained diffusion models to improve SR performance. We design a \textit{Partial noise Prediction} strategy to construct an intermediate state of the diffusion model, which serves as the starting sampling point. Central to our approach is a deep noise predictor to estimate the optimal noise maps for the forward diffusion process. Once trained, this noise predictor can be used to initialize the sampling process partially along the diffusion trajectory, generating the desirable high-resolution result. Compared to existing approaches, our method offers a flexible and efficient sampling mechanism that supports an arbitrary number of sampling steps, ranging from one to five. Even with a single sampling step, our method demonstrates superior or comparable performance to recent state-of-the-art approaches.
++><img src="./assets/framework.png" align="middle" width="800">
++---
++## Update
++- **2025.03.01**: InvSR has been accepted by CVPR 2025.
++- **2025.01.08**: Update gradio demo for batch processing.
++- **2024.12.14**: Add [![Replicate](https://img.shields.io/badge/Demo-%F0%9F%9A%80%20Replicate-blue)](https://replicate.com/zsyoaoa/invsr).
++- **2024.12.13**: Add [![Hugging Face](https://img.shields.io/badge/Demo-%F0%9F%A4%97%20Hugging%20Face-blue)](https://huggingface.co/spaces/OAOA/InvSR) and <a href="https://colab.research.google.com/drive/1hjgCFnAU4oUUhh9VRfTwsFN1AiIjdcSR?usp=sharing"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="google colab logo"></a>.
++- **2024.12.11**: Create this repo.
++
++## Requirements
++* Python 3.10, Pytorch 2.4.0, [xformers](https://github.com/facebookresearch/xformers) 0.0.27.post2
++* More detail (See [environment.yaml](environment.yaml))
++* A suitable [conda](https://conda.io/) environment named `invsr` can be created and activated with:
+ 
+-<!---
+-Copyright 2022 - The HuggingFace Team. All rights reserved.
+-
+-Licensed under the Apache License, Version 2.0 (the "License");
+-you may not use this file except in compliance with the License.
+-You may obtain a copy of the License at
+-
+-    http://www.apache.org/licenses/LICENSE-2.0
+-
+-Unless required by applicable law or agreed to in writing, software
+-distributed under the License is distributed on an "AS IS" BASIS,
+-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-See the License for the specific language governing permissions and
+-limitations under the License.
+--->
+-
+-<p align="center">
+-    <br>
+-    <img src="https://raw.githubusercontent.com/huggingface/diffusers/main/docs/source/en/imgs/diffusers_library.jpg" width="400"/>
+-    <br>
+-<p>
+-<p align="center">
+-    <a href="https://github.com/huggingface/diffusers/blob/main/LICENSE"><img alt="GitHub" src="https://img.shields.io/github/license/huggingface/datasets.svg?color=blue"></a>
+-    <a href="https://github.com/huggingface/diffusers/releases"><img alt="GitHub release" src="https://img.shields.io/github/release/huggingface/diffusers.svg"></a>
+-    <a href="https://pepy.tech/project/diffusers"><img alt="GitHub release" src="https://static.pepy.tech/badge/diffusers/month"></a>
+-    <a href="CODE_OF_CONDUCT.md"><img alt="Contributor Covenant" src="https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg"></a>
+-    <a href="https://twitter.com/diffuserslib"><img alt="X account" src="https://img.shields.io/twitter/url/https/twitter.com/diffuserslib.svg?style=social&label=Follow%20%40diffuserslib"></a>
+-</p>
+-
+-🤗 Diffusers is the go-to library for state-of-the-art pretrained diffusion models for generating images, audio, and even 3D structures of molecules. Whether you're looking for a simple inference solution or training your own diffusion models, 🤗 Diffusers is a modular toolbox that supports both. Our library is designed with a focus on [usability over performance](https://huggingface.co/docs/diffusers/conceptual/philosophy#usability-over-performance), [simple over easy](https://huggingface.co/docs/diffusers/conceptual/philosophy#simple-over-easy), and [customizability over abstractions](https://huggingface.co/docs/diffusers/conceptual/philosophy#tweakable-contributorfriendly-over-abstraction).
+-
+-🤗 Diffusers offers three core components:
+-
+-- State-of-the-art [diffusion pipelines](https://huggingface.co/docs/diffusers/api/pipelines/overview) that can be run in inference with just a few lines of code.
+-- Interchangeable noise [schedulers](https://huggingface.co/docs/diffusers/api/schedulers/overview) for different diffusion speeds and output quality.
+-- Pretrained [models](https://huggingface.co/docs/diffusers/api/models/overview) that can be used as building blocks, and combined with schedulers, for creating your own end-to-end diffusion systems.
++```
++conda create -n invsr python=3.10
++conda activate invsr
++pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu121
++pip install -U xformers==0.0.27.post2 --index-url https://download.pytorch.org/whl/cu121
++pip install -e ".[torch]"
++pip install -r requirements.txt
++```
+ 
+-## Installation
++## Applications
++### :point_right: Real-world Image Super-resolution
++[<img src="assets/real-7.png" height="235"/>](https://imgsli.com/MzI2MTU5) [<img src="assets/real-1.png" height="235"/>](https://imgsli.com/MzI2MTUx) [<img src="assets/real-2.png" height="235"/>](https://imgsli.com/MzI2MTUy)
++[<img src="assets/real-4.png" height="361"/>](https://imgsli.com/MzI2MTU0) [<img src="assets/real-6.png" height="361"/>](https://imgsli.com/MzI2MTU3) [<img src="assets/real-5.png" height="361"/>](https://imgsli.com/MzI2MTU1)
+ 
+-We recommend installing 🤗 Diffusers in a virtual environment from PyPI or Conda. For more details about installing [PyTorch](https://pytorch.org/get-started/locally/) and [Flax](https://flax.readthedocs.io/en/latest/#installation), please refer to their official documentation.
++<!-- ### :point_right: General Image Enhancement
++[<img src="assets/enhance-1.png" height="246.5"/>](https://imgsli.com/MzI2MTYw) [<img src="assets/enhance-2.png" height="246.5"/>](https://imgsli.com/MzI2MTYy)
++[<img src="assets/enhance-3.png" height="207"/>](https://imgsli.com/MzI2MjAx) [<img src="assets/enhance-4.png" height="207"/>](https://imgsli.com/MzI2NTk1) [<img src="assets/enhance-5.png" height="207"/>](https://imgsli.com/MzI2MjA0) -->
+ 
+-### PyTorch
++### :point_right: AIGC Image Enhancement
++[<img src="assets/sdxl-1.png" height="272"/>](https://imgsli.com/MzI2MjQy) [<img src="assets/sdxl-2.png" height="272"/>](https://imgsli.com/MzI2MjQ1) [<img src="assets/sdxl-3.png" height="272"/>](https://imgsli.com/MzI2MjQ3)
++[<img src="assets/flux-1.png" height="272"/>](https://imgsli.com/MzI2MjQ5) [<img src="assets/flux-2.png" height="272"/>](https://imgsli.com/MzI2MjUw) [<img src="assets/flux-3.png" height="272"/>](https://imgsli.com/MzI2MjUx)
+ 
+-With `pip` (official package):
+ 
+-```bash
+-pip install --upgrade diffusers[torch]
++## Inference
++### :rocket: Fast testing 
+ ```
+-
+-With `conda` (maintained by the community):
+-
+-```sh
+-conda install -c conda-forge diffusers
++python inference_invsr.py -i [image folder/image path] -o [result folder] --num_steps 1
++```
++1. **To deal with large images, e.g., 1k---->4k, we recommend adding the option** ``--chopping_size 256``.
++2. Other options:
++    + Specify the pre-downloaded [SD Turbo](https://huggingface.co/stabilityai/sd-turbo) Model: ``--sd_path``.
++    + Specify the pre-downloaded noise predictor: ``--started_ckpt_path``.
++    + The number of sampling steps: ``--num_steps``.
++    + If your GPU memory is limited, please add the option ``--chopping_bs 1``.
++
++### :railway_car: Online Demo
++You can try our method through an online demo:
++```
++python app.py
+ ```
+ 
+-### Flax
+-
+-With `pip` (official package):
+-
++### :whale: Now also available in Docker
+ ```bash
+-pip install --upgrade diffusers[flax]
++docker compose up -d # Go to http://127.0.0.1:7860/
+ ```
+ 
+-### Apple Silicon (M1/M2) support
+-
+-Please refer to the [How to use Stable Diffusion in Apple Silicon](https://huggingface.co/docs/diffusers/optimization/mps) guide.
++### :airplane: Reproducing our paper results
+++ Synthetic dataset of ImageNet-Test: [Google Drive](https://drive.google.com/file/d/1PRGrujx3OFilgJ7I6nW7ETIR00wlAl2m/view?usp=sharing).
+ 
+-## Quickstart
+++ Real data for image super-resolution: [RealSRV3](https://github.com/csjcai/RealSR) | [RealSet80](testdata/RealSet80)
+ 
+-Generating outputs is super easy with 🤗 Diffusers. To generate an image from text, use the `from_pretrained` method to load any pretrained diffusion model (browse the [Hub](https://huggingface.co/models?library=diffusers&sort=downloads) for 30,000+ checkpoints):
+++ To reproduce the quantitative results on Imagenet-Test and RealSRV3, please add the color fixing options by ``--color_fix wavelet``.
+ 
+-```python
+-from diffusers import DiffusionPipeline
+-import torch
++## Training
++### :turtle: Preparing stage
++1. Download the finetuned LPIPS model from this [link](https://huggingface.co/OAOA/InvSR/resolve/main/vgg16_sdturbo_lpips.pth?download=true) and put it in the folder of "weights".
++2. Prepare the [config](configs/sd-turbo-sr-ldis.yaml) file:
++    + SD-Turbo path: configs.sd_pipe.params.cache_dir.
++    + Training data path: data.train.params.data_source.
++    + Validation data path: data.val.params.dir_path (low-quality image) and data.val.params.extra_dir_path (high-quality image).
++    + Batchsize: configs.train.batch and configs.train.microbatch (total batchsize = microbatch * #GPUS * num_grad_accumulation)
+ 
+-pipeline = DiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16)
+-pipeline.to("cuda")
+-pipeline("An image of a squirrel in Picasso style").images[0]
++### :dolphin: Begin training
+ ```
+-
+-You can also dig into the models and schedulers toolbox to build your own diffusion system:
+-
+-```python
+-from diffusers import DDPMScheduler, UNet2DModel
+-from PIL import Image
+-import torch
+-
+-scheduler = DDPMScheduler.from_pretrained("google/ddpm-cat-256")
+-model = UNet2DModel.from_pretrained("google/ddpm-cat-256").to("cuda")
+-scheduler.set_timesteps(50)
+-
+-sample_size = model.config.sample_size
+-noise = torch.randn((1, 3, sample_size, sample_size), device="cuda")
+-input = noise
+-
+-for t in scheduler.timesteps:
+-    with torch.no_grad():
+-        noisy_residual = model(input, t).sample
+-        prev_noisy_sample = scheduler.step(noisy_residual, t, input).prev_sample
+-        input = prev_noisy_sample
+-
+-image = (input / 2 + 0.5).clamp(0, 1)
+-image = image.cpu().permute(0, 2, 3, 1).numpy()[0]
+-image = Image.fromarray((image * 255).round().astype("uint8"))
+-image
++CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 --nnodes=1 main.py --save_dir [Logging Folder] 
+ ```
+ 
+-Check out the [Quickstart](https://huggingface.co/docs/diffusers/quicktour) to launch your diffusion journey today!
+-
+-## How to navigate the documentation
+-
+-| **Documentation**                                                   | **What can I learn?**                                                                                                                                                                           |
+-|---------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+-| [Tutorial](https://huggingface.co/docs/diffusers/tutorials/tutorial_overview)                                                            | A basic crash course for learning how to use the library's most important features like using models and schedulers to build your own diffusion system, and training your own diffusion model.  |
+-| [Loading](https://huggingface.co/docs/diffusers/using-diffusers/loading_overview)                                                             | Guides for how to load and configure all the components (pipelines, models, and schedulers) of the library, as well as how to use different schedulers.                                         |
+-| [Pipelines for inference](https://huggingface.co/docs/diffusers/using-diffusers/pipeline_overview)                                             | Guides for how to use pipelines for different inference tasks, batched generation, controlling generated outputs and randomness, and how to contribute a pipeline to the library.               |
+-| [Optimization](https://huggingface.co/docs/diffusers/optimization/opt_overview)                                                        | Guides for how to optimize your diffusion model to run faster and consume less memory.                                                                                                          |
+-| [Training](https://huggingface.co/docs/diffusers/training/overview) | Guides for how to train a diffusion model for different tasks with different training techniques.                                                                                               |
+-## Contribution
+-
+-We ❤️  contributions from the open-source community!
+-If you want to contribute to this library, please check out our [Contribution guide](https://github.com/huggingface/diffusers/blob/main/CONTRIBUTING.md).
+-You can look out for [issues](https://github.com/huggingface/diffusers/issues) you'd like to tackle to contribute to the library.
+-- See [Good first issues](https://github.com/huggingface/diffusers/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22) for general opportunities to contribute
+-- See [New model/pipeline](https://github.com/huggingface/diffusers/issues?q=is%3Aopen+is%3Aissue+label%3A%22New+pipeline%2Fmodel%22) to contribute exciting new diffusion models / diffusion pipelines
+-- See [New scheduler](https://github.com/huggingface/diffusers/issues?q=is%3Aopen+is%3Aissue+label%3A%22New+scheduler%22)
+-
+-Also, say 👋 in our public Discord channel <a href="https://discord.gg/G7tWnz98XR"><img alt="Join us on Discord" src="https://img.shields.io/discord/823813159592001537?color=5865F2&logo=discord&logoColor=white"></a>. We discuss the hottest trends about diffusion models, help each other with contributions, personal projects or just hang out ☕.
+-
+-
+-## Popular Tasks & Pipelines
+-
+-<table>
+-  <tr>
+-    <th>Task</th>
+-    <th>Pipeline</th>
+-    <th>🤗 Hub</th>
+-  </tr>
+-  <tr style="border-top: 2px solid black">
+-    <td>Unconditional Image Generation</td>
+-    <td><a href="https://huggingface.co/docs/diffusers/api/pipelines/ddpm"> DDPM </a></td>
+-    <td><a href="https://huggingface.co/google/ddpm-ema-church-256"> google/ddpm-ema-church-256 </a></td>
+-  </tr>
+-  <tr style="border-top: 2px solid black">
+-    <td>Text-to-Image</td>
+-    <td><a href="https://huggingface.co/docs/diffusers/api/pipelines/stable_diffusion/text2img">Stable Diffusion Text-to-Image</a></td>
+-      <td><a href="https://huggingface.co/runwayml/stable-diffusion-v1-5"> runwayml/stable-diffusion-v1-5 </a></td>
+-  </tr>
+-  <tr>
+-    <td>Text-to-Image</td>
+-    <td><a href="https://huggingface.co/docs/diffusers/api/pipelines/unclip">unCLIP</a></td>
+-      <td><a href="https://huggingface.co/kakaobrain/karlo-v1-alpha"> kakaobrain/karlo-v1-alpha </a></td>
+-  </tr>
+-  <tr>
+-    <td>Text-to-Image</td>
+-    <td><a href="https://huggingface.co/docs/diffusers/api/pipelines/deepfloyd_if">DeepFloyd IF</a></td>
+-      <td><a href="https://huggingface.co/DeepFloyd/IF-I-XL-v1.0"> DeepFloyd/IF-I-XL-v1.0 </a></td>
+-  </tr>
+-  <tr>
+-    <td>Text-to-Image</td>
+-    <td><a href="https://huggingface.co/docs/diffusers/api/pipelines/kandinsky">Kandinsky</a></td>
+-      <td><a href="https://huggingface.co/kandinsky-community/kandinsky-2-2-decoder"> kandinsky-community/kandinsky-2-2-decoder </a></td>
+-  </tr>
+-  <tr style="border-top: 2px solid black">
+-    <td>Text-guided Image-to-Image</td>
+-    <td><a href="https://huggingface.co/docs/diffusers/api/pipelines/controlnet">ControlNet</a></td>
+-      <td><a href="https://huggingface.co/lllyasviel/sd-controlnet-canny"> lllyasviel/sd-controlnet-canny </a></td>
+-  </tr>
+-  <tr>
+-    <td>Text-guided Image-to-Image</td>
+-    <td><a href="https://huggingface.co/docs/diffusers/api/pipelines/pix2pix">InstructPix2Pix</a></td>
+-      <td><a href="https://huggingface.co/timbrooks/instruct-pix2pix"> timbrooks/instruct-pix2pix </a></td>
+-  </tr>
+-  <tr>
+-    <td>Text-guided Image-to-Image</td>
+-    <td><a href="https://huggingface.co/docs/diffusers/api/pipelines/stable_diffusion/img2img">Stable Diffusion Image-to-Image</a></td>
+-      <td><a href="https://huggingface.co/runwayml/stable-diffusion-v1-5"> runwayml/stable-diffusion-v1-5 </a></td>
+-  </tr>
+-  <tr style="border-top: 2px solid black">
+-    <td>Text-guided Image Inpainting</td>
+-    <td><a href="https://huggingface.co/docs/diffusers/api/pipelines/stable_diffusion/inpaint">Stable Diffusion Inpainting</a></td>
+-      <td><a href="https://huggingface.co/runwayml/stable-diffusion-inpainting"> runwayml/stable-diffusion-inpainting </a></td>
+-  </tr>
+-  <tr style="border-top: 2px solid black">
+-    <td>Image Variation</td>
+-    <td><a href="https://huggingface.co/docs/diffusers/api/pipelines/stable_diffusion/image_variation">Stable Diffusion Image Variation</a></td>
+-      <td><a href="https://huggingface.co/lambdalabs/sd-image-variations-diffusers"> lambdalabs/sd-image-variations-diffusers </a></td>
+-  </tr>
+-  <tr style="border-top: 2px solid black">
+-    <td>Super Resolution</td>
+-    <td><a href="https://huggingface.co/docs/diffusers/api/pipelines/stable_diffusion/upscale">Stable Diffusion Upscale</a></td>
+-      <td><a href="https://huggingface.co/stabilityai/stable-diffusion-x4-upscaler"> stabilityai/stable-diffusion-x4-upscaler </a></td>
+-  </tr>
+-  <tr>
+-    <td>Super Resolution</td>
+-    <td><a href="https://huggingface.co/docs/diffusers/api/pipelines/stable_diffusion/latent_upscale">Stable Diffusion Latent Upscale</a></td>
+-      <td><a href="https://huggingface.co/stabilityai/sd-x2-latent-upscaler"> stabilityai/sd-x2-latent-upscaler </a></td>
+-  </tr>
+-</table>
+-
+-## Popular libraries using 🧨 Diffusers
+-
+-- https://github.com/microsoft/TaskMatrix
+-- https://github.com/invoke-ai/InvokeAI
+-- https://github.com/apple/ml-stable-diffusion
+-- https://github.com/Sanster/lama-cleaner
+-- https://github.com/IDEA-Research/Grounded-Segment-Anything
+-- https://github.com/ashawkey/stable-dreamfusion
+-- https://github.com/deep-floyd/IF
+-- https://github.com/bentoml/BentoML
+-- https://github.com/bmaltais/kohya_ss
+-- +14,000 other amazing GitHub repositories 💪
+-
+-Thank you for using us ❤️.
+-
+-## Credits
++### :whale: Resume from interruption
++```
++CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 --nnodes=1 main.py --save_dir [Logging Folder] --resume save_dir/ckpts/model_xx.pth
++```
+ 
+-This library concretizes previous work by many different authors and would not have been possible without their great research and implementations. We'd like to thank, in particular, the following implementations which have helped us in our development and without which the API could not have been as polished today:
++## License
+ 
+-- @CompVis' latent diffusion models library, available [here](https://github.com/CompVis/latent-diffusion)
+-- @hojonathanho original DDPM implementation, available [here](https://github.com/hojonathanho/diffusion) as well as the extremely useful translation into PyTorch by @pesser, available [here](https://github.com/pesser/pytorch_diffusion)
+-- @ermongroup's DDIM implementation, available [here](https://github.com/ermongroup/ddim)
+-- @yang-song's Score-VE and Score-VP implementations, available [here](https://github.com/yang-song/score_sde_pytorch)
++This project is licensed under [NTU S-Lab License 1.0](LICENSE). Redistribution and use should follow this license.
+ 
+-We also want to thank @heejkoo for the very helpful overview of papers, code and resources on diffusion models, available [here](https://github.com/heejkoo/Awesome-Diffusion-Models) as well as @crowsonkb and @rromb for useful discussions and insights.
++## Acknowledgement
+ 
+-## Citation
++This project is based on [BasicSR](https://github.com/XPixelGroup/BasicSR) and [diffusers](https://github.com/huggingface/diffusers). Thanks for their awesome works.
+ 
+-```bibtex
+-@misc{von-platen-etal-2022-diffusers,
+-  author = {Patrick von Platen and Suraj Patil and Anton Lozhkov and Pedro Cuenca and Nathan Lambert and Kashif Rasul and Mishig Davaadorj and Dhruv Nair and Sayak Paul and William Berman and Yiyi Xu and Steven Liu and Thomas Wolf},
+-  title = {Diffusers: State-of-the-art diffusion models},
+-  year = {2022},
+-  publisher = {GitHub},
+-  journal = {GitHub repository},
+-  howpublished = {\url{https://github.com/huggingface/diffusers}}
+-}
+-```
++### Contact
++If you have any questions, please feel free to contact me via `zsyzam@gmail.com`.
+diff --git a/src/diffusers.egg-info/SOURCES.txt b/src/diffusers.egg-info/SOURCES.txt
+index d4d83cb..eeae8d4 100644
+--- a/src/diffusers.egg-info/SOURCES.txt
++++ b/src/diffusers.egg-info/SOURCES.txt
+@@ -1,7 +1,5 @@
+ LICENSE
+-MANIFEST.in
+ README.md
+-pyproject.toml
+ setup.py
+ src/diffusers/__init__.py
+ src/diffusers/callbacks.py
+@@ -100,6 +98,7 @@ src/diffusers/models/unets/unet_2d.py
+ src/diffusers/models/unets/unet_2d_blocks.py
+ src/diffusers/models/unets/unet_2d_blocks_flax.py
+ src/diffusers/models/unets/unet_2d_condition.py
++src/diffusers/models/unets/unet_2d_condition_discriminator.py
+ src/diffusers/models/unets/unet_2d_condition_flax.py
+ src/diffusers/models/unets/unet_3d_blocks.py
+ src/diffusers/models/unets/unet_3d_condition.py
+@@ -325,6 +324,7 @@ src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_image_variati
+ src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_img2img.py
+ src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_inpaint.py
+ src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_instruct_pix2pix.py
++src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_inversion_sr.py
+ src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_latent_upscale.py
+ src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_upscale.py
+ src/diffusers/pipelines/stable_diffusion/pipeline_stable_unclip.py
+@@ -337,6 +337,7 @@ src/diffusers/pipelines/stable_diffusion_3/pipeline_output.py
+ src/diffusers/pipelines/stable_diffusion_3/pipeline_stable_diffusion_3.py
+ src/diffusers/pipelines/stable_diffusion_3/pipeline_stable_diffusion_3_img2img.py
+ src/diffusers/pipelines/stable_diffusion_3/pipeline_stable_diffusion_3_inpaint.py
++src/diffusers/pipelines/stable_diffusion_3/pipeline_stable_diffusion_3_inversion_sr.py
+ src/diffusers/pipelines/stable_diffusion_attend_and_excite/__init__.py
+ src/diffusers/pipelines/stable_diffusion_attend_and_excite/pipeline_stable_diffusion_attend_and_excite.py
+ src/diffusers/pipelines/stable_diffusion_diffedit/__init__.py
+@@ -364,6 +365,7 @@ src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl.py
+ src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl_img2img.py
+ src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl_inpaint.py
+ src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl_instruct_pix2pix.py
++src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl_inversion_sr.py
+ src/diffusers/pipelines/stable_diffusion_xl/watermark.py
+ src/diffusers/pipelines/stable_video_diffusion/__init__.py
+ src/diffusers/pipelines/stable_video_diffusion/pipeline_stable_video_diffusion.py
+@@ -392,6 +394,13 @@ src/diffusers/pipelines/wuerstchen/modeling_wuerstchen_prior.py
+ src/diffusers/pipelines/wuerstchen/pipeline_wuerstchen.py
+ src/diffusers/pipelines/wuerstchen/pipeline_wuerstchen_combined.py
+ src/diffusers/pipelines/wuerstchen/pipeline_wuerstchen_prior.py
++src/diffusers/quantizers/__init__.py
++src/diffusers/quantizers/auto.py
++src/diffusers/quantizers/base.py
++src/diffusers/quantizers/quantization_config.py
++src/diffusers/quantizers/bitsandbytes/__init__.py
++src/diffusers/quantizers/bitsandbytes/bnb_quantizer.py
++src/diffusers/quantizers/bitsandbytes/utils.py
+ src/diffusers/schedulers/__init__.py
+ src/diffusers/schedulers/scheduling_amused.py
+ src/diffusers/schedulers/scheduling_consistency_decoder.py

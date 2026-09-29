@@ -1,0 +1,38 @@
+diff --git a/visualize.py b/visualize.py
+index bdf2959..ef8cf3d 100644
+--- a/visualize.py
++++ b/visualize.py
+@@ -2,6 +2,7 @@ import argparse
+ import numpy as np
+ import rerun as rr
+ import rerun.blueprint as rrb
++from scipy.spatial.transform import Rotation as R
+ 
+ from spatiallm import Layout
+ from spatiallm.pcd import load_o3d_pcd, get_points_and_colors
+@@ -75,20 +76,23 @@ if __name__ == "__main__":
+     for ti in range(num_entities + 1):
+         sub_floor_plan = floor_plan[:ti]
+ 
+-        rr.set_time_seconds("time_sec", ti * seconds)
++        rr.set_time("time_sec", duration=ti * seconds)  # 5090 patch: rerun>=0.23 去掉了 set_time_seconds
+         for box in sub_floor_plan:
+             uid = box["id"]
+             group = box["class"]
+             label = box["label"]
+ 
++            # 5090 patch: rerun>=0.22 起 Boxes3D 的 centers 和 InstancePoses3D 不再合成同一个姿态,
++            # 单独给 mat3x3 会让盒子绕世界原点旋转而跑位; 改成把旋转直接写进 Boxes3D 的 quaternions (xyzw)
++            quat_xyzw = R.from_matrix(box["rotation"]).as_quat()
+             rr.log(
+                 f"world/pred/{group}/{uid}",
+                 rr.Boxes3D(
+                     centers=box["center"],
+                     half_sizes=0.5 * box["scale"],
++                    quaternions=rr.Quaternion(xyzw=quat_xyzw),
+                     labels=label,
+                 ),
+-                rr.InstancePoses3D(mat3x3=box["rotation"]),
+                 static=False,
+             )
+     rr.script_teardown(args)
