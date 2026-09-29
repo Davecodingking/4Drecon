@@ -1443,13 +1443,25 @@ DEPS_OBJ = {
     "recall_merge": ["recall_gen", "up"],
     # ★ 补 scale: world_scale 就地把倍数乘进深度和相机, 壳如果不跟着重算,
     #   房间壳会留在校准前的世界里, 和物体差一个 k 倍。
-    "shell": ["zup", "up", "scale"],
+    # ★ 2026-09-29 补 recall_merge: 开着召回时壳读的是 06_all_boxes_merged.json(柱子那部分要用盒子)。
+    #   以前步骤一个接一个跑, recall_merge 排在前面没出过事; 并行之后依赖表不写, 两步就会同时跑
+    "shell": ["zup", "up", "scale", "recall_merge"],
     "assemble": ["scale", "solo", "recall_merge", "shell"],
     "people": ["assemble", "people_mesh"],
     "phys": ["assemble", "people"],
     "people_glb": ["phys", "people"],
     "render": ["phys"],
 }
+
+# 吃显存的步骤, 两条链的名字并在一起(同名的 da3/gen 本来两条链都吃显存)。
+# 和 outdoor 的 GPU_STEPS 是同一个作用: 进这些步骤之前先领一张空卡(_common.GpuSlot)。
+# ★ vlm_sizes / floor / shell 以前不在任何"等 GPU"的通道里, 这次一并补进来:
+#   vlm_sizes 跑 Qwen3-VL(outdoor 早就把它算作 GPU 步骤了), floor 跑 LaMa,
+#   shell 内部会调 o_walls —— 那里有 wait_gpu 但没有锁, 挡不住另一条流水线。
+# ★ people_track / people_mesh 故意不在这里: body4d_pipeline.py 自己在 track/mesh 上领卡, 外面再领一张就多占一张不用
+GPU_STEPS = {"vlm", "vlm_sizes", "vlm_rest", "da3", "track", "verify", "gen", "solo",
+             "detect", "recall_mask", "recall_gen", "shell",   # 物体链
+             "lm", "mask", "floor"}                            # SpatialLM 链
 
 CHAINS = {
     # 物体链: Qwen 列词 -> SAM3 跟踪 -> 反投影量盒子 -> 生成 -> 摆回去。
@@ -1549,6 +1561,8 @@ def main():
     ap.add_argument("--dump-cfg", action="store_true",
                     help="把解析后的配置打成 JSON。给人工闸用 —— 闸要知道 SOLO/EXCLUDE\n                          才能把逐实例候选也摆出来, 而那些值只有这里算得出来。")
     ap.add_argument("--check", action="store_true", help="不跑, 只看产物在不在/有没有过期")
+    ap.add_argument("--dump-deps", action="store_true",
+                    help="把步骤表/依赖表/吃显存的步骤打成一行 JSON(调度自检和测试用)")
     g = ap.parse_args()
 
     # 两条链共用这一个驱动, 但步骤表/产物表/依赖表各是各的。选好之后塞回模块全局,
@@ -1557,6 +1571,9 @@ def main():
     STEPS, DEFAULT_END, ARTIFACTS, DEPS = CHAINS[g.chain]
 
     keys = [s[0] for s in STEPS]
+    if g.dump_deps:
+        print(json.dumps(dict(steps=keys, deps=DEPS, gpu=sorted(GPU_STEPS & set(keys))), ensure_ascii=False))
+        return
     if g.dump_cfg:
         _c = Ctx(g.scene, g.run)
         print(_c.tag if g.tag_only else json.dumps(_c.cfg, ensure_ascii=False))
@@ -1590,15 +1607,6 @@ def main():
         print(f"视频 {c.VID}")
     print(f"结果 {c.R1}")
     print(f"步骤 {' -> '.join(s[0] for s in sel)}" + ("   [干跑]" if g.dry_run else "") + "\n")
-    # 吃显存的步骤, 两条链的名字并在一起(同名的 da3/gen 本来两条链都吃显存)。
-    # 和 outdoor 的 GPU_STEPS 是同一个作用: 进这些步骤之前先去排队拿锁。
-    # ★ vlm_sizes / floor / shell 以前不在任何"等 GPU"的通道里, 这次一并补进来:
-    #   vlm_sizes 跑 Qwen3-VL(outdoor 早就把它算作 GPU 步骤了), floor 跑 LaMa,
-    #   shell 内部会调 o_walls —— 那里有 wait_gpu 但没有锁, 挡不住另一条流水线。
-    # ★ people_track / people_mesh 故意不在这里: body4d_pipeline.py 自己拿同一把锁, 套两层就死锁
-    GPU_STEPS = {"vlm", "vlm_sizes", "vlm_rest", "da3", "track", "verify", "gen", "solo",
-                 "detect", "recall_mask", "recall_gen", "shell",   # 物体链
-                 "lm", "mask", "floor"}                            # SpatialLM 链
     for k, e, d, fn in sel:
         t = time.time()
         _cm.CUR_STEP = k               # sh() 靠它往步骤日志打 "== <步骤> <时间戳>" 分隔线

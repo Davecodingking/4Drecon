@@ -247,3 +247,43 @@ K 至少是 1。K = 1 就和现在一样。
 7. 拆分：出人网格。
 8. nfl1 实跑验证（`r2` 对 `r3`），再跑 soccer。
 9. 室内接上，office 验证。
+
+## 附录: 同时跑的步骤核对结果（2026-09-29）
+
+做法：按依赖表算出每一段里"互相不是上下游"的步骤对，逐对查它们的脚本读什么、写什么。
+
+### 室外
+
+| 段 | 同时跑的步骤 | 各自写什么 | 结论 |
+|---|---|---|---|
+| 地基 | vlm 和 da3、up | vlm 写 `01_vlm_vocab.json`；da3、up 写 `02_da3/` | 不重叠 |
+| 生成前 | people_track 和 track、dedup、relabel、pick、verify、override | people_track 写 `body4d/` 和 `05_people.json`（原子替换）；其余写 `03_masks/`、`03_*.json`、`04_picks/` | 不重叠 |
+| 尺度 | gen 链、vlm_sizes、people_mesh 三组；ratio 和 meshes；meshes 和 boxes、scale | gen 写生成目录；ratio 写 `05_mesh_ratio.json`；meshes 写 `05_meshes.jpg`；boxes 写 `06_all_boxes.json`；vlm_sizes 写 `01_vlm_sizes.json`；people_mesh 写 `body4d/04_mesh_occ0/` | 不重叠。scale 会就地改深度和相机，但除 meshes 外它依赖本段所有步骤，meshes 不读深度 |
+| 逐实例+召回 | solo、boxes_wd、compare、detect、recall、recall_mask | solo 写抠图和 `logs/solo_jobs.txt`；boxes_wd 写 `06_all_boxes_wilddet.json`；compare 只打印；召回三步写 `12_`、`13_`、`14_` 开头的文件，不写 `03_masks/` | 不重叠 |
+| 验收 | people_glb 和 render | people_glb 写 `09_*`；render 写 `08_render_back*.jpg` | 不重叠 |
+| 收尾 | building_scene 和 assemble_wd、phys_wd、render_wd | 前者写 `20_*`；后者写 `17_*`、`18_*`。`assemble_scene.py` 的旁路文件名跟着输出名走；`scene_phys.py` 的 `07_phys_people.json` 只在给了 `PEOPLE` 时才写，这几步都不给 | 不重叠 |
+
+各步骤的日志文件名都不相同。
+
+### 室内（物体链）
+
+和室外相同的步骤结论相同。室内独有的：
+
+| 段 | 同时跑的步骤 | 结论 |
+|---|---|---|
+| 尺度 | vlm_rest 和 vlm_sizes、gen 链、people_mesh | vlm_rest 写 `01_vlm_rest.json`，不重叠 |
+| 验收 | recall_gen、recall_merge 和 zup、shell | **发现漏掉的依赖**：开着召回时 shell 读 `06_all_boxes_merged.json`，这个文件是 recall_merge 写的。已补进依赖表（shell 依赖 recall_merge） |
+
+### 补进依赖表的
+
+| 流水线 | 补了什么 | 原因 |
+|---|---|---|
+| 室外 | track 依赖 vlm | track 读 vlm 出的词表 |
+| 室内 | shell 依赖 recall_merge | 见上 |
+
+室内的 track 本来就依赖 vlm，不用补。
+
+### 其他确认过的
+
+- 不在"吃显存的步骤"名单里的步骤，没有一个直接用 CUDA。渲染类的步骤（render、people_glb、meshes）用 EGL，占显存很少。
+- `05_people.json` 是原子替换写入的，别的步骤启动时读它不会读到写了一半的内容。

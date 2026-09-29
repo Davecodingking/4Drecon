@@ -1167,7 +1167,7 @@ ARTIFACTS = {
 # 每一步真正依赖谁的产物。--check 靠它判断"过期", 而不是靠"比前面所有步骤旧"——
 # 那种偷懒判法只要有人乱序重跑一步就会级联误报一片。
 DEPS = {
-    "vlm": ["frames"],          "da3": ["frames"],        "track": ["frames"],
+    "vlm": ["frames"],          "da3": ["frames"],        "track": ["frames", "vlm"],   # track 读 vlm 出的词表 01_vlm_vocab.json
     "up": ["da3"],   "dedup": ["track"],        "relabel": ["dedup"],   "pick": ["track", "dedup", "relabel"],
     "verify": ["pick"],       "override": ["verify"],
     "gen": ["override"],        "ratio": ["gen"],         "meshes": ["gen"],
@@ -1193,6 +1193,11 @@ DEPS = {
     "buildings": ["track", "da3", "scale"],
     "merge": ["phys", "buildings", "up"]  # topview.py 现在读 world_up.json,
 }
+
+# 吃显存的步骤: 开始之前先领一张空卡(_common.GpuSlot)。
+# ★ people_track / people_mesh 故意不在这里: body4d_pipeline.py 自己在 track/mesh 上领卡, 外面再领一张就多占一张不用
+GPU_STEPS = {"vlm", "vlm_sizes", "da3", "track", "verify", "gen", "solo", "boxes_wd", "detect",
+             "recall_mask", "recall_gen"}
 
 def do_check(c):
     """看一遍产物在不在、有没有过期。过期 = 比上一步的产物还旧, 说明上游重跑过而它没跟上。"""
@@ -1263,9 +1268,14 @@ def main():
     ap.add_argument("--dump-cfg", action="store_true",
                     help="把解析后的配置打成 JSON。给人工闸用 —— 闸要知道 SOLO/EXCLUDE\n                          才能把逐实例候选也摆出来, 而那些值只有这里算得出来。")
     ap.add_argument("--check", action="store_true", help="不跑, 只看产物在不在/有没有过期")
+    ap.add_argument("--dump-deps", action="store_true",
+                    help="把步骤表/依赖表/吃显存的步骤打成一行 JSON(调度自检和测试用)")
     g = ap.parse_args()
 
     keys = [s[0] for s in STEPS]
+    if g.dump_deps:
+        print(json.dumps(dict(steps=keys, deps=DEPS, gpu=sorted(GPU_STEPS)), ensure_ascii=False))
+        return
     if g.dump_cfg:
         _c = Ctx(g.scene, g.run)
         # 源码里写死的换候选(PICK_OVERRIDE_BY_SCENE)也吐出去: s_override 每次都会套它,
@@ -1295,9 +1305,6 @@ def main():
     print(f"帧   {c.FR}")
     print(f"结果 {c.R1}")
     print(f"步骤 {' -> '.join(s[0] for s in sel)}" + ("   [干跑]" if g.dry_run else "") + "\n")
-    # ★ people_track / people_mesh 故意不在这里: body4d_pipeline.py 自己拿同一把锁, 套两层就死锁
-    GPU_STEPS = {"vlm","vlm_sizes","da3","track","verify","gen","solo","boxes_wd","detect",
-                 "recall_mask","recall_gen"}
     for k, e, d, fn in sel:
         t = time.time()
         for lg in glob.glob(f"{c.LOG}/*.log"): pass

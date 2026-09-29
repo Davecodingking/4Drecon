@@ -362,9 +362,13 @@ def main():
     ap.add_argument("--check", action="store_true", help="不跑, 只看产物在不在/有没有过期")
     ap.add_argument("--dump-cfg", action="store_true")
     ap.add_argument("--tag-only", action="store_true")
+    ap.add_argument("--dump-deps", action="store_true")
     g = ap.parse_args()
 
     keys = [s[0] for s in STEPS]
+    if g.dump_deps:
+        print(json.dumps(dict(steps=keys, deps=DEPS, gpu=sorted(GPU_STEPS)), ensure_ascii=False))
+        return
     if g.dump_cfg:
         c = Ctx(g.scene, g.run)
         print(c.tag if g.tag_only else json.dumps(c.cfg, ensure_ascii=False))
