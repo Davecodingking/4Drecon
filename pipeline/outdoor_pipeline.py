@@ -49,6 +49,7 @@ import os, sys, json, time, glob, argparse, subprocess, shlex
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _common as _cm          # 设 CUR_STEP 用 —— 必须改模块上的属性, from-import 进来的是副本
 import sched                   # pipeline/sched.py(不是标准库那个): 按依赖表并行跑步骤
+import fanout                  # 步骤内部拆分: 同一个脚本起几份, 各用一张卡
 from _common import (LOCK, GpuSlot, wait_gpu, sh, envcmd, stamp_path,
                      timing as _timing, resolve_cfg as _resolve_cfg,
                      write_frame_map, load_frame_map)
@@ -390,12 +391,13 @@ def s_up(c, dry):
        f"{c.LOG}/02_up.log", dry)
 
 def s_track(c, dry):
-    """SAM3 视频跟踪, 每个词跑一次, 结果 RLE 压缩落盘。跟踪只跑这一次,
+    """SAM3 视频跟踪, 每个词一个结果文件, RLE 压缩落盘。跟踪只跑这一次,
     后面挑图/量盒子/逐实例生成全部从 03_masks/*.npz 读, 不再碰 GPU。
-    防 OOM 三级都在 track_all.py 里(显存卸到 CPU / 密集词提高检出阈值 / 分段)。"""
-    sh(envcmd(PY["sam3"], f"{SCRIPTS}/track_all.py",
-              dict(FR=c.FR, R1=c.R1, EXTRA_WORDS=c.cfg["EXTRA_WORDS"])),
-       f"{c.LOG}/03_track.log", dry)
+    防 OOM 三级都在 track_all.py 里(显存卸到 CPU / 密集词提高检出阈值 / 分段)。
+    ★ 2026-09-29 按词拆分: 有几张空卡就起几份 track_all.py, 每份跟踪一部分词(fanout.fan_track)。"""
+    fanout.fan_track(PY["sam3"], f"{SCRIPTS}/track_all.py",
+                     dict(FR=c.FR, R1=c.R1, EXTRA_WORDS=c.cfg["EXTRA_WORDS"]),
+                     c.R1, f"{c.LOG}/03_track.log", dry)
 
 def s_dedup(c, dry):
     """跨词去重(二维): 同一批物体被几个同义词各抠一遍, 赶在生成之前判掉多余的词。
@@ -1199,6 +1201,8 @@ DEPS = {
 # ★ people_track / people_mesh 故意不在这里: body4d_pipeline.py 自己在 track/mesh 上领卡, 外面再领一张就多占一张不用
 GPU_STEPS = {"vlm", "vlm_sizes", "da3", "track", "verify", "gen", "solo", "boxes_wd", "detect",
              "recall_mask", "recall_gen"}
+# 内部拆分的步骤: 它起的每一份各领一张卡, 主循环不替它领(领了就多占一张不用)
+FANOUT_STEPS = {"track"}
 
 def do_check(c):
     """看一遍产物在不在、有没有过期。过期 = 比上一步的产物还旧, 说明上游重跑过而它没跟上。"""
@@ -1341,7 +1345,7 @@ def main():
         globals()["sh"] = lambda *a, **kw: _o(*a, **{**kw, "sep": kw.get("sep", c._sep)})
         t_run, ok = t, "失败"
         try:
-            if k in GPU_STEPS and not g.dry_run:
+            if k in GPU_STEPS - FANOUT_STEPS and not g.dry_run:
                 with GpuSlot(k):
                     t_run = time.time()          # 等卡的时间单独记, 不算进这一步的耗时
                     fn(c, g.dry_run)

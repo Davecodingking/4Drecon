@@ -34,6 +34,13 @@ EXTRA = [w.strip() for w in os.environ.get("EXTRA_WORDS","").split(",") if w.str
 if EXTRA:
     print(f"[附加词] {len(EXTRA)} 个(不在 VLM 词表里): {', '.join(EXTRA)}", flush=True)
     VOCAB = VOCAB + [w for w in EXTRA if w not in VOCAB]
+# ★ 2026-09-29 拆分: 同一轮里这个脚本可能同时起几份, 每份只跟踪自己那几个词(各用一张卡)。
+#   报告各写各的, 由流水线并成一份 —— 几份都往 03_track_report.json 写的话后写的盖掉先写的。
+ONLY = [w for w in os.environ.get("ONLY_WORDS", "").split(",") if w]
+if ONLY:
+    VOCAB = [w for w in VOCAB if w in ONLY]
+    print(f"[拆分] 这一份只跟踪 {len(VOCAB)} 个词: {', '.join(VOCAB)}", flush=True)
+REPORT = os.environ.get("TRACK_REPORT", f"{ROOT}/03_track_report.json")
 # 二级: 单帧就密密麻麻的词, 只要最大的那几个
 DENSE = {"sign":0.90, "billboard":0.90, "window":0.90,
          "person":0.85, "pedestrian":0.85, "chair":0.85, "folding chair":0.85}
@@ -187,5 +194,5 @@ if MULTI:
 else:
     for w in todo:
         track_single(w)
-json.dump(report, open(f"{ROOT}/03_track_report.json","w"), ensure_ascii=False, indent=1)
+json.dump(report, open(REPORT,"w"), ensure_ascii=False, indent=1)
 print(f"\n[done] {sum(r['实例数'] for r in report.values())} 个实例 -> {OUT}")

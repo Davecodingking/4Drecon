@@ -83,6 +83,84 @@ def test_merge_reports():
         assert sorted(os.listdir(T)) == ["all.json"]
 
 
+def _fake_track(T):
+    """假的 track_all.py: 只认环境变量, 给每个词写一个 npz 和一份报告。FAIL_WORD 里的词第一次跑会失败。"""
+    p = f"{T}/fake_track.py"
+    open(p, "w").write('''
+import json, os, sys
+R1 = os.environ["R1"]; only = [w for w in os.environ.get("ONLY_WORDS", "").split(",") if w]
+vocab = json.load(open(f"{R1}/01_vlm_vocab.json"))["vocab"]
+words = [w for w in vocab if not only or w in only]
+rep = {}
+os.makedirs(f"{R1}/03_masks", exist_ok=True)
+for w in words:
+    f = f"{R1}/03_masks/{w.replace(' ', '_')}.npz"
+    if os.path.exists(f): continue
+    flag = f"{R1}/.failed_once_{w}"
+    if w == os.environ.get("FAIL_WORD") and not os.path.exists(flag):
+        open(flag, "w").close(); sys.exit(1)
+    open(f, "w").write(os.environ.get("CUDA_VISIBLE_DEVICES", "?")); rep[w] = {"实例数": 1}
+json.dump(rep, open(os.environ.get("TRACK_REPORT", f"{R1}/03_track_report.json"), "w"), ensure_ascii=False)
+''')
+    return p
+
+
+def _track_run(words, **env):
+    T = tempfile.mkdtemp()
+    json.dump({"vocab": words}, open(f"{T}/01_vlm_vocab.json", "w"))
+    F.fan_track(sys.executable, _fake_track(T), dict(R1=T, FR="x", EXTRA_WORDS="", **env), T, f"{T}/logs/03_track.log",
+                False, **KW)
+    cards = {w: open(f"{T}/03_masks/{w.replace(' ', '_')}.npz").read() for w in words}
+    return T, cards, json.load(open(f"{T}/03_track_report.json"))
+
+
+def test_fan_track_splits_words_over_cards():
+    words = ["goal post", "helmet", "sign", "jersey", "football", "gloves"]
+    T, cards, rep = _track_run(words)
+    assert sorted(set(cards.values())) == ["t81", "t82", "t83"], cards          # 三张卡都用上了
+    assert list(rep) and set(rep) == set(words), rep                            # 报告并成了一份
+    assert not [f for f in os.listdir(T) if ".part" in f], os.listdir(T)
+
+
+def test_fan_track_retry_only_redoes_missing_words():
+    T, cards, rep = _track_run(["helmet", "sign", "jersey"], FAIL_WORD="sign")
+    assert set(cards) == {"helmet", "sign", "jersey"}, cards
+
+
+def test_fan_track_names_the_words_that_never_came_out():
+    T = tempfile.mkdtemp()
+    json.dump({"vocab": ["helmet", "sign"]}, open(f"{T}/01_vlm_vocab.json", "w"))
+    bad = f"{T}/bad.py"; open(bad, "w").write("import sys; sys.exit(2)")
+    try:
+        F.fan_track(sys.executable, bad, dict(R1=T, FR="x", EXTRA_WORDS=""), T, f"{T}/logs/03_track.log", False, **KW)
+    except SystemExit as e:
+        assert "helmet" in str(e) and "sign" in str(e), str(e)
+    else:
+        raise AssertionError("该失败")
+
+
+def test_fan_track_nothing_to_do():
+    T = tempfile.mkdtemp()
+    json.dump({"vocab": ["helmet"]}, open(f"{T}/01_vlm_vocab.json", "w"))
+    os.makedirs(f"{T}/03_masks"); open(f"{T}/03_masks/helmet.npz", "w").close()
+    F.fan_track(sys.executable, _fake_track(T), dict(R1=T, FR="x", EXTRA_WORDS=""), T, f"{T}/logs/03_track.log",
+                False, **KW)                                                    # 词都跟踪过了: 照常跑一份, 不崩
+
+
+def test_fan_track_max_parts_one_means_no_split():
+    T = tempfile.mkdtemp()
+    json.dump({"vocab": ["helmet", "sign", "jersey"]}, open(f"{T}/01_vlm_vocab.json", "w"))
+    F.fan_track(sys.executable, _fake_track(T), dict(R1=T, FR="x", EXTRA_WORDS=""), T, f"{T}/logs/03_track.log",
+                False, max_parts=1, **KW)
+    cards = {open(f"{T}/03_masks/{w}.npz").read() for w in ("helmet", "sign", "jersey")}
+    assert len(cards) == 1, cards                                               # 一份, 一张卡
+
+
+def test_track_all_reads_the_two_env_vars():
+    txt = open(f"{SAM3D}/data/outdoor/scripts/track_all.py").read()
+    assert 'os.environ.get("ONLY_WORDS"' in txt and 'os.environ.get("TRACK_REPORT"' in txt
+
+
 if __name__ == "__main__":
     for name, t in list(globals().items()):
         if name.startswith("test_") and callable(t):
