@@ -31,6 +31,19 @@ def merge(run, trk, ids, parts, seconds=None):
     have = sorted(o for _, rel, _ in got for o in rel)
     if have != sorted(ids):
         raise SystemExit(f"[失败] 几份加起来的人 {have} 和要出网格的 {sorted(ids)} 对不上")
+    # ★ 空网格(文件头里写着 0 个顶点)不能收: 2026-09-29 nfl1 r3 人 2/6/7 拆开后全是空的 —— 这几个人有
+    #   "模型拒绝出网格"的帧, 那一帧里没有别人时上游从此全出空网格。以前照收, 到 scale 那步才炸
+    empty = {}
+    for p, rel, _ in got:
+        for o, l in rel.items():
+            d = f"{p}/mesh_4d_individual/{l}"
+            n = sum(b"element vertex 0\n" in open(f"{d}/{f}", "rb").read(400)
+                    for f in (os.listdir(d) if os.path.isdir(d) else []))
+            if n:
+                empty[o] = n
+    if empty:
+        raise SystemExit(f"[失败] 拆开跑之后这些人出了空网格 {{人: 空的帧数}} = {empty}。"
+                         f"这几个人不能单独拆出去, 用 FANOUT=0 重跑这一步(不拆)")
     # 先清掉上一次留下的(上次挑的人可能更多), 再把各份的搬进来
     for d in PER_PERSON + ("rendered_frames", "masks"):
         shutil.rmtree(f"{run}/{d}", ignore_errors=True)

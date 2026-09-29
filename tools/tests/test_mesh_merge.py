@@ -156,10 +156,10 @@ def _mesh_setup(**env):
     import _common as C, body4d_pipeline as B
     T = tempfile.mkdtemp()
     keep = {k: os.environ.get(k) for k in ("BODY_OUT", "GPU_POOL", "RUN_DIR", "OCC", "PARALLEL", "FAIL_ALWAYS",
-                                           "CUDA_VISIBLE_DEVICES", "SCENE_R1", "MAX_GPUS")}
+                                           "CUDA_VISIBLE_DEVICES", "SCENE_R1", "MAX_GPUS", "FANOUT")}
     for k in keep:
         os.environ.pop(k, None)
-    os.environ.update(BODY_OUT=f"{T}/body4d", GPU_POOL="t71,t72,t73", **env)
+    os.environ.update(dict(BODY_OUT=f"{T}/body4d", GPU_POOL="t71,t72,t73", FANOUT="1"), **env)
     old = (C.card_busy, B.B4D, B.PY)
     C.card_busy = lambda card, need_mb=0: False
     B.B4D = f"{T}/b4d"; os.makedirs(B.B4D)
@@ -235,6 +235,33 @@ def test_s_mesh_does_not_split_with_completion_on():
         assert len({card for _, card in _who(c).values()}) == 1
     finally:
         undo()
+
+
+def test_s_mesh_does_not_split_by_default():
+    """2026-09-29 nfl1 实测按人拆分改变结果(差 1~3 厘米), 默认不拆; FANOUT=1 才拆。"""
+    B, c, undo = _mesh_setup(FANOUT="0")
+    try:
+        B.s_mesh(c, False)
+        assert open(f"{c.TRK}/calls.txt").read().split() == ["1,2,4,7,9"]
+    finally:
+        undo()
+
+
+def test_merge_refuses_empty_meshes():
+    """2026-09-29 nfl1 r3: 拆开后人 2/6/7 的网格全是空的(292 字节的 ply) —— 这几个人有"模型拒绝出网格"的帧,
+    那一帧里没有别人时上游从此全出空网格。以前合并照收, 到 scale 那步才炸, 报的还是看不懂的错。"""
+    run, trk, frames_of = _setup()
+    open(f"{run}/_part1/mesh_4d_individual/1/00000000.ply", "wb").write(      # 真实的空网格就长这样
+        b"ply\nformat binary_little_endian 1.0\ncomment https://github.com/mikedh/trimesh\nelement vertex 0\n"
+        b"property float x\nproperty float y\nproperty float z\nelement face 0\n"
+        b"property list uchar int vertex_indices\nend_header\n")
+    try:
+        M.merge(run, trk, [1, 2, 4, 7], 2)
+    except SystemExit as e:
+        assert "空" in str(e) and "2" in str(e) and "FANOUT" in str(e), str(e)   # 原 id 2(第 1 份里的 1 号)
+    else:
+        raise AssertionError("有空网格该失败")
+    assert os.path.isdir(f"{run}/_part0/mesh_4d_individual/1"), "失败时不能动各份的结果"
 
 
 def test_s_mesh_does_not_split_when_parallel_is_off():

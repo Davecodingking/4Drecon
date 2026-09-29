@@ -13,6 +13,16 @@ import json, os, threading
 from _common import GpuSlot, gpus_free_now, sh, envcmd, parallel_on
 
 
+def on():
+    """拆分默认关, FANOUT=1 才开。
+    ★ 2026-09-29 nfl1 实测拆分会改变结果, 所以不能默认开:
+      - track 按词拆: gloves 10 -> 11 个实例, referee 1 -> 2(不拆时两次重跑完全一样)。它是"一批词共用一次检测",
+        批里有哪些词会影响结果。
+      - 出人网格按人拆: 除了编号 1 的人, 其余的人顶点系统性地差 1~3 厘米(两次重跑只差 1~4 毫米);
+        有"模型拒绝出网格"的帧的人, 单独一份时从那一帧起全是空网格(合并时会拦下, 见 mesh_merge.py)。"""
+    return os.environ.get("FANOUT", "0") == "1"
+
+
 def split(items, weights, k):
     """分成最多 k 组, 让各组的权重和接近: 从重到轻, 每次放进当前最轻的那组。组内保持原来的顺序。"""
     if not items:
@@ -79,26 +89,28 @@ def merge_reports(parts, out):
     return d
 
 
-def fan_track(py, script, env, R1, log, dry, need_mb=0, max_parts=None, **kw):
+def fan_track(py, script, env, R1, log, dry, need_mb=0, max_parts=None, sh_env=None, **kw):
     """物体跟踪按词拆分。env: 给 track_all.py 的环境变量(FR / R1 / EXTRA_WORDS ...)。max_parts: 最多拆几份。
+    sh_env: 每条命令额外带的环境变量(室内要带 CUDA_HOME 那一套, 见 indoor_pipeline.sh)。
     每个词的结果是单独一个 npz, 不用合并; 报告各份写各的, 这里并成一份。
     ★ 重试只补没出来的词: track_all.py 见到 npz 已经在就跳过。"""
     probe = {k: v for k, v in kw.items() if k in ("run_dir", "pool", "busy")}
     words = [] if dry else track_words(R1, env.get("EXTRA_WORDS", ""))
-    k = how_many(len(words), need_mb, **probe) if (words and parallel_on()) else 1
+    k = how_many(len(words), need_mb, **probe) if (words and parallel_on() and on()) else 1
     k = min(k, max_parts) if max_parts else k
     if dry or k <= 1:
         if dry:
-            return sh(envcmd(py, script, env), log, dry)
+            return sh(envcmd(py, script, env), log, dry, env=sh_env)
         with GpuSlot("track", need_mb, **kw):
-            return sh(envcmd(py, script, env), log, dry)
+            return sh(envcmd(py, script, env), log, dry, env=sh_env)
     groups = split(words, [1] * len(words), k)
     print(f"    [拆分] {len(words)} 个词分成 {len(groups)} 份: " + " | ".join(", ".join(g) for g in groups), flush=True)
     parts = [f"{R1}/03_track_report.part{i}.json" for i in range(len(groups))]
 
     def job(i):
         return lambda card: sh(envcmd(py, script, dict(env, CUDA_VISIBLE_DEVICES=card, CUDA_DEVICE_ORDER="PCI_BUS_ID",
-                                                       ONLY_WORDS=",".join(groups[i]), TRACK_REPORT=parts[i])), log, dry)
+                                                       ONLY_WORDS=",".join(groups[i]), TRACK_REPORT=parts[i])),
+                               log, dry, env=sh_env)
 
     res = run_workers([(f"w{i}", job(i)) for i in range(len(groups))], "track", need_mb, **kw)
     merge_reports(parts, f"{R1}/03_track_report.json")

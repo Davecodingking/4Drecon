@@ -133,10 +133,32 @@ def test_avoid_prefers_another_card():
         assert a.card == "t91"                                  # 只有这一张就还用它
 
 
+def test_commands_get_a_cpu_thread_cap():
+    """255 核的机器上每个进程默认开几百个线程空转: 一个出网格进程占 44~110 个核, 几个一起跑互相拖慢。
+    实测限成 8 反而更快(出网格 143s -> 109s), CPU 少用 82 倍。sh() 起的命令默认都带上。"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as T:
+        old = _env(OMP_NUM_THREADS=None, MKL_NUM_THREADS=None, CPU_THREADS=None)
+        try:
+            show = "echo $OMP_NUM_THREADS $MKL_NUM_THREADS $OPENBLAS_NUM_THREADS $NUMEXPR_NUM_THREADS"
+            C.sh(show, f"{T}/a.log")
+            assert open(f"{T}/a.log").read().split("\n")[-2] == "8 8 8 8", open(f"{T}/a.log").read()
+            os.environ["CPU_THREADS"] = "16"
+            C.sh(show, f"{T}/b.log")
+            assert open(f"{T}/b.log").read().split("\n")[-2] == "16 16 16 16"
+            os.environ["OMP_NUM_THREADS"] = "3"                  # 人明确设了的不动
+            C.sh(show, f"{T}/c.log")
+            assert open(f"{T}/c.log").read().split("\n")[-2] == "3 16 16 16"
+            C.sh(show, f"{T}/d.log", env={"MKL_NUM_THREADS": "5"})   # 步骤自己给的也不动
+            assert open(f"{T}/d.log").read().split("\n")[-2] == "3 5 16 16"
+        finally:
+            _restore(old)
+
+
 def test_defaults():
     old = _env(MAX_GPUS=None, PARALLEL=None)
     try:
-        assert C.max_gpus() == 8 and C.parallel_on() is True
+        assert C.max_gpus() == 8 and C.parallel_on() is True and C.cpu_threads() == 8
         os.environ["PARALLEL"] = "0"
         assert C.parallel_on() is False
     finally:

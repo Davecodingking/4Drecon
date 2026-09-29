@@ -106,6 +106,7 @@ MAX_GPUS = 8          # 一轮最多同时用几张卡(环境变量 MAX_GPUS 可
 FOREIGN_MB = 2000     # 卡上别人的进程占显存超过这么多 = 这张卡有人在用(和 wait_gpu 同一个数)
 SLOT_POLL = 5         # 秒: 没领到卡, 隔多久再找一遍
 SLOT_TIMEOUT = 10800  # 秒: 排这么久还领不到就报失败(和 wait_gpu 一样 3 小时)
+CPU_THREADS = 8       # 每条命令的 CPU 线程数上限(环境变量 CPU_THREADS 可改), 理由见 cpu_threads()
 
 
 def parallel_on():
@@ -115,6 +116,15 @@ def parallel_on():
 
 def max_gpus():
     return max(1, int(os.environ.get("MAX_GPUS", MAX_GPUS)))
+
+
+def cpu_threads():
+    """每条命令默认的 CPU 线程数上限(OMP / MKL / OPENBLAS / NUMEXPR)。
+    ★ 这台机器 255 个核, torch / numpy 默认按核数开线程, 大多数在空转还互相抢:
+      2026-09-29 实测出人网格(nfl1 人 1): 默认 载模型 80s + 出网格 143s, CPU 用户时间 17354s;
+      限成 8 -> 48s + 109s, CPU 用户时间 211s, 结果的差别在两次重跑的差别以内(1 mm)。
+      不限的话几个步骤一起跑会互相拖慢: 6 个出网格进程一起跑, 机器负载 500+, 载模型从 59s 变成 265s。"""
+    return max(1, int(os.environ.get("CPU_THREADS", CPU_THREADS)))
 
 
 def _smi(query, what="gpu"):
@@ -318,6 +328,8 @@ def sh(cmd, log=None, dry=False, cwd=None, sep=None, env=None):
     #   用了 18 分钟。以前只有 SAM3D 生成那步单独加了, Qwen-VL 那几步(vlm/verify/vlm_sizes)漏了;
     #   放在这里所有步骤一起管。要下新模型: 环境变量或 env= 里显式给 HF_HUB_OFFLINE=0。
     run_env = dict(os.environ); run_env.setdefault("HF_HUB_OFFLINE", "1")
+    for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        run_env.setdefault(_k, str(cpu_threads()))          # 人明确设了的不动; 步骤自己给的(env=)在下面覆盖
     if env:
         run_env.update(env)
         if "CUDA_HOME" in env:

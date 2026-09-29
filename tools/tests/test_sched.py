@@ -180,18 +180,37 @@ def test_child_mode_prints_no_banner():
     assert "[全部完成]" not in r.stdout and "\n场景 " not in "\n" + r.stdout
 
 
+def _drive_go(T, script=f"{SAM3D}/tools/drive_go.sh", **env):
+    """在临时的家目录 T 里用假的 tmux 跑一次 drive_go.sh。返回 (它交给 tmux 的那条命令, 跑它用的环境)。"""
+    os.makedirs(f"{T}/sam3d/data/outdoor/result/_t_scene/r1/logs")
+    os.makedirs(f"{T}/bin")
+    open(f"{T}/bin/tmux", "w").write('#!/bin/bash\n[ "$1" = new-session ] && printf "%s\\n" "${@: -1}" > "$FAKE_OUT"\nexit 0\n')
+    os.chmod(f"{T}/bin/tmux", 0o755)
+    e = {k: v for k, v in os.environ.items() if k not in ("CUDA_VISIBLE_DEVICES", "PARALLEL", "MAX_GPUS", "GPU_POOL")}
+    e.update(HOME=T, PATH=f"{T}/bin:" + os.environ["PATH"], FAKE_OUT=f"{T}/cmd", **env)
+    r = subprocess.run(["bash", script, "_t_scene", "r1"], env=e, capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return open(f"{T}/cmd").read(), e
+
+
 def _drive_go_cmd(script=f"{SAM3D}/tools/drive_go.sh", **env):
     """用假的 tmux 跑一次 drive_go.sh, 返回它交给 tmux 的那条命令(真的驱动不会起来)。"""
     with tempfile.TemporaryDirectory() as T:
-        os.makedirs(f"{T}/sam3d/data/outdoor/result/_t_scene/r1/logs")
-        os.makedirs(f"{T}/bin")
-        open(f"{T}/bin/tmux", "w").write('#!/bin/bash\n[ "$1" = new-session ] && printf "%s\\n" "${@: -1}" > "$FAKE_OUT"\nexit 0\n')
-        os.chmod(f"{T}/bin/tmux", 0o755)
-        e = {k: v for k, v in os.environ.items() if k not in ("CUDA_VISIBLE_DEVICES", "PARALLEL", "MAX_GPUS", "GPU_POOL")}
-        e.update(HOME=T, PATH=f"{T}/bin:" + os.environ["PATH"], FAKE_OUT=f"{T}/cmd", **env)
-        r = subprocess.run(["bash", script, "_t_scene", "r1"], env=e, capture_output=True, text=True)
-        assert r.returncode == 0, r.stdout + r.stderr
-        return open(f"{T}/cmd").read()
+        return _drive_go(T, script, **env)[0]
+
+
+def test_drive_go_log_records_the_real_exit_code():
+    """驱动失败了, 日志结尾的"退出码"要是驱动的退出码。以前 $? 取到的是它前面 $(date) 的, 永远是 0 ——
+    看板显示不出失败, 09-29 实跑 r3 第 3 段失败时日志里写的也是"退出码 0"。"""
+    import glob
+    with tempfile.TemporaryDirectory() as T:
+        cmd, e = _drive_go(T)
+        os.makedirs(f"{T}/miniforge3/envs/sam3d/bin")
+        fake = f"{T}/miniforge3/envs/sam3d/bin/python"
+        open(fake, "w").write("#!/bin/bash\necho 假的驱动\nexit 7\n"); os.chmod(fake, 0o755)
+        subprocess.run(["bash", "-c", cmd], env=e)
+        log = open(glob.glob(f"{T}/sam3d/data/outdoor/result/_t_scene/r1/logs/drive_*.log")[0]).read()
+        assert "假的驱动" in log and log.strip().splitlines()[-1].endswith("退出码 7"), log
 
 
 def test_drive_go_does_not_pin_a_card():
@@ -204,6 +223,15 @@ def test_drive_go_passes_pin_and_switches():
     """想钉卡、想关并行、想改名额: 环境变量要带进 tmux 里的驱动。"""
     cmd = _drive_go_cmd(CUDA_VISIBLE_DEVICES="3", PARALLEL="0", MAX_GPUS="3")
     assert "env CUDA_VISIBLE_DEVICES=3 CUDA_DEVICE_ORDER=PCI_BUS_ID PARALLEL=0 MAX_GPUS=3 " in cmd, cmd
+
+
+def test_indoor_child_mode_and_dry_run():
+    base = [sys.executable, f"{SAM3D}/pipeline/indoor_pipeline.py", "--chain", "obj", "--scene", "office", "--run", "r6_pillarfix"]
+    r = subprocess.run(base + ["--only", "vlm,da3,up", "-n"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-400:]
+    assert [l.split()[1] for l in r.stdout.splitlines() if l.startswith("== ")] == ["vlm", "da3", "up"]
+    r = subprocess.run(base + ["--only", "up", "--child", "-n"], capture_output=True, text=True)
+    assert r.returncode == 0 and "== up  [" in r.stdout and "[全部完成]" not in r.stdout, r.stdout[:200]
 
 
 if __name__ == "__main__":

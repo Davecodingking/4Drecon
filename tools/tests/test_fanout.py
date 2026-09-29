@@ -9,6 +9,7 @@ import fanout as F
 
 FREE = lambda card, need_mb=0: False
 KW = dict(pool=["t81", "t82", "t83"], busy=FREE, poll=0.05)
+os.environ["FANOUT"] = "1"      # 拆分默认是关的(见 test_split_is_off_by_default), 这里的测试测的是打开以后
 
 
 def test_split_balances_by_weight():
@@ -100,6 +101,7 @@ for w in words:
     if w == os.environ.get("FAIL_WORD") and not os.path.exists(flag):
         open(flag, "w").close(); sys.exit(1)
     open(f, "w").write(os.environ.get("CUDA_VISIBLE_DEVICES", "?")); rep[w] = {"实例数": 1}
+    open(f"{R1}/env_{w}.txt", "w").write(os.environ.get("MY_FLAG", "没有") + " " + os.environ.get("PATH", "").split(":")[0])
 json.dump(rep, open(os.environ.get("TRACK_REPORT", f"{R1}/03_track_report.json"), "w"), ensure_ascii=False)
 ''')
     return p
@@ -154,6 +156,33 @@ def test_fan_track_max_parts_one_means_no_split():
                 False, max_parts=1, **KW)
     cards = {open(f"{T}/03_masks/{w}.npz").read() for w in ("helmet", "sign", "jersey")}
     assert len(cards) == 1, cards                                               # 一份, 一张卡
+
+
+def test_fan_track_passes_extra_env_to_every_worker():
+    """室内每条命令都要带 CUDA_HOME 那一套环境变量(它自己的 sh 包了一层), 拆不拆都得带到。"""
+    for parts in (None, 1):
+        T = tempfile.mkdtemp()
+        json.dump({"vocab": ["helmet", "sign"]}, open(f"{T}/01_vlm_vocab.json", "w"))
+        F.fan_track(sys.executable, _fake_track(T), dict(R1=T, FR="x", EXTRA_WORDS=""), T, f"{T}/logs/03_track.log",
+                    False, max_parts=parts, sh_env={"MY_FLAG": "带到了", "CUDA_HOME": "/假的/cuda"}, **KW)
+        for w in ("helmet", "sign"):
+            assert open(f"{T}/env_{w}.txt").read() == "带到了 /假的/cuda/bin", (parts, open(f"{T}/env_{w}.txt").read())
+
+
+def test_split_is_off_by_default():
+    """2026-09-29 nfl1 实测: 按词拆分 gloves 从 10 个实例变成 11 个, 按人拆分网格差 1~3 厘米。
+    拆分改变结果, 所以默认不拆; FANOUT=1 才拆。"""
+    old = os.environ.pop("FANOUT")
+    try:
+        assert F.on() is False
+        T = tempfile.mkdtemp()
+        json.dump({"vocab": ["helmet", "sign", "jersey"]}, open(f"{T}/01_vlm_vocab.json", "w"))
+        F.fan_track(sys.executable, _fake_track(T), dict(R1=T, FR="x", EXTRA_WORDS=""), T, f"{T}/logs/03_track.log",
+                    False, **KW)
+        assert len({open(f"{T}/03_masks/{w}.npz").read() for w in ("helmet", "sign", "jersey")}) == 1
+    finally:
+        os.environ["FANOUT"] = old
+    assert F.on() is True
 
 
 def test_track_all_reads_the_two_env_vars():

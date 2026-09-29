@@ -276,8 +276,9 @@ def _part_ok(part, meta):
 
 def s_mesh(c, dry):
     """SAM 3D Body 出网格。OCC=1 时先跑 Diffusion-VAS 补全 (32G 上会 OOM, 见文件头)。
-    ★ 2026-09-29 按人拆分: 有几张空卡就起几份, 每份算几个人(按每人出现的帧数分, 各份工作量接近),
-      跑完并回一个目录(mesh_merge.py)。只在补全关着的时候拆 —— 补全要看别人的遮挡, 不能按人拆开。"""
+    ★ 2026-09-29 按人拆分(默认关, FANOUT=1 才拆, 原因见 fanout.on): 有几张空卡就起几份, 每份算几个人
+      (按每人出现的帧数分, 各份工作量接近), 跑完并回一个目录(mesh_merge.py)。
+      只在补全关着的时候拆 —— 补全要看别人的遮挡, 不能按人拆开。"""
     g = c.cfg
     need = 26000 if g["OCC"] == "1" else 15000
     script = f"{B4D}/body4d_mesh_5090.py"
@@ -287,7 +288,7 @@ def s_mesh(c, dry):
     picked = json.load(open(f"{c.TRK}/picked.json")) if os.path.exists(f"{c.TRK}/picked.json") else {}
     ids = picked.get("keep_ids", [])
     k = 1
-    if not dry and g["OCC"] != "1" and parallel_on() and len(ids) > 1:
+    if not dry and g["OCC"] != "1" and parallel_on() and fanout.on() and len(ids) > 1:
         k = fanout.how_many(len(ids), need)
     if k <= 1:
         if dry:
