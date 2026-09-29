@@ -49,8 +49,11 @@ import argparse, glob, json, os, shlex, subprocess, sys, time
 # ★ 驱动层的公共件在 _common.py(见那个文件的文件头)。三条流水线共用同一把 GPU 锁、
 #   同一个跑命令/计时/配置解析的实现 —— 复制粘贴过的东西一定会漂移。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import (LOCK, GpuSlot, wait_gpu, sh, envcmd, stamp_path,
+from _common import (LOCK, GpuSlot, wait_gpu, sh, envcmd, stamp_path, parallel_on,
                      timing as _timing, resolve_cfg as _resolve_cfg)
+import fanout                  # 步骤内部拆分: 同一个脚本起几份, 各用一张卡
+
+PIPE = os.path.dirname(os.path.abspath(__file__))
 
 HOME = os.path.expanduser("~")
 SAM3D = f"{HOME}/sam3d"
@@ -263,15 +266,61 @@ print(f"[挑人] 留 {{pick}}, 丢 {{[i for i in cov if i not in pick]}}")
     sh([PY["sam3d"], "-c", code], f"{c.LOG}/03_pick.log", dry)
 
 
+def _part_ok(part, meta):
+    """这一份上次已经算好、而且算的是同样的东西(人、参数、跟踪结果都没变): 直接用, 不重算。"""
+    try:
+        return json.load(open(f"{part}/part.json")) == meta and os.path.exists(f"{part}/mesh_report.json")
+    except (OSError, ValueError):
+        return False
+
+
 def s_mesh(c, dry):
-    """SAM 3D Body 出网格。OCC=1 时先跑 Diffusion-VAS 补全 (32G 上会 OOM, 见文件头)。"""
+    """SAM 3D Body 出网格。OCC=1 时先跑 Diffusion-VAS 补全 (32G 上会 OOM, 见文件头)。
+    ★ 2026-09-29 按人拆分: 有几张空卡就起几份, 每份算几个人(按每人出现的帧数分, 各份工作量接近),
+      跑完并回一个目录(mesh_merge.py)。只在补全关着的时候拆 —— 补全要看别人的遮挡, 不能按人拆开。"""
     g = c.cfg
-    wait_gpu(26000 if g["OCC"] == "1" else 15000, dry)
-    sh(envcmd(PY["body4d"], f"{B4D}/body4d_mesh_5090.py", GPUENV,
-              ["--dir", c.TRK, "--out", c.MESH, "--completion", g["OCC"],
-               "--batch-size", g["BATCH"], "--max-occ-len", g["MAX_OCC_LEN"]]
-              + (["--cam-json", f"{g['SCENE_R1']}/02_da3/cameras.json"] if g["SCENE_R1"] else [])),
-       f"{c.LOG}/04_mesh.log", dry, cwd=B4D)
+    need = 26000 if g["OCC"] == "1" else 15000
+    script = f"{B4D}/body4d_mesh_5090.py"
+    log = f"{c.LOG}/04_mesh.log"
+    args = (["--dir", c.TRK, "--completion", g["OCC"], "--batch-size", g["BATCH"], "--max-occ-len", g["MAX_OCC_LEN"]]
+            + (["--cam-json", f"{g['SCENE_R1']}/02_da3/cameras.json"] if g["SCENE_R1"] else []))
+    picked = json.load(open(f"{c.TRK}/picked.json")) if os.path.exists(f"{c.TRK}/picked.json") else {}
+    ids = picked.get("keep_ids", [])
+    k = 1
+    if not dry and g["OCC"] != "1" and parallel_on() and len(ids) > 1:
+        k = fanout.how_many(len(ids), need)
+    if k <= 1:
+        if dry:
+            return sh(envcmd(PY["body4d"], script, GPUENV, args + ["--out", c.MESH]), log, dry, cwd=B4D)
+        with GpuSlot("mesh", need):
+            return sh(envcmd(PY["body4d"], script, GPUENV, args + ["--out", c.MESH]), log, dry, cwd=B4D)
+    cover = picked.get("coverage", {})
+    groups = fanout.split(ids, [cover.get(str(i), 1) for i in ids], k)
+    print(f"    [拆分] {len(ids)} 个人分成 {len(groups)} 份: "
+          + " | ".join(",".join(map(str, grp)) for grp in groups), flush=True)
+    t0 = time.time()
+    tm = os.path.getmtime(f"{c.TRK}/track_report.json") if os.path.exists(f"{c.TRK}/track_report.json") else 0
+
+    def job(i):
+        part = f"{c.MESH}/_part{i}"
+        meta = dict(ids=groups[i], args=args, track_mtime=tm)
+
+        def fn(card):
+            if _part_ok(part, meta):
+                print(f"    [拆分] 第 {i} 份(人 {groups[i]})上次已经算好, 直接用", flush=True)
+                return
+            sh(envcmd(PY["body4d"], script, dict(GPUENV, CUDA_VISIBLE_DEVICES=card, CUDA_DEVICE_ORDER="PCI_BUS_ID"),
+                      args + ["--out", part, "--ids", ",".join(map(str, groups[i]))]), log, dry, cwd=B4D)
+            json.dump(meta, open(f"{part}/part.json", "w"), ensure_ascii=False)
+        return fn
+
+    res = fanout.run_workers([(f"p{i}", job(i)) for i in range(len(groups))], "mesh", need)
+    bad = [int(n[1:]) for n, e in res.items() if e]
+    if bad:
+        raise SystemExit(f"[失败] 出网格有 {len(bad)} 份重试后还是没跑成。没算出来的人: "
+                         f"{sorted(x for i in bad for x in groups[i])}。算好的几份留着, 重跑这一步只补没算出来的")
+    sh([PY["sam3d"], f"{PIPE}/mesh_merge.py", "--run", c.MESH, "--trk", c.TRK, "--ids", ",".join(map(str, ids)),
+        "--parts", str(len(groups)), "--seconds", f"{time.time() - t0:.1f}"], log, dry)
 
 
 def s_report(c, dry):
@@ -294,6 +343,8 @@ STEPS = [
 ]
 DEFAULT_END = "report"
 GPU_STEPS = {"track", "mesh"}
+# mesh 内部按人拆分, 它起的每一份各领一张卡(s_mesh 里), 主循环不替它领
+FANOUT_STEPS = {"mesh"}
 
 # 只列关键产物, 不求全。@FR = 帧目录, @TRK = 跟踪目录, @MESH = 出网格目录
 ARTIFACTS = {
@@ -409,7 +460,7 @@ def main():
         _o = globals()["sh"]
         globals()["sh"] = lambda *a, **kw: _o(*a, **{**kw, "sep": kw.get("sep", sep)})
         try:
-            if k in GPU_STEPS and not g.dry_run:
+            if k in GPU_STEPS - FANOUT_STEPS and not g.dry_run:
                 with GpuSlot(k):
                     fn(c, g.dry_run)
             else:
