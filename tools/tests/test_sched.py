@@ -162,6 +162,50 @@ def test_run_children_reports_failure():
         assert rc == {"vlm": 3} and "[失败] 步骤 vlm 退出码 3" in out.getvalue() and "坏了" in out.getvalue()
 
 
+def test_dry_run_is_still_linear_and_prints_commands():
+    """干跑不并行: 打印出来的命令要能一条条照着粘去跑, 顺序就是步骤表的顺序。"""
+    r = subprocess.run([sys.executable, f"{SAM3D}/pipeline/outdoor_pipeline.py", "--scene", "nfl1", "--run", "r1",
+                        "--only", "vlm,da3,up", "-n"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-400:]
+    heads = [l.split()[1] for l in r.stdout.splitlines() if l.startswith("== ")]
+    assert heads == ["vlm", "da3", "up"], heads
+    assert "[并行]" not in r.stdout
+
+
+def test_child_mode_prints_no_banner():
+    r = subprocess.run([sys.executable, f"{SAM3D}/pipeline/outdoor_pipeline.py", "--scene", "nfl1", "--run", "r1",
+                        "--only", "up", "--child", "-n"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-400:]
+    assert "== up  [" in r.stdout, r.stdout[:200]
+    assert "[全部完成]" not in r.stdout and "\n场景 " not in "\n" + r.stdout
+
+
+def _drive_go_cmd(script=f"{SAM3D}/tools/drive_go.sh", **env):
+    """用假的 tmux 跑一次 drive_go.sh, 返回它交给 tmux 的那条命令(真的驱动不会起来)。"""
+    with tempfile.TemporaryDirectory() as T:
+        os.makedirs(f"{T}/sam3d/data/outdoor/result/_t_scene/r1/logs")
+        os.makedirs(f"{T}/bin")
+        open(f"{T}/bin/tmux", "w").write('#!/bin/bash\n[ "$1" = new-session ] && printf "%s\\n" "${@: -1}" > "$FAKE_OUT"\nexit 0\n')
+        os.chmod(f"{T}/bin/tmux", 0o755)
+        e = {k: v for k, v in os.environ.items() if k not in ("CUDA_VISIBLE_DEVICES", "PARALLEL", "MAX_GPUS", "GPU_POOL")}
+        e.update(HOME=T, PATH=f"{T}/bin:" + os.environ["PATH"], FAKE_OUT=f"{T}/cmd", **env)
+        r = subprocess.run(["bash", script, "_t_scene", "r1"], env=e, capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        return open(f"{T}/cmd").read()
+
+
+def test_drive_go_does_not_pin_a_card():
+    """不钉卡: 每个任务自己领。要明确去掉 CUDA_VISIBLE_DEVICES —— tmux 服务端的环境里可能留着旧的卡号。"""
+    cmd = _drive_go_cmd()
+    assert "env -u CUDA_VISIBLE_DEVICES CUDA_DEVICE_ORDER=PCI_BUS_ID " in cmd, cmd
+
+
+def test_drive_go_passes_pin_and_switches():
+    """想钉卡、想关并行、想改名额: 环境变量要带进 tmux 里的驱动。"""
+    cmd = _drive_go_cmd(CUDA_VISIBLE_DEVICES="3", PARALLEL="0", MAX_GPUS="3")
+    assert "env CUDA_VISIBLE_DEVICES=3 CUDA_DEVICE_ORDER=PCI_BUS_ID PARALLEL=0 MAX_GPUS=3 " in cmd, cmd
+
+
 if __name__ == "__main__":
     for name, t in list(globals().items()):
         if name.startswith("test_") and callable(t):

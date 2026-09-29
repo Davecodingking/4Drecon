@@ -49,7 +49,7 @@ import argparse, glob, json, os, shlex, subprocess, sys, time
 # ★ 驱动层的公共件在 _common.py(见那个文件的文件头)。三条流水线共用同一把 GPU 锁、
 #   同一个跑命令/计时/配置解析的实现 —— 复制粘贴过的东西一定会漂移。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import (LOCK, GpuLock, wait_gpu, sh, envcmd, stamp_path,
+from _common import (LOCK, GpuSlot, wait_gpu, sh, envcmd, stamp_path,
                      timing as _timing, resolve_cfg as _resolve_cfg)
 
 HOME = os.path.expanduser("~")
@@ -394,6 +394,7 @@ def main():
         sel = STEPS[i:j + 1]
 
     os.makedirs(c.LOG, exist_ok=True)
+    os.environ.setdefault("RUN_DIR", c.R1)      # 主流程拉起时外面已经给了(整轮共用名额); 单跑时用自己的目录
     print(f"场景 {c.scene}  轮次 {c.run}  标签 {c.tag}")
     print(f"视频 {c.VID}")
     print(f"结果 {c.R1}")
@@ -409,7 +410,7 @@ def main():
         globals()["sh"] = lambda *a, **kw: _o(*a, **{**kw, "sep": kw.get("sep", sep)})
         try:
             if k in GPU_STEPS and not g.dry_run:
-                with GpuLock():
+                with GpuSlot(k):
                     fn(c, g.dry_run)
             else:
                 fn(c, g.dry_run)

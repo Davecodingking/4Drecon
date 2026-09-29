@@ -48,7 +48,8 @@ import os, sys, json, time, glob, argparse, subprocess, shlex
 #   计时、帧号映射。留在本文件里的是室外真正独有的部分。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _common as _cm          # 设 CUR_STEP 用 —— 必须改模块上的属性, from-import 进来的是副本
-from _common import (LOCK, GpuLock, wait_gpu, sh, envcmd, stamp_path,
+import sched                   # pipeline/sched.py(不是标准库那个): 按依赖表并行跑步骤
+from _common import (LOCK, GpuSlot, wait_gpu, sh, envcmd, stamp_path,
                      timing as _timing, resolve_cfg as _resolve_cfg,
                      write_frame_map, load_frame_map)
 import people_decisions           # 挑人闸的决策文件 + BODY_RUN 自动指向, 室内外共用
@@ -1253,6 +1254,26 @@ def do_check(c):
     print(f"\n{'全部就绪' if not bad else f'{bad} 处需要注意'}")
 
 
+def _parallel(g, c, names):
+    """一段里能同时跑的步骤同时跑: 每个步骤起一个子进程(--only <步骤> --child), 谁的依赖满足了谁开始。
+    吃显存的步骤在子进程里自己领卡(GpuSlot)。规则和理由见 sched.py。"""
+    sched.check_graph([s[0] for s in STEPS], DEPS)
+    tsv = f"{c.LOG}/timing.tsv"
+    if not os.path.exists(tsv):     # 表头先写好: 几个子进程同时发现"文件不存在"会各写一遍表头
+        with open(tsv, "w") as f:
+            f.write("步骤\t环境\t开始\t结束\t耗时秒\t等GPU秒\t结果\n")
+    me = os.path.abspath(__file__)
+    rc = sched.run_children(
+        names, DEPS,
+        lambda k: [sys.executable, "-u", me, "--scene", g.scene, "--run", g.run, "--only", k, "--child"],
+        c.LOG, max_parallel=8, env=dict(os.environ, RUN_DIR=c.R1))
+    bad = [k for k in names if rc.get(k, 0) != 0]
+    if bad:
+        left = [k for k in names if k not in rc]
+        raise SystemExit(f"[失败] 这些步骤失败: {bad}" + (f"; 没轮到跑的: {left}" if left else ""))
+    print("[全部完成]")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1270,6 +1291,7 @@ def main():
     ap.add_argument("--check", action="store_true", help="不跑, 只看产物在不在/有没有过期")
     ap.add_argument("--dump-deps", action="store_true",
                     help="把步骤表/依赖表/吃显存的步骤打成一行 JSON(调度自检和测试用)")
+    ap.add_argument("--child", action="store_true", help=argparse.SUPPRESS)   # sched.run_children 起的子进程
     g = ap.parse_args()
 
     keys = [s[0] for s in STEPS]
@@ -1301,10 +1323,14 @@ def main():
     c = Ctx(g.scene, g.run)
     if g.check: return do_check(c)
     os.makedirs(c.LOG, exist_ok=True)
-    print(f"场景 {c.scene}  轮次 {c.run}")
-    print(f"帧   {c.FR}")
-    print(f"结果 {c.R1}")
-    print(f"步骤 {' -> '.join(s[0] for s in sel)}" + ("   [干跑]" if g.dry_run else "") + "\n")
+    os.environ.setdefault("RUN_DIR", c.R1)      # 领卡的名额和"谁在用哪张卡"都记在本轮目录里, 子进程也要知道
+    if not g.child:
+        print(f"场景 {c.scene}  轮次 {c.run}")
+        print(f"帧   {c.FR}")
+        print(f"结果 {c.R1}")
+        print(f"步骤 {' -> '.join(s[0] for s in sel)}" + ("   [干跑]" if g.dry_run else "") + "\n")
+    if len(sel) > 1 and _cm.parallel_on() and not g.dry_run:
+        return _parallel(g, c, [s[0] for s in sel])
     for k, e, d, fn in sel:
         t = time.time()
         for lg in glob.glob(f"{c.LOG}/*.log"): pass
@@ -1316,8 +1342,8 @@ def main():
         t_run, ok = t, "失败"
         try:
             if k in GPU_STEPS and not g.dry_run:
-                with GpuLock():
-                    t_run = time.time()          # 等 GPU 锁的时间单独记, 不算进这一步的耗时
+                with GpuSlot(k):
+                    t_run = time.time()          # 等卡的时间单独记, 不算进这一步的耗时
                     fn(c, g.dry_run)
             else:
                 fn(c, g.dry_run)
@@ -1327,7 +1353,8 @@ def main():
             if not g.dry_run: _timing(c, k, e, t, t_run, ok)
         if not g.dry_run: open(stamp_path(c, k), "w").write(time.strftime("%F %T"))
         print(f"   {time.time()-t:.1f}s\n", flush=True)
-    print("[全部完成]")
+    if not g.child:
+        print("[全部完成]")
 
 if __name__ == "__main__":
     main()

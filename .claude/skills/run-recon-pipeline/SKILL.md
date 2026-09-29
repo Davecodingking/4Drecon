@@ -184,11 +184,15 @@ $PY $D --scene cyberpunk --indoor --status
 - **网页能开跑了**:`gate_ui.py` 的 `/new`(新建一轮)和 `/run`(本轮页:配置、地基图、挑人、
   Start/Continue)。开跑只通过 `tools/drive_go.sh`(后台 tmux,会话名 `run_<场景>_<轮次>`),
   同一轮在跑就拒绝。页面在 `tools/run_page.py`,逻辑在 `tools/run_ctl.py`。
-- **多卡并行**:GPU 锁是**每张卡一把**(`_common.lock_path()`,`/tmp/outdoor_pipeline_gpu<卡号>.lock`,
-  shell 的 `gpulock.sh` 同一规则)。`drive_go.sh` 没拿到 `CUDA_VISIBLE_DEVICES` 就自动挑一张空卡
-  (`run_ctl.pick_gpu()`:没有别的驱动在用、已用显存 < 2GB 的里面卡号最小的),网页开跑也走这条;
-  想钉某张卡就 `CUDA_VISIBLE_DEVICES=3 tools/drive_go.sh <场景> <轮次>`。所以不同场景可以同时开跑、各占一张卡。
-  本轮页状态条会显示这一轮在哪张卡上。
+- **并行和卡(2026-09-29)**:一段里互不依赖的步骤同时跑,每个吃显存的任务开始时自己领一张空卡、跑完还
+  (`_common.GpuSlot`;依据是各流水线的 `DEPS`,调度在 `pipeline/sched.py`)。GPU 锁还是**每张卡一把**
+  (`/tmp/outdoor_pipeline_gpu<卡号>.lock`,shell 的 `gpulock.sh` 同一规则)。
+  - `MAX_GPUS`(默认 8):一轮最多同时用几张卡。同事一起用时设成 3。
+  - `GPU_POOL`(默认全部):可以用哪些卡,例如 `GPU_POOL=0,1,2,3`。
+  - `PARALLEL=0`:退回一步一步跑。
+  - 想钉某张卡:`CUDA_VISIBLE_DEVICES=3 tools/drive_go.sh <场景> <轮次>`,这一轮就只用 3 号卡。
+  - 谁在用哪张卡:`<本轮>/logs/.gpu_<卡号>.json`;正在跑哪几步:`<本轮>/logs/.running_<步骤>`。
+  - 这几个环境变量要在调 `drive_go.sh` 时给,它会带进 tmux 里的驱动。
 
 ## Gotchas
 

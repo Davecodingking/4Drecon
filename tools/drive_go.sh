@@ -32,18 +32,15 @@ LOG=$R1/logs/drive_$(date +%m%d_%H%M%S).log
 #   同一场景开第二轮会把第一轮正在跑的驱动杀掉(上面的 pgrep 只查了这一轮)。
 S="run_${SC}_${RUN}"
 tmux kill-session -t "$S" 2>/dev/null || true
-# ★ 挑卡: 调用方没给 CUDA_VISIBLE_DEVICES 就挑一张空的(没有别的驱动在用、没人占着显存),
-#   每张卡一把 GPU 锁, 这样各轮次才真的并行。给了就照用(想钉某张卡: CUDA_VISIBLE_DEVICES=3 drive_go.sh ...)
-if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
-  CUDA_VISIBLE_DEVICES=$($PY -c "import sys; sys.path.insert(0, '$HERE'); import run_ctl; print(run_ctl.pick_gpu())") \
-    || { echo "挑不到空闲的卡, 没开跑"; exit 1; }
-  export CUDA_VISIBLE_DEVICES CUDA_DEVICE_ORDER=PCI_BUS_ID
-fi
-echo "用 GPU $CUDA_VISIBLE_DEVICES"
-# ★ GPU 选择显式带进去: tmux 会话继承的是 tmux 服务端的环境, 不是调这个脚本的人的 ——
-#   不带的话会落到默认的 0 号卡(见 _common.wait_gpu 的注释)
-GPU=""
-for v in CUDA_VISIBLE_DEVICES CUDA_DEVICE_ORDER; do [ -n "${!v:-}" ] && GPU="$GPU $v=${!v}"; done
+# ★ 2026-09-29 不在这里挑卡了: 每个吃显存的任务开始时自己领一张空卡(_common.GpuSlot), 一轮里能同时用好几张。
+#   想钉某张卡照旧: CUDA_VISIBLE_DEVICES=3 drive_go.sh ... —— 这一轮就只用 3 号卡。
+# ★ 环境变量显式带进去: tmux 会话继承的是 tmux 服务端的环境, 不是调这个脚本的人的。
+#   没钉卡时要把 CUDA_VISIBLE_DEVICES 明确去掉 —— 服务端的环境里可能留着以前的卡号, 留着就等于钉死了。
+GPU="-u CUDA_VISIBLE_DEVICES"
+[ -n "${CUDA_VISIBLE_DEVICES:-}" ] && GPU="CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+GPU="$GPU CUDA_DEVICE_ORDER=PCI_BUS_ID"
+for v in PARALLEL MAX_GPUS GPU_POOL; do [ -n "${!v:-}" ] && GPU="$GPU $v=${!v}"; done
+echo "卡: ${CUDA_VISIBLE_DEVICES:-每个任务自己领}  ${PARALLEL:+PARALLEL=$PARALLEL }${MAX_GPUS:+MAX_GPUS=$MAX_GPUS }${GPU_POOL:+GPU_POOL=$GPU_POOL}"
 tmux new-session -d -s "$S" \
   "{ echo \"[开始] \$(date '+%F %T')\"; env $GPU $PY -u $HOME/sam3d/.claude/skills/run-recon-pipeline/drive.py --scene $SC --run $RUN $IN --go; echo \"[结束] \$(date '+%F %T') 退出码 \$?\"; } > $LOG 2>&1"
 echo "已继续: $SC/$RUN  日志 $LOG"
