@@ -72,6 +72,96 @@ def test_indoor_shell_waits_for_recall_merge():
     assert "recall_merge" in d["deps"]["shell"], d["deps"]["shell"]
 
 
+class _Fake:
+    """假步骤: 跑 secs 秒, 然后以 rc 退出。记下起止时刻。"""
+    log = []
+
+    def __init__(self, name, secs=0.3, rc=0):
+        self.name, self.t0, self.t1, self.rc = name, time.time(), time.time() + secs, rc
+
+    def poll(self):
+        if time.time() < self.t1:
+            return None
+        if self not in _Fake.log:
+            _Fake.log.append(self)
+        return self.rc
+
+
+def _run(sel, deps=DEPS, fail=(), **kw):
+    _Fake.log = []
+    started = []
+    def launch(k):
+        started.append(k)
+        return _Fake(k, rc=1 if k in fail else 0)
+    rc = sched.run_graph(sel, deps, launch, poll=0.02, **kw)
+    return rc, started, {f.name: (f.t0, f.t1) for f in _Fake.log}
+
+
+def test_independent_steps_overlap():
+    """vlm 和 da3 互不依赖: 同时跑。up 等 da3, track 等 vlm。"""
+    rc, started, t = _run(["vlm", "da3", "up", "track"])
+    assert set(rc) == {"vlm", "da3", "up", "track"} and not any(rc.values()), rc
+    assert t["vlm"][0] < t["da3"][1] and t["da3"][0] < t["vlm"][1], "vlm 和 da3 应该有重叠"
+    assert t["up"][0] >= t["da3"][1] and t["track"][0] >= t["vlm"][1]
+
+
+def test_max_parallel_one_is_the_old_order():
+    rc, started, t = _run(["vlm", "da3", "up", "track"], max_parallel=1)
+    assert started == ["vlm", "da3", "up", "track"], started
+    assert t["da3"][0] >= t["vlm"][1] and t["up"][0] >= t["da3"][1] and t["track"][0] >= t["up"][1]
+
+
+def test_waits_through_unselected_steps():
+    """决策落地后重跑的是 ...,boxes,solo, 中间隔着没选的 scale: solo 仍然要等 boxes。"""
+    rc, started, t = _run(["boxes", "solo"])
+    assert t["solo"][0] >= t["boxes"][1], t
+
+
+def test_failure_stops_new_steps_but_not_running_ones():
+    rc, started, t = _run(["vlm", "da3", "up", "track"], fail=("vlm",))
+    assert rc["vlm"] == 1 and rc["da3"] == 0, rc            # da3 已经在跑, 让它跑完
+    assert "up" not in started and "track" not in started, started
+
+
+def test_steps_without_deps_entry_just_run():
+    rc, started, t = _run(["frames", "vlm"], deps={})
+    assert set(rc) == {"frames", "vlm"}
+
+
+def test_run_children_blocks_and_markers():
+    """子进程的输出整块写出, 不穿插; 在跑的步骤有 .running_<步骤>, 跑完删掉。"""
+    import io
+    with tempfile.TemporaryDirectory() as T:
+        seen = {}
+        def cmd(k):
+            code = (f"import time, os; print('== {k}  [env]  说明', flush=True); time.sleep(0.4); "
+                    f"print('    $ 命令 {k}'); print('   0.4s')")
+            return [sys.executable, "-c", code]
+        out = io.StringIO()
+        import threading
+        def peek():
+            time.sleep(0.2); seen["mid"] = sorted(f for f in os.listdir(T) if f.startswith(".running_"))
+        th = threading.Thread(target=peek); th.start()
+        rc = sched.run_children(["vlm", "da3"], DEPS, cmd, T, out=out)
+        th.join()
+        assert rc == {"vlm": 0, "da3": 0}, rc
+        assert seen["mid"] == [".running_da3", ".running_vlm"], seen
+        assert not [f for f in os.listdir(T) if f.startswith(".running_") or f.startswith(".out_")], os.listdir(T)
+        txt = out.getvalue()
+        assert "[并行] 开始 vlm" in txt and "[并行] 开始 da3" in txt
+        for k in ("vlm", "da3"):                             # 每个步骤的三行连在一起
+            assert f"== {k}  [env]  说明\n    $ 命令 {k}\n   0.4s\n" in txt, txt
+
+
+def test_run_children_reports_failure():
+    import io
+    with tempfile.TemporaryDirectory() as T:
+        out = io.StringIO()
+        rc = sched.run_children(["vlm"], {}, lambda k: [sys.executable, "-c", "import sys; print('坏了'); sys.exit(3)"],
+                                T, out=out)
+        assert rc == {"vlm": 3} and "[失败] 步骤 vlm 退出码 3" in out.getvalue() and "坏了" in out.getvalue()
+
+
 if __name__ == "__main__":
     for name, t in list(globals().items()):
         if name.startswith("test_") and callable(t):
