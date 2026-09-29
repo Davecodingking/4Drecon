@@ -23,9 +23,13 @@ import fcntl, json, os, shlex, subprocess, time
 # ★ 2026-09-24 从"整台机器一把锁"改成"每张卡一把": 8x3090 上各轮次钉在不同的卡上
 #   (drive_go.sh 开跑时挑空闲的卡), 锁只该挡同一张卡上的人。卡号取 CUDA_VISIBLE_DEVICES 的第一个
 #   (torch 的 cuda:0), 不设就是 0 —— 和 wait_gpu() 看的是同一张卡。
+def lock_path_of(dev):
+    return f"/tmp/outdoor_pipeline_gpu{dev}.lock"
+
+
 def lock_path():
     dev = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip() or "0"
-    return f"/tmp/outdoor_pipeline_gpu{dev}.lock"
+    return lock_path_of(dev)
 
 
 LOCK = lock_path()      # 老的 import 名; 进程的卡在启动时就定了, 算一次就够
@@ -92,6 +96,181 @@ def wait_gpu(need_mb, dry=False, timeout=10800):
         print(f"    别的活占着 {others}MB, 空闲 {total-used}MB / 需要 {need_mb}MB, "
               f"等 30s (已等 {(time.time()-t0)/60:.0f}min)", flush=True)
         time.sleep(30)
+
+
+# ==================================================================== 领卡(2026-09-29)
+# ★ 以前一轮开跑时 drive_go.sh 挑一张卡, 整轮所有步骤都钉在这张卡上, 另外 7 张闲着。
+#   现在每个吃显存的任务开始时领一张空卡, 跑完还 —— 同一轮里几个步骤可以各用一张同时跑(见 sched.py)。
+# ★ 每张卡还是那一把锁, 文件名不变(lock_path_of)。旧方式起的轮次、gpulock.sh 和这里互相认得。
+MAX_GPUS = 8          # 一轮最多同时用几张卡(环境变量 MAX_GPUS 可改)。现在一个人用 8 张; 同事一起用时改成 3
+FOREIGN_MB = 2000     # 卡上别人的进程占显存超过这么多 = 这张卡有人在用(和 wait_gpu 同一个数)
+SLOT_POLL = 5         # 秒: 没领到卡, 隔多久再找一遍
+SLOT_TIMEOUT = 10800  # 秒: 排这么久还领不到就报失败(和 wait_gpu 一样 3 小时)
+
+
+def parallel_on():
+    """PARALLEL=0 = 和以前完全一样一步一步跑。出问题时用它退回去。"""
+    return os.environ.get("PARALLEL", "1") != "0"
+
+
+def max_gpus():
+    return max(1, int(os.environ.get("MAX_GPUS", MAX_GPUS)))
+
+
+def _smi(query, what="gpu"):
+    r = subprocess.run(["nvidia-smi", f"--query-{what}={query}", "--format=csv,noheader,nounits"],
+                       capture_output=True, text=True)
+    return [[x.strip() for x in l.split(",")] for l in r.stdout.strip().splitlines() if l.strip()]
+
+
+def gpu_pool():
+    """可以用哪些卡。GPU_POOL 说了算; 没给但钉了 CUDA_VISIBLE_DEVICES(想钉某张卡: CUDA_VISIBLE_DEVICES=3
+    drive_go.sh ...)就只用钉的; 都没给 = 机器上全部的卡。"""
+    p = os.environ.get("GPU_POOL", "").strip() or os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if p:
+        return [x.strip() for x in p.split(",") if x.strip()]
+    return [r[0] for r in _smi("index")]
+
+
+def card_busy(card, need_mb=0):
+    """这张卡现在不能用: 有别人的进程占着显存(超过 FOREIGN_MB), 或者余量不够 need_mb。
+    ★ 只看瞬时余量不够, 理由见 wait_gpu: 别人的活有空档期, 骗得过余量检查。"""
+    row = next((r for r in _smi("index,uuid,memory.used,memory.total") if r[0] == str(card)), None)
+    if row is None:
+        return True
+    me = os.getpid()
+    others = sum(int(mb) for u, pid, mb in _smi("gpu_uuid,pid,used_memory", "compute-apps")
+                 if u == row[1] and int(pid) != me and int(mb) > FOREIGN_MB)
+    return bool(others) or int(row[3]) - int(row[2]) < need_mb
+
+
+def _try_lock(path):
+    fh = open(path, "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fh
+    except OSError:
+        fh.close()
+        return None
+
+
+def _unlock(fh):
+    if fh not in (None, True):
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+
+
+def _take_quota(run_dir):
+    """本轮的名额: <本轮>/logs/.gpu_quota_<i>.lock 里拿到任意一把。几个子进程共用一轮的名额,
+    所以是文件锁不是计数器。没有本轮目录(单跑一个脚本)就不限, 返回 True。满了返回 None。"""
+    if not run_dir:
+        return True
+    os.makedirs(f"{run_dir}/logs", exist_ok=True)
+    for i in range(max_gpus()):
+        fh = _try_lock(f"{run_dir}/logs/.gpu_quota_{i}.lock")
+        if fh:
+            return fh
+    return None
+
+
+def _take_card(pool, busy, need_mb, avoid=()):
+    """avoid: 上次在这张卡上失败了, 有别的就先用别的。"""
+    for card in [c for c in pool if c not in avoid] + [c for c in pool if c in avoid]:
+        fh = _try_lock(lock_path_of(card))
+        if not fh:
+            continue
+        if busy(card, need_mb):
+            _unlock(fh)
+            continue
+        return card, fh
+    return None
+
+
+def gpus_free_now(need_mb=0, run_dir=None, pool=None, busy=None):
+    """现在马上能领到几张卡: 空卡数和本轮剩余名额里小的那个。只看一眼, 不占。拆分时用它定拆几份。"""
+    run_dir = run_dir if run_dir is not None else os.environ.get("RUN_DIR") or None
+    pool, busy = (gpu_pool() if pool is None else pool), busy or card_busy
+    held, cards = [], 0
+    try:
+        for card in pool:
+            fh = _try_lock(lock_path_of(card))
+            if fh:
+                held.append(fh)
+                cards += 0 if busy(card, need_mb) else 1
+        if not run_dir:
+            return cards
+        os.makedirs(f"{run_dir}/logs", exist_ok=True)
+        quota = 0
+        for i in range(max_gpus()):
+            fh = _try_lock(f"{run_dir}/logs/.gpu_quota_{i}.lock")
+            if fh:
+                held.append(fh); quota += 1
+        return min(cards, quota)
+    finally:
+        for fh in held:
+            _unlock(fh)
+
+
+class GpuSlot:
+    """领一张空卡, 用完还。with GpuSlot("track") as s: ... s.card 是卡号。
+    set_env=True: 把本进程的 CUDA_VISIBLE_DEVICES 设成这张卡(之后起的命令都落在它上面), 出来时恢复。
+    一个进程里开几个线程各领一张的(拆分)用 set_env=False, 自己把卡号写进命令的环境变量。"""
+
+    def __init__(self, what="", need_mb=0, run_dir=None, pool=None, busy=None, set_env=True, avoid=(),
+                 poll=SLOT_POLL, timeout=SLOT_TIMEOUT):
+        self.what, self.need_mb, self.set_env, self.avoid = what, need_mb, set_env, tuple(avoid)
+        self.run_dir = run_dir if run_dir is not None else os.environ.get("RUN_DIR") or None
+        self.pool, self.busy, self.poll, self.timeout = pool, busy or card_busy, poll, timeout
+        self.card = self.waited = self._fh = self._quota = self._old = self._mark = None
+
+    def __enter__(self):
+        t0, said = time.time(), False
+        while True:
+            pool = gpu_pool() if self.pool is None else self.pool
+            q = _take_quota(self.run_dir)
+            got = _take_card(pool, self.busy, self.need_mb, self.avoid) if q else None
+            if got:
+                (self.card, self._fh), self._quota = got, q
+                break
+            _unlock(q)
+            if time.time() - t0 > self.timeout:
+                raise SystemExit(f"[失败] {self.what or '这一步'} 排了 {self.timeout / 60:.0f}min 队还是领不到卡 "
+                                 f"(可用的卡 {pool}, 本轮最多 {max_gpus()} 张)")
+            if not said:
+                print(f"    [等待] {self.what or '这一步'}: 没有空卡, 或本轮 {max_gpus()} 张的名额用满了, 排队中...",
+                      flush=True)
+                said = True
+            time.sleep(self.poll)
+        self.waited = time.time() - t0
+        if self.set_env:
+            self._old = {k: os.environ.get(k) for k in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER")}
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(self.card)
+            os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # nvidia-smi 的编号才和 CUDA 一致
+        if self.run_dir:
+            # 谁在用哪张卡: 网页和看板读这个文件。进程被杀的话文件会留下, 读的人要核对 pid 还在不在
+            self._mark = f"{self.run_dir}/logs/.gpu_{self.card}.json"
+            tmp = f"{self._mark}.{os.getpid()}.tmp"
+            json.dump({"卡": str(self.card), "步骤": self.what, "pid": os.getpid(),
+                       "开始": time.strftime("%F %T")}, open(tmp, "w"), ensure_ascii=False)
+            os.replace(tmp, self._mark)
+        print(f"    [卡] {self.what or '这一步'} 用 GPU {self.card}"
+              + (f" (等了 {self.waited:.0f}s)" if self.waited >= 1 else ""), flush=True)
+        return self
+
+    def __exit__(self, *a):
+        if self._mark:
+            try:
+                os.remove(self._mark)
+            except OSError:
+                pass
+        if self._old is not None:
+            for k, v in self._old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        _unlock(self._fh)
+        _unlock(self._quota)
 
 
 # ==================================================================== 跑命令
