@@ -187,6 +187,65 @@ def test_new_run_refuses_tag_collision():
             raise AssertionError("标签撞了应该拒绝")
         run_ctl.new_run("outdoor", "abcy", "r2", people="0", recall="0")     # 轮次不同, 标签不同, 可以
 
+def _marker(R1, step=None, card=None, what=None, pid=None):
+    os.makedirs(f"{R1}/logs", exist_ok=True)
+    pid = os.getpid() if pid is None else pid
+    if step:
+        open(f"{R1}/logs/.running_{step}", "w").write(str(pid))
+    if card:
+        json.dump({"卡": card, "步骤": what, "pid": pid, "开始": "x"}, open(f"{R1}/logs/.gpu_{card}.json", "w"))
+
+
+def _dead_pid():
+    import subprocess, sys
+    p = subprocess.Popen([sys.executable, "-c", "pass"]); p.wait()
+    return p.pid
+
+
+def test_several_steps_running_at_once():
+    """并行之后一段里可以有好几步同时在跑, 各用各的卡。"""
+    with tempfile.TemporaryDirectory() as T:
+        _sandbox(T)
+        R1 = run_ctl.new_run("outdoor", "soccer", "r1", people="1", recall="0")
+        run_ctl.running = lambda scene, run: True               # 先建轮次再说它在跑: 在跑的轮次 go() 会拒绝
+        _state(R1, 2, False)
+        open(f"{R1}/logs/drive_0929_100000.log", "w").write("[开始] 2026-09-29 10:00:00\n[并行] 开始 gen\n")
+        for step, card, what in (("gen", "0", "gen"), ("vlm_sizes", "1", "vlm_sizes"), ("people_mesh", "3", "mesh/p0")):
+            _marker(R1, step, card, what)
+        _marker(R1, card="2", what="mesh/p1")
+        s = run_ctl.state("outdoor", "soccer", "r1")
+        assert s["GPU"] == "0,1,2,3", s["GPU"]
+        assert s["任务"] == [{"卡": "0", "步骤": "gen"}, {"卡": "1", "步骤": "vlm_sizes"},
+                             {"卡": "2", "步骤": "mesh/p1"}, {"卡": "3", "步骤": "mesh/p0"}], s["任务"]
+        rows = {r["步骤"]: r["状态"] for r in s["段列表"][2]["步骤"]}
+        assert [k for k, v in rows.items() if v == "running"] == ["gen", "vlm_sizes", "people_mesh"], rows
+        assert rows["scale"] == "pending"
+
+
+def test_stale_markers_are_ignored():
+    """进程被杀的时候来不及删标记。进程已经不在的标记不算数, 不然网页一直显示"在跑"。"""
+    with tempfile.TemporaryDirectory() as T:
+        _sandbox(T)
+        R1 = run_ctl.new_run("outdoor", "soccer", "r1", people="1", recall="0")
+        _marker(R1, "gen", "0", "gen", pid=_dead_pid())
+        assert run_ctl.running_steps(R1) == [] and run_ctl.gpu_tasks(R1) == []
+        open(f"{R1}/logs/.gpu_5.json", "w").write("{坏的")                # 写到一半的文件也不能让网页崩
+        assert run_ctl.gpu_tasks(R1) == []
+
+
+def test_old_style_run_still_shows_its_step():
+    """PARALLEL=0 或者老轮次: 没有标记文件, 照旧看驱动日志里最后出现的步骤。"""
+    with tempfile.TemporaryDirectory() as T:
+        _sandbox(T)
+        R1 = run_ctl.new_run("outdoor", "soccer", "r1", people="1", recall="0")
+        run_ctl.running = lambda scene, run: True
+        _state(R1, 0, False)
+        open(f"{R1}/logs/drive_0929_100000.log", "w").write("[开始] 2026-09-29 10:00:00\n== vlm  [trellis2]  x\n   3.0s\n== da3  [spatiallm]  y\n")
+        s = run_ctl.state("outdoor", "soccer", "r1")
+        rows = {r["步骤"]: r["状态"] for r in s["段列表"][0]["步骤"]}
+        assert rows["da3"] == "running" and s["GPU"] is None and s["任务"] == [], (rows, s["GPU"])
+
+
 if __name__ == "__main__":
     for name, t in list(globals().items()):
         if name.startswith("test_") and callable(t):

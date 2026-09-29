@@ -130,7 +130,7 @@ def drive_log(LOG):
 
 def parse_drive(p):
     """驱动日志: 起止时间、跑过的步骤(含秒数)、正在跑的步骤、最后一道闸。"""
-    r = dict(start=None, end=None, steps=[], running=None, gate=None, fail=None)
+    r = dict(start=None, end=None, steps=[], running=None, running_all=[], gate=None, fail=None)
     if not p:
         return r
     txt = tail_bytes(p).decode("utf-8", "ignore")
@@ -139,8 +139,18 @@ def parse_drive(p):
     m = re.search(r"\[结束\] (\S+ \S+) 退出码 (\d+)", txt)
     if m:
         r["end"] = (m.group(1), int(m.group(2)))
-    cur = None
+    cur, started = None, []
     for ln in txt.splitlines():
+        p = re.match(r"^\[并行\] 开始 (\S+)", ln)
+        if p:                                   # 并行: 步骤启动时只有这一行, 它的输出跑完才整块写进来
+            started.append(p.group(1))
+            continue
+        f = re.match(r"^\[失败\] 步骤 (\S+) 退出码", ln)
+        if f:                                   # 失败的步骤没有结尾那行秒数: 在这里收尾, 不然它一直算"在跑"
+            if f.group(1) in started:
+                started.remove(f.group(1))
+            if cur == f.group(1):
+                cur = None
         s = re.match(r"^== (\S+)\s+\[", ln)
         if s:
             cur = s.group(1)
@@ -148,6 +158,8 @@ def parse_drive(p):
         d = re.match(r"^\s+([\d.]+)s$", ln)
         if d and cur:
             r["steps"].append((cur, float(d.group(1))))
+            if cur in started:
+                started.remove(cur)
             cur = None
             continue
         g = re.search(r"闸 (\d+)/(\d+) — (\S+)", ln)
@@ -155,7 +167,8 @@ def parse_drive(p):
             r["gate"] = (int(g.group(1)), int(g.group(2)), g.group(3))
         if "[失败]" in ln or "Traceback" in ln:
             r["fail"] = ln.strip()[:160]
-    r["running"] = cur
+    r["running_all"] = started + ([cur] if cur and cur not in started else [])
+    r["running"] = r["running_all"][0] if r["running_all"] else None
     return r
 
 
@@ -377,7 +390,7 @@ def render(a, R1, SEGS):
         tl = {t["step"]: t for t in T_run}
         for s in SEGS[show_seg][1]:
             t = tl.get(s)
-            if D["running"] == s:
+            if s in D["running_all"]:
                 sl = step_log(LOG, s)
                 t0 = sl[1] if sl else None
                 took = (now - dt.datetime.strptime(t0, "%Y-%m-%d %H:%M:%S")).total_seconds() if t0 else None

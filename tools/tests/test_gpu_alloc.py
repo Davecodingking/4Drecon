@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""每张卡一把 GPU 锁 + 开跑时自动挑空闲的卡。不起驱动, 假 drive_go.sh 只记环境变量。
+"""每张卡一把 GPU 锁(文件名规则) + 网页开跑不把自己的卡号传下去。领卡见 test_gpu_slot.py。
 跑: $PY tools/tests/test_gpu_alloc.py"""
 import fcntl, os, subprocess, sys, tempfile
 
@@ -48,32 +48,6 @@ def test_different_gpus_do_not_block():
         assert run("7") != 0            # 同一张卡: 被占着
     finally:
         fcntl.flock(held, fcntl.LOCK_UN); held.close()
-
-
-def test_pick_gpu():
-    cards = [("0", 50), ("1", 9000), ("2", 10), ("3", 30)]
-    assert run_ctl.pick_gpu(cards, busy={"0"}) == "2"             # 0 被别的轮次占着, 1 上有别人的显存
-    assert run_ctl.pick_gpu(cards, busy=set()) == "0"
-    try:
-        run_ctl.pick_gpu([("0", 50), ("1", 9000)], busy={"0"})
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("没有空卡要报错")
-
-
-def test_busy_gpus_reads_driver_process_env():
-    """在跑的驱动占哪张卡, 从它进程的环境变量里读(命令行起的轮次没有别的记录)。"""
-    fake = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)",
-                             "run-recon-pipeline/drive.py", "--scene", "_t_fake", "--run", "_t_r9"],
-                            env=dict(os.environ, CUDA_VISIBLE_DEVICES="3"))
-    try:
-        import time; time.sleep(0.5)
-        assert "3" in run_ctl.busy_gpus()
-        assert run_ctl.run_gpu("_t_fake", "_t_r9") == "3" and run_ctl.run_gpu("_t_fake", "nope") is None
-        assert run_ctl.pick_gpu([("3", 0), ("4", 0)]) == "4"
-    finally:
-        fake.kill(); fake.wait()
 
 
 def test_go_lets_drive_go_pick_the_gpu():

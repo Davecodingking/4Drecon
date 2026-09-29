@@ -311,9 +311,12 @@ function render(){
   const nx = S.下一步;
   let big, sub = '';
   if (S.在跑 && cur){
-    const r = cur.步骤.find(x => x.状态 === 'running');
+    // 并行之后一段里可以有好几步同时在跑, 各用各的卡
+    const rs = cur.步骤.filter(x => x.状态 === 'running');
     big = '正在跑第 ' + cur.段 + ' 段「' + cur.名 + '」' + (S.GPU ? ' · GPU ' + S.GPU : '');
-    sub = r ? '当前步骤 ' + r.步骤 + ' — ' + r.说明 + (cur.已用秒 != null ? ' · 已用 ' + dur(cur.已用秒) : '') : '';
+    sub = rs.length ? '当前步骤 ' + rs.map(x => x.步骤).join('、') + (rs.length === 1 ? ' — ' + rs[0].说明 : '') +
+          ((S.任务 || []).length ? ' · ' + S.任务.map(t => '卡 ' + t.卡 + ': ' + t.步骤).join(', ') : '') +
+          (cur.已用秒 != null ? ' · 已用 ' + dur(cur.已用秒) : '') : '';
   } else if (S.停在闸口){
     big = '停在第 ' + S.闸 + ' 道闸「' + cur.名 + '」: 看下面这一段的结果, 需要的话改决定, 再点继续';
   } else if (S.段 >= S.总段数){

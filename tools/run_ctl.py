@@ -85,59 +85,44 @@ def running(scene, run):
     return subprocess.run(["pgrep", "-f", pat], capture_output=True).returncode == 0
 
 
-# ---------------------------------------------------------------- 挑卡(2026-09-24)
-# 每张卡一把 GPU 锁(_common.lock_path), 各轮次钉在不同的卡上才能真并行。开跑时由 drive_go.sh
-# 调 pick_gpu() 挑一张: 没有别的驱动在用、也没有别人占着显存的那张里, 卡号最小的。
-FREE_MB = 2000          # 卡上已用显存超过这么多, 就当有别人在用(比如渲染农场的容器)
+# ---------------------------------------------------------------- 在跑什么、用哪张卡(2026-09-29)
+# 并行之后一段里可以有好几步同时在跑, 各自领了卡(见 pipeline/sched.py 和 _common.GpuSlot)。
+# 调度和领卡的时候各写一个标记文件, 这里只管读。
+# ★ 进程被杀(OOM / kill -9)的时候来不及删标记: 进程已经不在的标记不算数。
+def _alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True                     # 进程在, 只是不归我们管
+    except (OSError, ValueError):
+        return False
 
 
-def gpu_cards():
-    """[(卡号, 已用显存 MB)], nvidia-smi 的顺序(PCI 顺序, 跑的时候配 CUDA_DEVICE_ORDER=PCI_BUS_ID)。"""
-    r = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
-                       capture_output=True, text=True)
-    return [(a.strip(), int(b)) for a, b in (l.split(",") for l in r.stdout.strip().splitlines() if l.strip())]
-
-
-def _driver_procs():
-    """正在跑的驱动进程: {pid: (cmdline 参数表, 它的 CUDA_VISIBLE_DEVICES 第一个卡号)}。
-    ★ 只认 python 本身 —— tmux 里套的那层 bash 命令行里也有 drive.py, 但它的环境里没有卡号。"""
-    out = {}
-    r = subprocess.run(["pgrep", "-f", "run-recon-pipeline/drive.py"], capture_output=True, text=True)
-    for pid in r.stdout.split():
+def running_steps(R1):
+    """调度正在跑的步骤(logs/.running_<步骤>, 内容是子进程号)。"""
+    out = []
+    for p in sorted(glob.glob(f"{R1}/logs/.running_*")):
         try:
-            argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
-            env = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
+            pid = open(p).read().strip()
         except OSError:
             continue
-        if not os.path.basename(argv[0]).startswith(b"python"):
-            continue
-        cvd = next((e.split(b"=", 1)[1].decode() for e in env if e.startswith(b"CUDA_VISIBLE_DEVICES=")), "")
-        out[pid] = ([a.decode(errors="replace") for a in argv], cvd.split(",")[0].strip() or "0")
+        if _alive(pid):
+            out.append(os.path.basename(p)[len(".running_"):])
     return out
 
 
-def busy_gpus():
-    """正在跑的驱动各占哪张卡。看进程环境不看本轮配置: 命令行起的轮次没有记录, 进程环境才是真相。"""
-    return {g for _, g in _driver_procs().values()}
-
-
-def run_gpu(scene, run):
-    """这一轮的驱动在哪张卡上跑; 没在跑返回 None。"""
-    for argv, g in _driver_procs().values():
-        if "--scene" in argv and "--run" in argv and argv[argv.index("--scene") + 1] == scene \
-                and argv[argv.index("--run") + 1] == run:
-            return g
-    return None
-
-
-def pick_gpu(cards=None, busy=None):
-    """挑一张空卡。cards / busy 不给就现查(测试时注入)。一张都没有就抛 ValueError。"""
-    cards = gpu_cards() if cards is None else cards
-    busy = busy_gpus() if busy is None else busy
-    for idx, used in cards:
-        if idx not in busy and used < FREE_MB:
-            return idx
-    raise ValueError(f"没有空闲的卡: 在跑的驱动占着 {sorted(busy)}, 其余的卡已用显存都超过 {FREE_MB} MB")
+def gpu_tasks(R1):
+    """谁在用哪张卡: [{"卡": "0", "步骤": "track/w0"}], 按卡号排(logs/.gpu_<卡>.json)。"""
+    out = []
+    for p in glob.glob(f"{R1}/logs/.gpu_*.json"):
+        try:
+            d = json.load(open(p))
+            if _alive(d["pid"]):
+                out.append({"卡": str(d["卡"]), "步骤": d["步骤"]})
+        except (OSError, ValueError, KeyError):
+            continue                    # 正在写的、写坏的: 下一次刷新再看
+    return sorted(out, key=lambda t: (len(t["卡"]), t["卡"]))
 
 
 def _drive_state(R1):
@@ -177,12 +162,13 @@ def state(kind, scene, run):
     until = _common.EDITABLE_UNTIL
     total = len(_segments(kind))
     body = people_decisions.auto_dir(R1)
+    tasks = gpu_tasks(R1) if busy else []
     return {"场景": scene, "轮次": run, "类型": (rc or {}).get("类型", kind), "配置文件": rc is not None,
             "有人": people, "召回": recall, "手工人体": manual,
             "可改": {"PEOPLE": not busy and not manual and done <= until["PEOPLE"],
                      "RECALL": not busy and done <= until["RECALL"]},
             "段": seg, "停在闸口": stop, "闸": seg + 1 if stop else None, "已跑完": done, "总段数": total,
-            "在跑": busy, "GPU": run_gpu(scene, run) if busy else None,
+            "在跑": busy, "GPU": ",".join(t["卡"] for t in tasks) or None, "任务": tasks,
             "段列表": segments_view(kind, scene, run, seg, stop, busy, recall),
             "下一步": None if busy else next_action(kind, seg, stop, recall),
             "能继续": not busy and seg < total and os.path.isdir(R1),
@@ -326,10 +312,13 @@ def segments_view(kind, scene, run, seg, stop, busy, recall):
     / running / stopped(这一段开过头但没跑完, 多半失败了) / pending。"""
     R1 = r1_of(kind, scene, run)
     log, t0 = _latest_log(R1)
-    cur = None
-    if busy and log:
-        hits = re.findall(r"^== (\S+)  \[", open(log, errors="ignore").read(), re.M)
-        cur = hits[-1] if hits else None
+    # 在跑哪几步: 并行时看调度写的标记; 没有标记(PARALLEL=0 或老轮次)照旧看驱动日志里最后出现的那一步
+    curs = set()
+    if busy:
+        curs = set(running_steps(R1))
+        if not curs and log:
+            hits = re.findall(r"^== (\S+)  \[", open(log, errors="ignore").read(), re.M)
+            curs = set(hits[-1:])
     tm, desc, media = _timing(R1), _step_desc(kind), media_paths(kind, scene, run)
     out = []
     for i, (name, steps, check) in enumerate(_segments(kind)):
@@ -345,7 +334,7 @@ def segments_view(kind, scene, run, seg, stop, busy, recall):
             if st in ("done", "waiting"):
                 s_ = "done"
             elif st == "running":
-                s_ = "running" if k == cur else "done" if os.path.exists(stamp) and t0 and os.path.getmtime(stamp) >= t0 else "pending"
+                s_ = "running" if k in curs else "done" if os.path.exists(stamp) and t0 and os.path.getmtime(stamp) >= t0 else "pending"
             else:
                 s_ = "pending"
             rows.append({"步骤": k, "说明": desc.get(k, ""), "状态": s_,
@@ -404,7 +393,7 @@ def go(kind, scene, run):
     if not os.path.isdir(r1_of(kind, scene, run)):
         raise ValueError(f"没有这个轮次: {r1_of(kind, scene, run)}")
     # ★ 网页进程自己的 CUDA_VISIBLE_DEVICES 不传下去: 传了所有轮次都挤在那一张卡上。
-    #   不给卡号, drive_go.sh 就调 pick_gpu() 挑一张空的。
+    #   不给卡号, 每个任务开始时自己领一张空卡(_common.GpuSlot)。
     env = {k: v for k, v in os.environ.items() if k != "CUDA_VISIBLE_DEVICES"}
     r = subprocess.run(["bash", DRIVE_GO, scene, run] + (["--indoor"] if kind == "indoor" else []),
                        capture_output=True, text=True, timeout=60, env=env)
