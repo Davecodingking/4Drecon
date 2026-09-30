@@ -84,7 +84,7 @@ CPU_THREADS = 8       # 每条命令的 CPU 线程数上限(环境变量 CPU_THR
 
 
 def parallel_on():
-    """PARALLEL=0 = 和以前完全一样一步一步跑。出问题时用它退回去。"""
+    """PARALLEL=0 = 关掉并行调度, 一步一步跑(领卡还是每步现领; 限 CPU 线程数由 CPU_THREADS 管, 不归它管)。"""
     return os.environ.get("PARALLEL", "1") != "0"
 
 

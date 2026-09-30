@@ -189,7 +189,10 @@ $PY $D --scene cyberpunk --indoor --status
   (`/tmp/outdoor_pipeline_gpu<卡号>.lock`,shell 的 `gpulock.sh` 同一规则)。
   - `MAX_GPUS`(默认 8):一轮最多同时用几张卡。同事一起用时设成 3。
   - `GPU_POOL`(默认全部):可以用哪些卡,例如 `GPU_POOL=0,1,2,3`。
-  - `PARALLEL=0`:退回一步一步跑。
+  - `PARALLEL=0`:关掉并行调度,一步一步跑(只管调度;限线程另有开关)。
+  - `CPU_THREADS`(默认 8):每条命令的 CPU 线程数上限(OMP/MKL/OPENBLAS/NUMEXPR)。这台机器 255 个核,
+    不限的话每个进程开几百个线程空转,实测限了反而快。要退回不限:`CPU_THREADS=255`。
+  - `FANOUT=1`:打开步骤内部拆分(track 按词、出人网格按人)。默认关,因为实测拆分会改变结果。
   - 想钉某张卡:`CUDA_VISIBLE_DEVICES=3 tools/drive_go.sh <场景> <轮次>`,这一轮就只用 3 号卡。
   - 谁在用哪张卡:`<本轮>/logs/.gpu_<卡号>.json`;正在跑哪几步:`<本轮>/logs/.running_<步骤>`。
   - 这几个环境变量要在调 `drive_go.sh` 时给,它会带进 tmux 里的驱动。

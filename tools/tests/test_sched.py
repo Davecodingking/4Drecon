@@ -221,8 +221,8 @@ def test_drive_go_does_not_pin_a_card():
 
 def test_drive_go_passes_pin_and_switches():
     """想钉卡、想关并行、想改名额: 环境变量要带进 tmux 里的驱动。"""
-    cmd = _drive_go_cmd(CUDA_VISIBLE_DEVICES="3", PARALLEL="0", MAX_GPUS="3")
-    assert "env CUDA_VISIBLE_DEVICES=3 CUDA_DEVICE_ORDER=PCI_BUS_ID PARALLEL=0 MAX_GPUS=3 " in cmd, cmd
+    cmd = _drive_go_cmd(CUDA_VISIBLE_DEVICES="3", PARALLEL="0", MAX_GPUS="3", FANOUT="1", CPU_THREADS="16")
+    assert "env CUDA_VISIBLE_DEVICES=3 CUDA_DEVICE_ORDER=PCI_BUS_ID PARALLEL=0 MAX_GPUS=3 FANOUT=1 CPU_THREADS=16 " in cmd, cmd
 
 
 def test_indoor_child_mode_and_dry_run():

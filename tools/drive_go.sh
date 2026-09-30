@@ -39,8 +39,8 @@ tmux kill-session -t "$S" 2>/dev/null || true
 GPU="-u CUDA_VISIBLE_DEVICES"
 [ -n "${CUDA_VISIBLE_DEVICES:-}" ] && GPU="CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 GPU="$GPU CUDA_DEVICE_ORDER=PCI_BUS_ID"
-for v in PARALLEL MAX_GPUS GPU_POOL; do [ -n "${!v:-}" ] && GPU="$GPU $v=${!v}"; done
-echo "卡: ${CUDA_VISIBLE_DEVICES:-每个任务自己领}  ${PARALLEL:+PARALLEL=$PARALLEL }${MAX_GPUS:+MAX_GPUS=$MAX_GPUS }${GPU_POOL:+GPU_POOL=$GPU_POOL}"
+for v in PARALLEL MAX_GPUS GPU_POOL FANOUT CPU_THREADS; do [ -n "${!v:-}" ] && GPU="$GPU $v=${!v}"; done
+echo "卡: ${CUDA_VISIBLE_DEVICES:-每个任务自己领}  ${PARALLEL:+PARALLEL=$PARALLEL }${MAX_GPUS:+MAX_GPUS=$MAX_GPUS }${GPU_POOL:+GPU_POOL=$GPU_POOL }${FANOUT:+FANOUT=$FANOUT }${CPU_THREADS:+CPU_THREADS=$CPU_THREADS}"
 # ★ 退出码先存进 rc 再打印: 直接写 $? 取到的是它前面 $(date) 的退出码, 永远是 0(2026-09-29 以前就是这样)
 tmux new-session -d -s "$S" \
   "{ echo \"[开始] \$(date '+%F %T')\"; env $GPU $PY -u $HOME/sam3d/.claude/skills/run-recon-pipeline/drive.py --scene $SC --run $RUN $IN --go; rc=\$?; echo \"[结束] \$(date '+%F %T') 退出码 \$rc\"; } > $LOG 2>&1"

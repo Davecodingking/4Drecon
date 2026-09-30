@@ -1636,7 +1636,8 @@ def main():
             print(f"视频 {c.VID}")
         print(f"结果 {c.R1}")
         print(f"步骤 {' -> '.join(s[0] for s in sel)}" + ("   [干跑]" if g.dry_run else "") + "\n")
-    if len(sel) > 1 and _cm.parallel_on() and not g.dry_run:
+    # ★ 只在 --only 给了多个步骤时并行(驱动就是这么调的): --from/--to 会跨段, 跨段的步骤对没核对过读写冲突
+    if g.only and len(sel) > 1 and _cm.parallel_on() and not g.dry_run:
         return _parallel(g, c, [s[0] for s in sel])
     for k, e, d, fn in sel:
         t = time.time()
