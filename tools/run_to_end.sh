@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # 把一轮从头跑到最后一道闸, 闸口自动过(验证并行调度用, 不是日常用法 —— 日常是人在网页上看闸口)。
 #   tools/run_to_end.sh <场景> <轮次> [--indoor] [环境变量=值 ...]      例: tools/run_to_end.sh nfl1 r2 PARALLEL=0
-# 第 2 道闸按 DROP_WORDS 把词整词作废(默认是 nfl1 r1 当时作废的那五个), 其他闸不改决定。
+# 第 2 道闸: 给了 REF_APPLIED(参考轮次的 05_review_applied.json)和 REF_TAG(它的标签)就照抄那一轮落地的决定
+# (作废 / 逐实例 / 共用 / 单个不生成, 见 apply_ref_decisions.py); 没给就按 DROP_WORDS 把词整词作废
+# (默认是 nfl1 r1 当时作废的那五个)。其他闸不改决定。
 set -eu
 SC=$1; RUN=$2; shift 2
 KIND=outdoor; IN=""
@@ -25,7 +27,9 @@ while true; do
   echo "[$(( $(date +%s) - T0 ))s] 停在第 $((SEG + 1)) 道闸"
   grep -q "全部跑完" "$LOG" && break
   [ "$STOP" = 1 ] || { echo "★ 没停在闸口也没跑完, 看 $LOG"; exit 1; }
-  if [ "$SEG" = 1 ]; then
+  if [ "$SEG" = 1 ] && [ -n "${REF_APPLIED:-}" ]; then
+    $PY "$HERE/apply_ref_decisions.py" "$R1" "$REF_APPLIED" "$REF_TAG"
+  elif [ "$SEG" = 1 ]; then
     $PY - "$R1" "$DROP_WORDS" <<'EOF'
 import json, sys
 R1, words = sys.argv[1], set(sys.argv[2].split(","))

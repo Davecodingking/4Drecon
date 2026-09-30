@@ -4,7 +4,7 @@
 ★ 为什么有这个文件(2026-09-20)
   算法脚本早就共用了 —— indoor_pipeline.py 的 SCRIPTS 直接指向 data/outdoor/scripts,
   一边改另一边立刻跟上。但**驱动层**一直是复制粘贴的: _timing / resolve_cfg /
-  stamp_path 三个函数两边逐字相同, GpuLock 只差一句提示文字, envcmd 只差个默认值。
+  stamp_path 三个函数两边逐字相同, GPU 锁只差一句提示文字, envcmd 只差个默认值。
   复制粘贴的东西一定会漂移, 而且漂移的时候不报错 —— 显卡那两套"等 GPU"的机制
   就是这么分叉的(一边 flock 一边查 nvidia-smi, 结果谁也拦不住谁, 双双 OOM)。
   所以: 不该分歧的地方一律搬到这里, 两边 import。
@@ -30,32 +30,6 @@ def lock_path_of(dev):
 def lock_path():
     dev = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip() or "0"
     return lock_path_of(dev)
-
-
-LOCK = lock_path()      # 老的 import 名; 进程的卡在启动时就定了, 算一次就够
-
-
-class GpuLock:
-    """吃显存的步骤串行执行。不是调参数能解决的问题: 单份 SAM3D 驻留 20GB 出头,
-    32G 卡装不下两份。之前 beach 和 carpark 并行跑 gen, 两边同时被 CUDA OOM 杀掉,
-    而且日志一停就再没有新内容, 靠"看日志有没有更新"的监控反而永远静默。
-
-    和 wait_gpu() 是两层, 两层都要:
-      锁       管"我们自己的几条流水线之间" —— 对方即使还没吃上显存也得排队,
-               因为它可能正在加载模型, 这时候查显存是看不出来的
-      wait_gpu 管"流水线之外的第三方进程" —— 那些进程不会来拿这把锁, 只能靠查显存看见
-    """
-    def __enter__(self):
-        self.f = open(lock_path(), "a+")
-        try:
-            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            print("    [等待] 另一条流水线正在占用 GPU, 排队中...", flush=True)
-            fcntl.flock(self.f, fcntl.LOCK_EX)
-        return self
-
-    def __exit__(self, *a):
-        fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
 
 
 def wait_gpu(need_mb, dry=False, timeout=10800):

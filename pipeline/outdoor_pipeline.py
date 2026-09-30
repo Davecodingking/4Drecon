@@ -50,7 +50,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _common as _cm          # 设 CUR_STEP 用 —— 必须改模块上的属性, from-import 进来的是副本
 import sched                   # pipeline/sched.py(不是标准库那个): 按依赖表并行跑步骤
 import fanout                  # 步骤内部拆分: 同一个脚本起几份, 各用一张卡
-from _common import (LOCK, GpuSlot, wait_gpu, sh, envcmd, stamp_path,
+from _common import (GpuSlot, wait_gpu, sh, envcmd, stamp_path,
                      timing as _timing, resolve_cfg as _resolve_cfg,
                      write_frame_map, load_frame_map)
 import people_decisions           # 挑人闸的决策文件 + BODY_RUN 自动指向, 室内外共用

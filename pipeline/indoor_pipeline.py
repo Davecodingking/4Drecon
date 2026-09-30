@@ -75,7 +75,7 @@ import os, sys, json, glob, csv, argparse, subprocess, shlex, time
 #   sh 用偏函数固定住 GPUENV —— 室内所有命令都要带 CUDA_HOME 那一套, 室外不带。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import functools as _ft
-from _common import (LOCK, GpuSlot, wait_gpu, envcmd, stamp_path,
+from _common import (GpuSlot, wait_gpu, envcmd, stamp_path,
                      timing as _timing, resolve_cfg as _resolve_cfg,
                      write_frame_map, load_frame_map)
 import people_decisions           # 挑人闸的决策文件 + BODY_RUN 自动指向, 室内外共用

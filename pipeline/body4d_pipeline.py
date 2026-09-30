@@ -49,7 +49,7 @@ import argparse, glob, json, os, shlex, subprocess, sys, time
 # ★ 驱动层的公共件在 _common.py(见那个文件的文件头)。三条流水线共用同一把 GPU 锁、
 #   同一个跑命令/计时/配置解析的实现 —— 复制粘贴过的东西一定会漂移。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import (LOCK, GpuSlot, wait_gpu, sh, envcmd, stamp_path, parallel_on,
+from _common import (GpuSlot, wait_gpu, sh, envcmd, stamp_path, parallel_on,
                      timing as _timing, resolve_cfg as _resolve_cfg)
 import fanout                  # 步骤内部拆分: 同一个脚本起几份, 各用一张卡
 
