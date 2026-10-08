@@ -9,7 +9,7 @@ import fanout as F
 
 FREE = lambda card, need_mb=0: False
 KW = dict(pool=["t81", "t82", "t83"], busy=FREE, poll=0.05)
-os.environ["FANOUT"] = "1"      # 拆分默认是关的(见 test_split_is_off_by_default), 这里的测试测的是打开以后
+os.environ["FANOUT"] = "1"      # 出人网格按人拆 10-08 起默认开; 这里显式设上, 免得外面有人 FANOUT=0
 
 
 def test_split_balances_by_weight():
@@ -196,11 +196,12 @@ def test_fan_track_passes_extra_env_to_every_worker():
 
 
 def test_track_split_does_not_need_fanout_switch():
-    """FANOUT 只管出人网格按人拆(默认关, 会改结果)。track 按批拆结果不变, 不要这个开关也拆;
+    """FANOUT 只管出人网格按人拆(10-08 起默认开, FANOUT=0 关)。track 按批拆结果不变, 不看这个开关;
     一批装得下的词(默认 8 个一批)不拆。"""
     old = os.environ.pop("FANOUT")
     try:
-        assert F.on() is False
+        assert F.on() is True
+        os.environ["FANOUT"] = "0"; assert F.on() is False; os.environ.pop("FANOUT")
         T = tempfile.mkdtemp()
         json.dump({"vocab": ["helmet", "sign", "jersey"]}, open(f"{T}/01_vlm_vocab.json", "w"))
         F.fan_track(sys.executable, _fake_track(T), dict(R1=T, FR="x", EXTRA_WORDS="", MW_GROUP="1"), T,

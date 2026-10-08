@@ -48,6 +48,10 @@ def merge(run, trk, ids, parts, seconds=None):
     # 先清掉上一次留下的(上次挑的人可能更多), 再把各份的搬进来
     for d in PER_PERSON + ("rendered_frames", "masks"):
         shutil.rmtree(f"{run}/{d}", ignore_errors=True)
+    # ★ 搬之前先把各份的"已算好"标记撕掉: 搬到一半崩了, 标记还在的话下次会把搬空了的份当成算好的直接用
+    for p, _, _ in got:
+        if os.path.exists(f"{p}/part.json"):
+            os.remove(f"{p}/part.json")
     for p, rel, _ in got:
         for d in PER_PERSON:
             for o, l in rel.items():

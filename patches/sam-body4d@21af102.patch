@@ -1,9 +1,9 @@
 diff --git a/NOTES_5090.md b/NOTES_5090.md
 new file mode 100644
-index 0000000..9e1b720
+index 0000000..a7f11b2
 --- /dev/null
 +++ b/NOTES_5090.md
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,158 @@
 +# SAM-Body4D 在 RTX 5090 上的部署记录（2026-09-09）
 +
 +装在**独立的 `body4d` 环境**里：`source ~/sam3d/env_body4d.sh`。
@@ -86,6 +86,7 @@ index 0000000..9e1b720
 +| 5 | `models/sam_3d_body/notebook/utils.py` `save_mesh_results` | 2026-10-08 加: 模型的一手参数也存下来（`mhr_4d_individual/`），给骨骼动画用 |
 +| 6 | `scripts/offline_app.py` 取每帧结果 | 2026-10-08: `mask_outputs[frame_id-num_empth_ids]` 错，列表本来就是每帧一项；一批里有"一个人都没有"的帧时后面的网格错位。改成 `[frame_id]` |
 +| 7 | `models/sam_3d_body/notebook/utils.py` 两处 `process_frames(...)` + `meta_arch/sam3d_body.py` 体型锁定 | 2026-10-08: **所有人共用第一个人第一帧的体型**。模型按 `hid in range(num_human)` 记体型, 带遮罩这条路一次只送一个人, 每个人都是 hid=0。修法: 字典按 `obj_id` 分格(`setdefault(obj_id, {})`); 锁定时取这一批里有效帧的中位, 没有有效帧就先不锁(人不在的帧全是 NaN, 取 t=0 会把中途进画面的人锁成 NaN -> 整段空网格)。实测 nfl1: 修前 8 人身高全是 1.664 m, 修后 1.64~1.72 m |
++| 8 | `body4d_mesh_5090.py` 热身 | 2026-10-08: 进程里**第一次**调模型的结果和后面的不一样（office 人 4: 排第一算 vs 排第二算, 每帧顶点差 2 mm, 个别帧 3 cm; 参数和 buffer 都没变, 是 GPU 库第一次跑的路径不同）。正式算之前先用第一批帧算一遍扔掉, 这样不拆、按人拆、排第几都走同一条路 |
 +
 +**2 和 3 是同一个根源，也是最危险的一个：用位置序号冒充身份 ID。**
 +他们的流程里 id 永远是连续的 1..N 且从不中途消失，所以两者恰好等价。
@@ -281,10 +282,10 @@ index 0000000..5e59671
 +print(f"[覆盖] " + "  ".join(f"id{i}:{cov[i]}/{N}" for i in ids))
 diff --git a/body4d_mesh_5090.py b/body4d_mesh_5090.py
 new file mode 100644
-index 0000000..c0208e3
+index 0000000..509f094
 --- /dev/null
 +++ b/body4d_mesh_5090.py
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,206 @@
 +#!/usr/bin/env python
 +"""第二段: 拿盘上的 images/ + masks/ 出人体网格 (SAM 3D Body [+ Diffusion-VAS 补全])。
 +
@@ -456,6 +457,17 @@ index 0000000..c0208e3
 +    app.sam3_3d_body_model.fov_estimator = _SceneK()
 +    print(f"[焦距] 用场景相机: f = {_fy_rel:.4f} x 图高 (1080 高时 {_fy_rel * 1080:.0f}px), 不用 MoGe-2")
 +print(f"[载模型] {time.time()-t0:.0f}s  显存 {torch.cuda.memory_allocated()/2**30:.1f}G")
++
++# ★ 2026-10-08 热身: 这个进程里**第一次**调模型算出来的东西和后面的调用不一样(office 人 4 实测: 排第一算 vs 排第二算,
++#   每帧顶点差 2 mm, 个别帧 3 cm; 先用同样的输入算一遍扔掉, 再算就和排第二一样, 差 0.01 mm)。参数、buffer 都没变,
++#   是 GPU 库第一次跑那套算子走了另一条路。不热身的话"谁排第一"就影响结果: 不拆时 1 号是第一个, 按人拆开后
++#   每份的第一个人都是 —— 拆不拆结果就对不上。热身用第一批(batch 个)帧 + 第一个人, 形状和正式算的一样。
++_imgs = sorted(f"{RUN}/images/{f}" for f in os.listdir(f"{RUN}/images") if f.endswith(".jpg"))[:int(cfg.sam_3d_body.batch_size)]
++_msks = [f"{RUN}/masks/{os.path.basename(f)[:-4]}.png" for f in _imgs]
++_t = time.time()
++with torch.autocast("cuda", enabled=False):
++    _oa.process_image_with_mask(app.sam3_3d_body_model, _imgs, _msks, {}, {}, {}, {ids_run[0]: [1] * len(_imgs)})
++print(f"[热身] {time.time()-_t:.0f}s ({len(_imgs)} 帧, 人 {ids_run[0]}; 结果不用)", flush=True)
 +
 +t1 = time.time()
 +with torch.autocast("cuda", enabled=False):    # 照抄他们 inference() 的做法
