@@ -39,7 +39,7 @@ index e61969f..908bde6 100644
  
              # only 1 frames should be propagated
 diff --git a/models/sam_3d_body/notebook/utils.py b/models/sam_3d_body/notebook/utils.py
-index a552bea..ffb4360 100644
+index a552bea..c15cd51 100644
 --- a/models/sam_3d_body/notebook/utils.py
 +++ b/models/sam_3d_body/notebook/utils.py
 @@ -233,13 +233,36 @@ def save_mesh_results(
@@ -81,11 +81,68 @@ index a552bea..ffb4360 100644
  
  def display_results_grid(
      images: List[np.ndarray], titles: List[str], figsize_per_image: tuple = (6, 6)
+@@ -431,10 +454,13 @@ def process_image_with_mask(estimator, image_path: str, mask_path: str, idx_path
+             no_occ_kps_batch = None
+             _occ_kps_batch = None
+ 
++        # ★ 5090 patch (2026-10-08): 体型字典按人分格。模型里是按"这次调用里排第几个人"(hid)记的, 而这条路
++        #   一次只送一个人, 每个人都排第 0 —— 于是全部人共用第一个人第一帧的体型和骨骼缩放(nfl1 8 个人身高全是 1.664)。
++        #   他们自己的 bbox 路一次送所有人, hid 能区分人, 所以没踩到。这里给每个人一个自己的子字典。
+         if len(no_occ_image_batch) > 0:
+-            no_occ_outputs = estimator.process_frames(no_occ_image_batch, bboxes=no_occ_bbox_batch, masks=no_occ_mask_batch, id_batch=[[1] for idb in range(len(no_occ_image_batch))], idx_path={}, idx_dict={}, mhr_shape_scale_dict=mhr_shape_scale_dict, kps_batch=no_occ_kps_batch, occ_dict=None, use_mask=True, kps_id=kps_id, cam_int=cam_int)
++            no_occ_outputs = estimator.process_frames(no_occ_image_batch, bboxes=no_occ_bbox_batch, masks=no_occ_mask_batch, id_batch=[[1] for idb in range(len(no_occ_image_batch))], idx_path={}, idx_dict={}, mhr_shape_scale_dict=mhr_shape_scale_dict.setdefault(obj_id, {}), kps_batch=no_occ_kps_batch, occ_dict=None, use_mask=True, kps_id=kps_id, cam_int=cam_int)
+         if len(_occ_image_batch) > 0:
+-            _occ_outputs = estimator.process_frames(_occ_image_batch, bboxes=_occ_bbox_batch, masks=_occ_mask_batch, id_batch=[[1] for idb in range(len(_occ_image_batch))], idx_path={}, idx_dict={}, mhr_shape_scale_dict=mhr_shape_scale_dict, kps_batch=_occ_kps_batch, occ_dict=None, use_mask=True, kps_id=kps_id, _occ_image_batch_ori=_occ_image_batch_ori, cam_int=cam_int)
++            _occ_outputs = estimator.process_frames(_occ_image_batch, bboxes=_occ_bbox_batch, masks=_occ_mask_batch, id_batch=[[1] for idb in range(len(_occ_image_batch))], idx_path={}, idx_dict={}, mhr_shape_scale_dict=mhr_shape_scale_dict.setdefault(obj_id, {}), kps_batch=_occ_kps_batch, occ_dict=None, use_mask=True, kps_id=kps_id, _occ_image_batch_ori=_occ_image_batch_ori, cam_int=cam_int)
+         
+         oid_outputs = []
+         ia, ib = 0, 0
+diff --git a/models/sam_3d_body/sam_3d_body/models/meta_arch/sam3d_body.py b/models/sam_3d_body/sam_3d_body/models/meta_arch/sam3d_body.py
+index d11e8d7..0d7ba15 100644
+--- a/models/sam_3d_body/sam_3d_body/models/meta_arch/sam3d_body.py
++++ b/models/sam_3d_body/sam_3d_body/models/meta_arch/sam3d_body.py
+@@ -2198,11 +2198,16 @@ class SAM3DBody(BaseModel):
+             for hid in range(num_human):
+                 # (28,) and (45,), values at t=0 for this human
+                 if hid not in mhr_shape_scale_dict:
+-                    mhr_shape_scale_dict[hid] = [scale_3d[0, hid].clone(), shape_3d[0, hid].clone()]
+-                    first_scale = scale_3d[0, hid].clone()
+-                    first_shape = shape_3d[0, hid].clone()
+-                else:
+-                    first_scale, first_shape = mhr_shape_scale_dict[hid]
++                    # ★ 5090 patch (2026-10-08): 上游直接取 t=0。但人不在的帧(空遮罩 / 整个遮罩在画面 5% 边缘内)
++                    #   是拿全零框算的, 这一行全是 NaN; 中途进画面的人第一帧就是 NaN, 锁成 NaN 整段都是空网格。
++                    #   改成: 这一批里有效(有限)的帧取中位; 一帧有效的都没有就这一批先不锁, 下一批再说。
++                    #   实测 nfl1 逐帧身高每人只晃 3~5 cm, 第一批里有效帧的中位和全片中位差不到 2 cm。
++                    ok = torch.isfinite(scale_3d[:, hid]).all(dim=-1) & torch.isfinite(shape_3d[:, hid]).all(dim=-1)
++                    if not bool(ok.any()):
++                        continue
++                    mhr_shape_scale_dict[hid] = [scale_3d[ok, hid].median(0).values.clone(),
++                                                 shape_3d[ok, hid].median(0).values.clone()]
++                first_scale, first_shape = mhr_shape_scale_dict[hid]
+                 # Broadcast to all time steps for this human
+                 scale_3d[:, hid, :] = first_scale
+                 shape_3d[:, hid, :] = first_shape
 diff --git a/scripts/offline_app.py b/scripts/offline_app.py
-index 45be5a3..a2f30e4 100644
+index 45be5a3..01a505b 100644
 --- a/scripts/offline_app.py
 +++ b/scripts/offline_app.py
-@@ -461,9 +461,12 @@ class OfflineApp:
+@@ -450,8 +450,12 @@ class OfflineApp:
+                     id_current = None
+                     num_empth_ids += 1
+                 else:
+-                    mask_output = mask_outputs[frame_id-num_empth_ids]
+-                    id_current = id_batch[frame_id-num_empth_ids]
++                    # ★ 5090 patch (2026-10-08): 上游写的是 mask_outputs[frame_id-num_empth_ids]。
++                    #   process_image_with_mask 返回的三个列表都是"每帧一项"(空帧也占位), 不是压缩过的;
++                    #   一批里有"一个人都没有"的帧时, 后面的帧会拿到前一帧的网格, 最后几帧丢掉。
++                    #   他们的流程首帧检人、人不会中途进来, 所以没踩到; 我们按人挑、人会中途进画面。
++                    mask_output = mask_outputs[frame_id]
++                    id_current = id_batch[frame_id]
+                 img = cv2.imread(image_path)
+                 rend_img = visualize_sample_together(img, mask_output, self.sam3_3d_body_model.faces, id_current)
+                 cv2.imwrite(
+@@ -461,9 +465,12 @@ class OfflineApp:
  
                  # save rendered frames for individual person
                  rend_img_list = visualize_sample(img, mask_output, self.sam3_3d_body_model.faces, id_current)
