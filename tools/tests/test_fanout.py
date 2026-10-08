@@ -216,6 +216,35 @@ def test_track_split_does_not_need_fanout_switch():
     assert F.on() is True
 
 
+def test_fan_gen_splits_objects_over_cards_and_skips_fresh():
+    """6 个物体, 每份至少 2 个 -> 3 份, 3 张卡; 已经出好的不再生成。"""
+    T = tempfile.mkdtemp()
+    todo = [f"{T}/obj{i}" for i in range(6)]
+    open(f"{T}/obj5.glb", "w").write("old")
+
+    def run(dirs, card):
+        for d in dirs:
+            open(f"{d}.glb", "w").write(card)
+
+    res = F.fan_gen(todo, run, lambda d: os.path.exists(f"{d}.glb"), need_mb=0, **KW)
+    assert not any(res.values()), res
+    cards = {d: open(f"{d}.glb").read() for d in todo}
+    assert cards[f"{T}/obj5"] == "old", cards                                 # 已有的跳过
+    assert sorted(set(cards.values()) - {"old"}) == ["t81", "t82", "t83"], cards
+
+
+def test_fan_gen_few_objects_stay_on_one_card():
+    T = tempfile.mkdtemp()
+    todo = [f"{T}/obj{i}" for i in range(3)]
+
+    def run(dirs, card):
+        for d in dirs:
+            open(f"{d}.glb", "w").write(card)
+
+    F.fan_gen(todo, run, lambda d: False, need_mb=0, **KW)
+    assert len({open(f"{d}.glb").read() for d in todo}) == 1                 # 3 个物体不值得拆
+
+
 def test_track_all_reads_the_two_env_vars():
     txt = open(f"{SAM3D}/data/outdoor/scripts/track_all.py").read()
     assert 'os.environ.get("ONLY_WORDS"' in txt and 'os.environ.get("TRACK_REPORT"' in txt

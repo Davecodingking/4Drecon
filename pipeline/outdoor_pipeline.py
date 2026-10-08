@@ -636,19 +636,27 @@ def _gen(c, dirs, log, dry):
     # run.py 里 inference.py 直接读 os.environ["CONDA_PREFIX"], 没有就 KeyError。
     # 那个变量只有 conda activate 才会设, 直接调环境里的 python 是没有的。
     print(f"    [批量] {len(todo)} 个一起生成, 模型只装一次", flush=True)
-    try:
-        sh(envcmd(PY["sam3d"], f"{GEN}/run.py",
-                  dict(CONDA_PREFIX=os.path.dirname(os.path.dirname(PY["sam3d"])),
-                       # SAM3D 每次启动都去 HuggingFace 拉 DINO 主干, HF 一抽风就 504。
-                       # 权重本地已有缓存, 强制离线即可。这个坑随网络状况时好时坏。
-                       HF_HUB_OFFLINE="1"),
-                  ["--dirs", *todo, "--hq", "--bake-workers", c.cfg["BAKE_WORKERS"]]), log, dry, cwd=GEN)
-    except SystemExit as e:
-        # 批量步骤不能一个失败就整批中断: 之前 HF 504 时 beach 卡在第 15 个,
-        # 后面 9 个连试都没试。run.py 内部逐个 try 住了, 这里只是接住它的非零码,
-        # 具体是哪几个失败的, 下面按产物点名 —— 比退出码准。
-        print(f"    [提示] 这一批有失败的 ({e}), 下面按产物点名", flush=True)
-    if dry: return
+
+    def run(dirs, card):
+        env = dict(CONDA_PREFIX=os.path.dirname(os.path.dirname(PY["sam3d"])),
+                   # SAM3D 每次启动都去 HuggingFace 拉 DINO 主干, HF 一抽风就 504。
+                   # 权重本地已有缓存, 强制离线即可。这个坑随网络状况时好时坏。
+                   HF_HUB_OFFLINE="1")
+        if card is not None:
+            env.update(CUDA_VISIBLE_DEVICES=card, CUDA_DEVICE_ORDER="PCI_BUS_ID")
+        try:
+            sh(envcmd(PY["sam3d"], f"{GEN}/run.py", env,
+                      ["--dirs", *dirs, "--hq", "--bake-workers", c.cfg["BAKE_WORKERS"]]), log, dry, cwd=GEN)
+        except SystemExit as e:
+            # 批量步骤不能一个失败就整批中断: 之前 HF 504 时 beach 卡在第 15 个,
+            # 后面 9 个连试都没试。run.py 内部逐个 try 住了, 这里只是接住它的非零码,
+            # 具体是哪几个失败的, 下面按产物点名 —— 比退出码准。
+            print(f"    [提示] 这一份有失败的 ({e}), 下面按产物点名", flush=True)
+
+    if dry:
+        return run(todo, None)
+    # ★ 2026-10-08 按物体分到几张空卡上同时生成(fanout.fan_gen); 这一步自己不领卡, 每份各领一张。
+    fanout.fan_gen(todo, run, _fresh)
     # ★ 按"产物在不在"点名, 不按退出码。退 0 但一个文件没写出来也算失败 ——
     #   原来一个进程一个物体时靠退出码分得清谁失败, 批量之后这个信息没了, 而且
     #   查产物本来就比查退出码严。
@@ -1147,7 +1155,7 @@ DEPS = {
 GPU_STEPS = {"vlm", "vlm_sizes", "da3", "track", "verify", "gen", "solo", "detect",
              "recall_mask", "recall_gen"}
 # 内部拆分的步骤: 它起的每一份各领一张卡, 主循环不替它领(领了就多占一张不用)
-FANOUT_STEPS = {"track"}
+FANOUT_STEPS = {"track", "gen", "solo", "recall_gen"}
 
 def do_check(c):
     """看一遍产物在不在、有没有过期。过期 = 比上一步的产物还旧, 说明上游重跑过而它没跟上。"""

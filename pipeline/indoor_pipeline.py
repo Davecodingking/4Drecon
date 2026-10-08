@@ -884,18 +884,25 @@ def _gen_dirs(c, dirs, log, dry):
     # ★ 一批一次交给 run.py, 不再一个物体起一个进程 —— 那样每个都要重装一遍模型
     #   (约 40 秒), 而真正生成一个才 30 秒。run.py 的 --dirs 模式模型只装一次。
     #   不能改用 --image 传一串: 图全叫 frame.png, 输出名取自文件名会整批互相覆盖。
-    wait_gpu(21000, dry)
     print(f"    [批量] {len(todo)} 个一起生成, 模型只装一次", flush=True)
-    # 批量步骤不能一个失败就整批中断 —— HF 504 时后面的连试都没试。
-    # run.py 内部逐个 try 住了, 这里接住它的非零码, 具体谁失败下面按产物点名。
-    try:
-        sh(envcmd(PY["sam3d"], f"{GEN}/run.py",
-                   dict(CONDA_PREFIX=os.path.dirname(os.path.dirname(PY["sam3d"])),
-                        HF_HUB_OFFLINE="1"),
-                   ["--dirs", *todo, "--hq", "--bake-workers", c.cfg["BAKE_WORKERS"]]), log, dry, cwd=GEN)
-    except SystemExit as e:
-        print(f"    [提示] 这一批有失败的 ({e}), 下面按产物点名", flush=True)
-    if dry: return
+
+    def run(dirs, card):
+        env = dict(CONDA_PREFIX=os.path.dirname(os.path.dirname(PY["sam3d"])), HF_HUB_OFFLINE="1")
+        if card is not None:
+            env.update(CUDA_VISIBLE_DEVICES=card, CUDA_DEVICE_ORDER="PCI_BUS_ID")
+        # 批量步骤不能一个失败就整批中断 —— HF 504 时后面的连试都没试。
+        # run.py 内部逐个 try 住了, 这里接住它的非零码, 具体谁失败下面按产物点名。
+        try:
+            sh(envcmd(PY["sam3d"], f"{GEN}/run.py", env,
+                      ["--dirs", *dirs, "--hq", "--bake-workers", c.cfg["BAKE_WORKERS"]]), log, dry, cwd=GEN)
+        except SystemExit as e:
+            print(f"    [提示] 这一份有失败的 ({e}), 下面按产物点名", flush=True)
+
+    if dry:
+        return run(todo, None)
+    # ★ 2026-10-08 按物体分到几张空卡上同时生成(fanout.fan_gen), 原来的 wait_gpu(21000) 变成领卡时的余量要求。
+    #   这一步自己不领卡, 每份各领一张。office 实测 40 个物体一张卡 25 分钟, 大头是贴图烘焙排队。
+    fanout.fan_gen(todo, run, _fresh, need_mb=21000)
     # 按产物点名比按退出码准: 退 0 但没写出文件也算失败。
     _failed = [os.path.basename(d) for d in todo if not _fresh(d)]
     if _failed:
@@ -1466,7 +1473,8 @@ GPU_STEPS = {"vlm", "vlm_sizes", "vlm_rest", "da3", "track", "verify", "gen", "s
              "detect", "recall_mask", "recall_gen", "shell",   # 物体链
              "lm", "mask", "floor"}                            # SpatialLM 链
 # 内部拆分的步骤: 它起的每一份各领一张卡, 主循环不替它领
-FANOUT_STEPS = {"track"}
+# gen 只在物体链上是分卡的(o_gen -> _gen_dirs); lm 链的 s_gen 自己领卡, 所以 gen 由主循环按链加进来
+FANOUT_STEPS = {"track", "solo", "recall_gen"}
 
 CHAINS = {
     # 物体链: Qwen 列词 -> SAM3 跟踪 -> 反投影量盒子 -> 生成 -> 摆回去。
@@ -1645,7 +1653,7 @@ def main():
         print(f"== {k}  [{e}]  {d}", flush=True)
         t_run, ok = t, "失败"
         try:
-            if k in GPU_STEPS - FANOUT_STEPS and not g.dry_run:
+            if k in GPU_STEPS - FANOUT_STEPS - ({"gen"} if g.chain == "obj" else set()) and not g.dry_run:
                 with GpuSlot(k):
                     t_run = time.time()      # 排队等锁的时间单独记, 不算进这一步的耗时
                     fn(c, g.dry_run)

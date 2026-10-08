@@ -95,6 +95,31 @@ def merge_reports(parts, out):
     return d
 
 
+def fan_gen(todo, run, fresh, need_mb=21000, min_per=2, **kw):
+    """逐个物体生成(sam-3d-objects/run.py)按物体分卡(2026-10-08)。
+    todo: 要生成的目录; run(dirs, card): 在这张卡上起一份 run.py 生成这些; fresh(d): 这个目录的 mesh 已经出好了。
+    ★ 为什么能拆: 每个物体独立生成, 种子固定, 在哪张卡、和谁一批结果都一样(生成本身每次都带随机, 没有"一致"的要求)。
+    ★ 一张卡一份 run.py: 采样进程常驻 13G + 它自己起的两个烘焙进程各 4G, 24G 的卡正好装一份。
+      office 实测 40 个物体: 采样共 14 分钟, 烘焙共 48 分钟, 一张卡上两个烘焙进程排队 25 分钟; 分到几张卡就除以几。
+    ★ 每份至少 min_per 个物体(模型装一遍 40 秒, 一两个物体不值得多起一份)。
+    不重试: run.py 内部逐个 try 住, 谁没出来由调用方按产物点名(和以前一样)。"""
+    probe = {k: v for k, v in kw.items() if k in ("run_dir", "pool", "busy")}
+    k = how_many(max(1, len(todo) // min_per), need_mb, **probe) if parallel_on() else 1
+    groups = split(todo, [1] * len(todo), k)
+    if len(groups) > 1:
+        print(f"    [拆分] {len(todo)} 个物体分成 {len(groups)} 份, 各 " + "/".join(str(len(g)) for g in groups) + " 个",
+              flush=True)
+
+    def job(i):
+        def fn(card):
+            left = [d for d in groups[i] if not fresh(d)]
+            if left:
+                run(left, card)
+        return fn
+
+    return run_workers([(f"g{i}", job(i)) for i in range(len(groups))], "gen", need_mb, retries=0, **kw)
+
+
 def fan_track(py, script, env, R1, log, dry, need_mb=0, max_parts=None, sh_env=None, **kw):
     """物体跟踪按"批"拆分。env: 给 track_all.py 的环境变量(FR / R1 / EXTRA_WORDS ...)。max_parts: 最多拆几份。
     sh_env: 每条命令额外带的环境变量(室内要带 CUDA_HOME 那一套, 见 indoor_pipeline.sh)。
