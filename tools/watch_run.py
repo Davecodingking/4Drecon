@@ -220,7 +220,7 @@ def step_detail(body, drive_txt_tail):
     tot = TRACK_TOTAL.findall(txt)
     if tot:
         done = TRACK_DONE.findall(txt)
-        tr = dict(total=int(tot[-1]), done=len(done) + len(TRACK_SKIP.findall(txt)),
+        tr = dict(total=sum(int(x) for x in tot), done=len(done) + len(TRACK_SKIP.findall(txt)),   # 分了几份就有几行, 加起来
                   last=(f"{done[-1][0]} · {done[-1][1]} instances · {done[-1][3]}s" if done else ""),
                   oom=len(TRACK_OOM.findall(txt)))
     finished = [a or b for a, b in DONE.findall(txt)]

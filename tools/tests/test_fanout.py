@@ -101,6 +101,9 @@ for w in words:
     if w == os.environ.get("FAIL_WORD") and not os.path.exists(flag):
         open(flag, "w").close(); sys.exit(1)
     open(f, "w").write(os.environ.get("CUDA_VISIBLE_DEVICES", "?")); rep[w] = {"实例数": 1}
+    g = int(os.environ.get("MW_GROUP", "8")); b = [words[i:i + g] for i in range(0, len(words), g)]
+    open(f"{R1}/batch_{w}.txt", "w").write(",".join(next(x for x in b if w in x)))   # 这个词和谁一批(按 track_all 的切法)
+    open(f"{R1}/count_{w}.txt", "a").write("1")                                       # 写了几次
     open(f"{R1}/env_{w}.txt", "w").write(os.environ.get("MY_FLAG", "没有") + " " + os.environ.get("PATH", "").split(":")[0])
 json.dump(rep, open(os.environ.get("TRACK_REPORT", f"{R1}/03_track_report.json"), "w"), ensure_ascii=False)
 ''')
@@ -116,17 +119,39 @@ def _track_run(words, **env):
     return T, cards, json.load(open(f"{T}/03_track_report.json"))
 
 
-def test_fan_track_splits_words_over_cards():
+def test_fan_track_splits_whole_batches_over_cards():
+    """6 个词每批 2 个 = 3 批, 3 张空卡 -> 3 份, 每份一整批; 报告并成一份且保持词序。"""
     words = ["goal post", "helmet", "sign", "jersey", "football", "gloves"]
-    T, cards, rep = _track_run(words)
+    T, cards, rep = _track_run(words, MW_GROUP="2")
     assert sorted(set(cards.values())) == ["t81", "t82", "t83"], cards          # 三张卡都用上了
-    assert list(rep) and set(rep) == set(words), rep                            # 报告并成了一份
+    assert cards["goal post"] == cards["helmet"] and cards["sign"] == cards["jersey"], cards   # 同一批在同一张卡
+    assert list(rep) == words, rep                                              # 报告并成了一份, 词序和不拆一样
     assert not [f for f in os.listdir(T) if ".part" in f], os.listdir(T)
 
 
-def test_fan_track_retry_only_redoes_missing_words():
-    T, cards, rep = _track_run(["helmet", "sign", "jersey"], FAIL_WORD="sign")
+def test_fan_track_batches_match_the_unsplit_run():
+    """拆开以后每份自己切的批必须和不拆时切的一模一样 —— 批的组成一变, 跟踪结果就变(09-29 实测)。
+    7 个词每批 3 个: 不拆是 [0,1,2] [3,4,5] [6]; 限 2 份时第二份拿到 [3,4,5,6], 自己再切还是 [3,4,5] [6]。"""
+    words = [f"w{i}" for i in range(7)]
+    want = {w: ",".join(words[i:i + 3]) for i in range(0, 7, 3) for w in words[i:i + 3]}
+    for parts in (None, 2):
+        T = tempfile.mkdtemp()
+        json.dump({"vocab": words}, open(f"{T}/01_vlm_vocab.json", "w"))
+        F.fan_track(sys.executable, _fake_track(T), dict(R1=T, FR="x", EXTRA_WORDS="", MW_GROUP="3"), T,
+                    f"{T}/logs/03_track.log", False, max_parts=parts, **KW)
+        got = {w: open(f"{T}/batch_{w}.txt").read() for w in words}
+        assert got == want, (parts, got)
+        cards = {w: open(f"{T}/03_masks/{w}.npz").read() for w in words}
+        assert len(set(cards.values())) == (3 if parts is None else 2), (parts, cards)
+
+
+def test_fan_track_retry_redoes_the_whole_share():
+    """一份里第二个词失败: 重试时第一个词也重来(npz 先删掉) —— 否则剩下的词会重新分批, 批一变结果就变。"""
+    T, cards, rep = _track_run(["helmet", "sign", "jersey"], FAIL_WORD="sign", MW_GROUP="2")
     assert set(cards) == {"helmet", "sign", "jersey"}, cards
+    assert open(f"{T}/count_helmet.txt").read() == "11", open(f"{T}/count_helmet.txt").read()   # 写了两次
+    assert cards["helmet"] == cards["sign"], cards                             # 重试那次两个词同一张卡
+    assert open(f"{T}/count_jersey.txt").read() == "1"                        # 另一份不受影响
 
 
 def test_fan_track_names_the_words_that_never_came_out():
@@ -134,7 +159,8 @@ def test_fan_track_names_the_words_that_never_came_out():
     json.dump({"vocab": ["helmet", "sign"]}, open(f"{T}/01_vlm_vocab.json", "w"))
     bad = f"{T}/bad.py"; open(bad, "w").write("import sys; sys.exit(2)")
     try:
-        F.fan_track(sys.executable, bad, dict(R1=T, FR="x", EXTRA_WORDS=""), T, f"{T}/logs/03_track.log", False, **KW)
+        F.fan_track(sys.executable, bad, dict(R1=T, FR="x", EXTRA_WORDS="", MW_GROUP="1"), T, f"{T}/logs/03_track.log",
+                    False, **KW)
     except SystemExit as e:
         assert "helmet" in str(e) and "sign" in str(e), str(e)
     else:
@@ -152,8 +178,8 @@ def test_fan_track_nothing_to_do():
 def test_fan_track_max_parts_one_means_no_split():
     T = tempfile.mkdtemp()
     json.dump({"vocab": ["helmet", "sign", "jersey"]}, open(f"{T}/01_vlm_vocab.json", "w"))
-    F.fan_track(sys.executable, _fake_track(T), dict(R1=T, FR="x", EXTRA_WORDS=""), T, f"{T}/logs/03_track.log",
-                False, max_parts=1, **KW)
+    F.fan_track(sys.executable, _fake_track(T), dict(R1=T, FR="x", EXTRA_WORDS="", MW_GROUP="1"), T,
+                f"{T}/logs/03_track.log", False, max_parts=1, **KW)
     cards = {open(f"{T}/03_masks/{w}.npz").read() for w in ("helmet", "sign", "jersey")}
     assert len(cards) == 1, cards                                               # 一份, 一张卡
 
@@ -163,22 +189,27 @@ def test_fan_track_passes_extra_env_to_every_worker():
     for parts in (None, 1):
         T = tempfile.mkdtemp()
         json.dump({"vocab": ["helmet", "sign"]}, open(f"{T}/01_vlm_vocab.json", "w"))
-        F.fan_track(sys.executable, _fake_track(T), dict(R1=T, FR="x", EXTRA_WORDS=""), T, f"{T}/logs/03_track.log",
-                    False, max_parts=parts, sh_env={"MY_FLAG": "带到了", "CUDA_HOME": "/假的/cuda"}, **KW)
+        F.fan_track(sys.executable, _fake_track(T), dict(R1=T, FR="x", EXTRA_WORDS="", MW_GROUP="1"), T,
+                    f"{T}/logs/03_track.log", False, max_parts=parts, sh_env={"MY_FLAG": "带到了", "CUDA_HOME": "/假的/cuda"}, **KW)
         for w in ("helmet", "sign"):
             assert open(f"{T}/env_{w}.txt").read() == "带到了 /假的/cuda/bin", (parts, open(f"{T}/env_{w}.txt").read())
 
 
-def test_split_is_off_by_default():
-    """2026-09-29 nfl1 实测: 按词拆分 gloves 从 10 个实例变成 11 个, 按人拆分网格差 1~3 厘米。
-    拆分改变结果, 所以默认不拆; FANOUT=1 才拆。"""
+def test_track_split_does_not_need_fanout_switch():
+    """FANOUT 只管出人网格按人拆(默认关, 会改结果)。track 按批拆结果不变, 不要这个开关也拆;
+    一批装得下的词(默认 8 个一批)不拆。"""
     old = os.environ.pop("FANOUT")
     try:
         assert F.on() is False
         T = tempfile.mkdtemp()
         json.dump({"vocab": ["helmet", "sign", "jersey"]}, open(f"{T}/01_vlm_vocab.json", "w"))
-        F.fan_track(sys.executable, _fake_track(T), dict(R1=T, FR="x", EXTRA_WORDS=""), T, f"{T}/logs/03_track.log",
-                    False, **KW)
+        F.fan_track(sys.executable, _fake_track(T), dict(R1=T, FR="x", EXTRA_WORDS="", MW_GROUP="1"), T,
+                    f"{T}/logs/03_track.log", False, **KW)
+        assert len({open(f"{T}/03_masks/{w}.npz").read() for w in ("helmet", "sign", "jersey")}) == 3
+        T = tempfile.mkdtemp()
+        json.dump({"vocab": ["helmet", "sign", "jersey"]}, open(f"{T}/01_vlm_vocab.json", "w"))
+        F.fan_track(sys.executable, _fake_track(T), dict(R1=T, FR="x", EXTRA_WORDS=""), T,
+                    f"{T}/logs/03_track.log", False, **KW)
         assert len({open(f"{T}/03_masks/{w}.npz").read() for w in ("helmet", "sign", "jersey")}) == 1
     finally:
         os.environ["FANOUT"] = old

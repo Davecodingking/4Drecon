@@ -82,7 +82,10 @@ def make_seg_dirs():
         if len(idx)<2: break
         for j,i in enumerate(idx):
             lk=f"{d}/{j:04d}.jpg"
-            if not os.path.islink(lk): os.symlink(f"{FR}/{FILES[i]}", lk)
+            try:
+                os.symlink(f"{FR}/{FILES[i]}", lk)
+            except FileExistsError:      # 同一轮里几份同时跑到三级, 谁先建都一样(链的是同一张图)
+                pass
         dirs.append((d, idx))
         if idx[-1]==NF-1: break
     return dirs

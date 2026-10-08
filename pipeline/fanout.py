@@ -14,13 +14,19 @@ from _common import GpuSlot, gpus_free_now, sh, envcmd, parallel_on
 
 
 def on():
-    """拆分默认关, FANOUT=1 才开。
-    ★ 2026-09-29 nfl1 实测拆分会改变结果, 所以不能默认开:
-      - track 按词拆: gloves 10 -> 11 个实例, referee 1 -> 2(不拆时两次重跑完全一样)。它是"一批词共用一次检测",
-        批里有哪些词会影响结果。
-      - 出人网格按人拆: 除了编号 1 的人, 其余的人顶点系统性地差 1~3 厘米(两次重跑只差 1~4 毫米);
-        有"模型拒绝出网格"的帧的人, 单独一份时从那一帧起全是空网格(合并时会拦下, 见 mesh_merge.py)。"""
+    """出人网格按人拆分: 默认关, FANOUT=1 才开。
+    ★ 2026-09-29 nfl1 实测按人拆会改变结果, 所以不能默认开: 除了编号 1 的人, 其余的人顶点系统性地差 1~3 厘米
+      (两次重跑只差 1~4 毫米); 有"模型拒绝出网格"的帧的人, 单独一份时从那一帧起全是空网格(合并时会拦下, 见 mesh_merge.py)。
+      根源 10-08 查到了: 上游把所有人的体型都锁成第一个人的(sam3d_body.py 的 mhr_shape_scale_dict 只有键 0)。
+    ★ track 不归这个开关管了(10-08): 它改成按"批"拆, 每一份都是整批, 结果和不拆一样, 所以默认就拆(fan_track)。"""
     return os.environ.get("FANOUT", "0") == "1"
+
+
+def mw_group(env):
+    """track_all.py 一批几个词(它共用一次检测的单位)。多词模式关着就是 1。和 track_all.py 读同样的环境变量。"""
+    if (env.get("MULTIWORD") or os.environ.get("MULTIWORD", "1")) != "1":
+        return 1
+    return int(env.get("MW_GROUP") or os.environ.get("MW_GROUP", "8"))
 
 
 def split(items, weights, k):
@@ -90,29 +96,43 @@ def merge_reports(parts, out):
 
 
 def fan_track(py, script, env, R1, log, dry, need_mb=0, max_parts=None, sh_env=None, **kw):
-    """物体跟踪按词拆分。env: 给 track_all.py 的环境变量(FR / R1 / EXTRA_WORDS ...)。max_parts: 最多拆几份。
+    """物体跟踪按"批"拆分。env: 给 track_all.py 的环境变量(FR / R1 / EXTRA_WORDS ...)。max_parts: 最多拆几份。
     sh_env: 每条命令额外带的环境变量(室内要带 CUDA_HOME 那一套, 见 indoor_pipeline.sh)。
-    每个词的结果是单独一个 npz, 不用合并; 报告各份写各的, 这里并成一份。
-    ★ 重试只补没出来的词: track_all.py 见到 npz 已经在就跳过。"""
+    每个词的结果是单独一个 npz, 不用合并; 报告各份写各的, 这里按份的顺序并成一份(和不拆时的词序一样)。
+    ★ 2026-10-08 改成按批拆: track_all.py 每 MW_GROUP(8) 个词一批共用一次检测, 批里有哪些词会影响结果
+      (09-29 按词拆时 gloves 10 -> 11 个实例)。现在先按 track_all 的规则切好批, 每一份拿到的都是整批,
+      每份自己再切批时切出来的和不拆时一模一样, 所以结果不变, 不用 FANOUT 开关。
+    ★ 一份失败就整份作废再重试(删掉这一份已出的 npz): track_all 见到 npz 就跳过, 剩下的词会重新分批, 批一变结果就变。"""
     probe = {k: v for k, v in kw.items() if k in ("run_dir", "pool", "busy")}
     words = [] if dry else track_words(R1, env.get("EXTRA_WORDS", ""))
-    k = how_many(len(words), need_mb, **probe) if (words and parallel_on() and on()) else 1
+    g = mw_group(env)
+    batches = [words[i:i + g] for i in range(0, len(words), g)]
+    k = how_many(len(batches), need_mb, **probe) if (len(batches) > 1 and parallel_on()) else 1
     k = min(k, max_parts) if max_parts else k
     if dry or k <= 1:
         if dry:
             return sh(envcmd(py, script, env), log, dry, env=sh_env)
         with GpuSlot("track", need_mb, **kw):
             return sh(envcmd(py, script, env), log, dry, env=sh_env)
-    groups = split(words, [1] * len(words), k)
-    print(f"    [拆分] {len(words)} 个词分成 {len(groups)} 份: " + " | ".join(", ".join(g) for g in groups), flush=True)
-    parts = [f"{R1}/03_track_report.part{i}.json" for i in range(len(groups))]
+    n = len(batches)
+    groups = [sum(batches[j * n // k:(j + 1) * n // k], []) for j in range(k)]     # 每份 = 连续的几个整批
+    print(f"    [拆分] {len(words)} 个词 {n} 批(每批 {g} 个), 分成 {k} 份: " + " | ".join(", ".join(x) for x in groups),
+          flush=True)
+    parts = [f"{R1}/03_track_report.part{i}.json" for i in range(k)]
 
     def job(i):
-        return lambda card: sh(envcmd(py, script, dict(env, CUDA_VISIBLE_DEVICES=card, CUDA_DEVICE_ORDER="PCI_BUS_ID",
-                                                       ONLY_WORDS=",".join(groups[i]), TRACK_REPORT=parts[i])),
-                               log, dry, env=sh_env)
+        def fn(card):
+            try:
+                sh(envcmd(py, script, dict(env, CUDA_VISIBLE_DEVICES=card, CUDA_DEVICE_ORDER="PCI_BUS_ID", MW_GROUP=str(g),
+                                           ONLY_WORDS=",".join(groups[i]), TRACK_REPORT=parts[i])), log, dry, env=sh_env)
+            except BaseException:
+                for f in [f"{R1}/03_masks/{w.replace(' ', '_')}.npz" for w in groups[i]] + [parts[i]]:
+                    if os.path.exists(f):
+                        os.remove(f)
+                raise
+        return fn
 
-    res = run_workers([(f"w{i}", job(i)) for i in range(len(groups))], "track", need_mb, **kw)
+    res = run_workers([(f"w{i}", job(i)) for i in range(k)], "track", need_mb, **kw)
     merge_reports(parts, f"{R1}/03_track_report.json")
     bad = {n: e for n, e in res.items() if e}
     if bad:
