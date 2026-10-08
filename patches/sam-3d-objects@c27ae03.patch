@@ -1,3 +1,319 @@
+diff --git a/bake_pool.py b/bake_pool.py
+new file mode 100644
+index 0000000..142bd2d
+--- /dev/null
++++ b/bake_pool.py
+@@ -0,0 +1,194 @@
++"""run.py --bake-workers N 的调度器: 拉起 N 个 bake_worker.py, 把采样好的物体分给空闲的那个。
++
++★ 为什么是子进程 + 管道, 不用 multiprocessing:
++  run.py 是顶层脚本(没有 main 保护), multiprocessing 的 spawn 会在子进程里重新执行它 ——
++  等于每个烘焙进程都再装一遍 12.9 GB 的模型。fork 更不行: 父进程已经初始化过 CUDA。
++  独立子进程只 import 烘焙要用的那几个模块, 和父进程什么都不共享, 没有这两类问题。
++
++并发上的几条约定(race / 死锁 / 资源):
++  * 每个 worker 由一个线程独占, 一问一答, 管道上不会有两个人同时读写。
++  * 在途任务数用信号量限在 N+1: 采样比烘焙快, 不限的话排队的任务(每个几十 MB)越积越多,
++    GPU 上同时抢算力的也越来越多。满了 submit 就阻塞, 采样进程歇一下。
++  * 每个任务有超时。超时/进程崩了 -> 杀掉这个 worker, 任务记失败, 下个任务来时重启一个新的。
++    不会有人永远等一个死掉的进程。
++  * 显存不够(OOM)的任务不算失败, 先记下来, 最后在其他 worker 都退了之后单独重烘一遍。
++  * 主进程退出/被杀: worker 的 stdin 断开, 做完手上那个就自己退出, 不留孤儿。
++  * 回调(打印"完成")在 worker 线程里执行, 打印加锁, 行不交错。
++"""
++import json
++import os
++import queue
++import select
++import subprocess
++import sys
++import threading
++import time
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++_print_lock = threading.Lock()
++
++
++def say(msg):
++    with _print_lock:
++        print(msg, flush=True)
++
++
++class _Worker:
++    def __init__(self, wid, ready_timeout, job_timeout):
++        self.wid, self.ready_timeout, self.job_timeout = wid, ready_timeout, job_timeout
++        self.proc = None
++        self.rfd = None
++        self.buf = b""
++
++    def _readline(self, timeout):
++        """从协议管道读一行; 超时返回 None, 进程没了返回 b""。"""
++        end = time.time() + timeout
++        while b"\n" not in self.buf:
++            left = end - time.time()
++            if left <= 0:
++                return None
++            r, _, _ = select.select([self.rfd], [], [], min(left, 5.0))
++            if not r:
++                if self.proc.poll() is not None:     # 进程已经退了, 管道里也不会再有东西
++                    return b""
++                continue
++            chunk = os.read(self.rfd, 65536)
++            if not chunk:
++                return b""
++            self.buf += chunk
++        line, self.buf = self.buf.split(b"\n", 1)
++        return line
++
++    def start(self):
++        r, w = os.pipe()
++        try:
++            self.proc = subprocess.Popen(
++                [sys.executable, os.path.join(HERE, "bake_worker.py"), str(w), str(self.wid)],
++                stdin=subprocess.PIPE, pass_fds=(w,), cwd=HERE)
++        finally:
++            os.close(w)                # 父进程不留写端, 子进程一死这边就读到 EOF
++        self.rfd, self.buf = r, b""
++        line = self._readline(self.ready_timeout)
++        if not line or not json.loads(line).get("ready"):
++            self.stop(kill=True)
++            raise RuntimeError(f"烘焙进程 w{self.wid} 没能启动")
++
++    def alive(self):
++        return self.proc is not None and self.proc.poll() is None
++
++    def stop(self, kill=False):
++        if self.proc is None:
++            return
++        try:
++            if kill:
++                self.proc.kill()
++            else:
++                self.proc.stdin.close()
++            self.proc.wait(timeout=60)
++        except Exception:
++            self.proc.kill()
++            self.proc.wait()
++        if self.rfd is not None:
++            os.close(self.rfd)
++        self.proc, self.rfd = None, None
++
++    def run(self, job_path):
++        if not self.alive():
++            self.stop(kill=True)
++            self.start()
++        try:
++            self.proc.stdin.write((job_path + "\n").encode())
++            self.proc.stdin.flush()
++        except BrokenPipeError:
++            self.stop(kill=True)
++            return {"ok": False, "err": f"烘焙进程 w{self.wid} 已退出"}
++        line = self._readline(self.job_timeout)
++        if line is None:
++            self.stop(kill=True)
++            return {"ok": False, "err": f"超时({self.job_timeout}s), 已杀掉 w{self.wid}"}
++        if line == b"":
++            code = self.proc.poll()
++            self.stop(kill=True)
++            return {"ok": False, "err": f"烘焙进程 w{self.wid} 崩了(退出码 {code})"}
++        return json.loads(line)
++
++
++class BakePool:
++    def __init__(self, n, job_timeout=900, ready_timeout=300):
++        self.n = n
++        self.q = queue.Queue()
++        self.slots = threading.Semaphore(n + 1)
++        self.failed, self.oom = [], []
++        self._lock = threading.Lock()
++        self.workers = [_Worker(i, ready_timeout, job_timeout) for i in range(n)]
++        self.threads = [threading.Thread(target=self._loop, args=(w,), daemon=True) for w in self.workers]
++        for t in self.threads:
++            t.start()
++
++    def _loop(self, w):
++        while True:
++            item = self.q.get()
++            if item is None:
++                self.q.task_done()
++                w.stop()
++                return
++            name, job_path, on_done = item
++            try:
++                try:
++                    res = w.run(job_path)
++                except Exception as e:           # 起不来之类
++                    res = {"ok": False, "err": f"{type(e).__name__}: {e}"}
++                with self._lock:
++                    if res.get("oom"):
++                        self.oom.append((name, job_path, on_done))
++                    elif not res.get("ok"):
++                        self.failed.append(name)
++                if not res.get("oom"):
++                    on_done(name, job_path, res)
++                else:
++                    say(f"[烘焙] {name} 显存不够, 放到最后单独重烘")
++            except Exception as e:               # 回调出错也不能让这个线程死掉, 否则队列永远等不完
++                say(f"[烘焙] {name} 收尾出错: {type(e).__name__}: {e}")
++                with self._lock:
++                    self.failed.append(name)
++            finally:
++                self.slots.release()
++                self.q.task_done()
++
++    def submit(self, name, job_path, on_done):
++        """满了就等 —— 采样进程在这里歇着, 不会越积越多。"""
++        self.slots.acquire()
++        self.q.put((name, job_path, on_done))
++
++    def busy(self):
++        return self.q.unfinished_tasks > 0
++
++    def wait_idle(self):
++        self.q.join()
++
++    def close(self):
++        """等所有任务做完、worker 都退出; 再单独重烘 OOM 的。返回失败的名字。"""
++        self.q.join()
++        for _ in self.threads:
++            self.q.put(None)
++        for t in self.threads:
++            t.join()
++        if self.oom:
++            say(f"[烘焙] {len(self.oom)} 个显存不够的, 单独重烘")
++            w = _Worker("solo", 300, 1800)
++            try:
++                for name, job_path, on_done in self.oom:
++                    try:
++                        res = w.run(job_path)
++                    except Exception as e:
++                        res = {"ok": False, "err": f"{type(e).__name__}: {e}"}
++                    if not res.get("ok"):
++                        self.failed.append(name)
++                    try:
++                        on_done(name, job_path, res)
++                    except Exception as e:
++                        say(f"[烘焙] {name} 收尾出错: {type(e).__name__}: {e}")
++                        self.failed.append(name)
++            finally:
++                w.stop()
++        return self.failed
+diff --git a/bake_worker.py b/bake_worker.py
+new file mode 100644
+index 0000000..ae68bf9
+--- /dev/null
++++ b/bake_worker.py
+@@ -0,0 +1,110 @@
++"""烘焙进程: 收一个物体的 (高斯, 网格), 做 to_glb —— 整理网格 + 展开 UV + 100 视角渲染 +
++2500 步贴图优化 —— 写出 glb。由 run.py --bake-workers N 拉起, 不单独用。
++
++★ 为什么拆出来 (2026-09-17 实测 pedestrian r2sim, 20 个物体平均):
++  一个物体 29.5 秒 = 采样 5.9 (GPU, 要 12.9 GB 的模型) + 整理网格 5.0 (CPU)
++                     + 烘焙 18.5 (GPU, 不要模型)。
++  原来一个进程排队做, 同一时刻 GPU 上只有一个物体。烘焙不需要那份模型, 单独开进程只多占
++  约 4 GB, 一张 32 GB 的卡能同时烘几个, 采样进程不用等它。
++
++协议(一个任务一行, 全是本机管道):
++  stdin            任务文件路径(torch.save 的 dict, 见 run.py 的 _pack_job)
++  argv[1] 那个 fd  回一行 JSON: {"ready": true} / {"job":..., "ok":..., "sec":..., "err":..., "oom":...}
++  stdout/stderr    都进日志(stdout 在启动时就接到 stderr 上, 免得库里的 print 混进协议)
++stdin 关掉就退出 —— 主进程没了, 这里做完手上这个就走, 不会留孤儿。
++"""
++import json
++import os
++import sys
++import time
++import traceback
++
++# 和 notebook/inference.py 开头一样: 不设这两个, import sam3d_objects 会去跑重初始化
++os.environ.setdefault("CUDA_HOME", os.environ.get("CONDA_PREFIX", ""))
++os.environ["LIDRA_SKIP_INIT"] = "true"
++
++
++def _cls(path):
++    import importlib
++    mod, name = path.split(":")
++    return getattr(importlib.import_module(mod), name)
++
++
++def _rebuild(p, torch):
++    """按 run.py _pack 带来的类名重建。有 init_params 的(高斯)走构造函数 —— 激活函数之类的
++    是构造时挂上去的, 没打包; 其余(网格)直接填属性。张量一律回到 GPU。"""
++    cls, d = _cls(p["cls"]), p["attrs"]
++    if "init_params" in d:
++        obj = cls(**d["init_params"], device="cuda")
++    else:
++        obj = cls.__new__(cls)
++    for k, v in d.items():
++        if k in ("init_params", "device"):
++            continue
++        setattr(obj, k, v.cuda() if torch.is_tensor(v) else v)
++    return obj
++
++
++def _die_with_parent():
++    """主进程被强杀(kill -9)时 stdin 也会断, 但那要等手上这个物体烘完(几十秒, 还占着显存,
++    流水线下一步可能因此显存不够)。父进程一没就立刻退出。"""
++    import threading
++    ppid = os.getppid()
++
++    def watch():
++        while True:
++            time.sleep(2)
++            if os.getppid() != ppid:
++                os._exit(1)
++    threading.Thread(target=watch, daemon=True).start()
++
++
++def main():
++    _die_with_parent()
++    proto = os.fdopen(int(sys.argv[1]), "w", buffering=1)
++    os.dup2(2, 1)                       # 之后谁往 stdout 打印都进日志, 不进协议管道
++    sys.stdout.reconfigure(line_buffering=True)
++    wid = sys.argv[2] if len(sys.argv) > 2 else "?"
++
++    import numpy as np
++    import torch
++    from sam3d_objects.model.backbone.tdfy_dit.utils import postprocessing_utils as pu
++
++    proto.write(json.dumps({"ready": True}) + "\n")
++    for line in sys.stdin:
++        job = line.strip()
++        if not job:
++            continue
++        t0 = time.time()
++        res = {"job": job, "ok": False}
++        gs = mesh = glb = p = tmp = None
++        try:
++            p = torch.load(job, map_location="cpu", weights_only=False)
++            print(f"[烘焙 w{wid}] {p['name']} 开始", flush=True)
++            gs = _rebuild(p["gs"], torch)
++            mesh = _rebuild(p["mesh"], torch)
++            # 贴图优化每步随机挑一个视角(np.random), 原流程从来没设种子 —— 同一个物体跑两次贴图就不一样。
++            # 这里按物体的种子设死, run.py 不拆的那条路也在 to_glb 前设同一个, 两条路结果可比。
++            np.random.seed(p["seed"])
++            torch.manual_seed(p["seed"])
++            glb = pu.to_glb(gs, mesh, **p["kw"])
++            # 先写临时文件再改名: 流水线按"glb 在不在、新不新"判断要不要重做, 不能让它看到半个文件
++            tmp = p["glb"] + f".tmp{os.getpid()}.glb"
++            glb.export(tmp, file_type="glb")
++            os.replace(tmp, p["glb"])
++            res.update(ok=True, sec=round(time.time() - t0, 1))
++        except torch.cuda.OutOfMemoryError as e:
++            res.update(oom=True, err=f"CUDA OOM: {str(e)[:300]}")
++        except Exception as e:
++            res.update(err=f"{type(e).__name__}: {e}"[:500])
++            traceback.print_exc()
++        finally:
++            if tmp and os.path.exists(tmp):     # 写到一半失败的临时文件不留
++                os.remove(tmp)
++            del gs, mesh, glb, p
++            torch.cuda.empty_cache()    # 还给别的进程 —— 同一张卡上还有采样进程和别的烘焙进程
++        proto.write(json.dumps(res) + "\n")
++
++
++if __name__ == "__main__":
++    main()
 diff --git a/notebook/inference.py b/notebook/inference.py
 index 94e99a7..80d4a96 100644
 --- a/notebook/inference.py

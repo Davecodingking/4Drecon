@@ -9,3 +9,7 @@
 在用的：sam-3d-objects、sam-body4d、Depth-Anything-3
 已弃用路线（留档）：SpatialGen（含子模块 Sparse-RaDeGS）、SpatialLM、InvSR、Pano2Room
 PiSA-SR 的"改动"只是删掉的 __pycache__，没导出。
+
+2026-10-08 起, 我们自己写在上游仓库目录里的脚本(sam-body4d 的 `body4d_*_5090.py`、`NOTES_5090.md`; sam-3d-objects 的
+`bake_pool.py`、`bake_worker.py`)在对应仓库里 `git add -N` 过, 所以 `git diff` 会把它们当新文件带进快照 —— 不然它们哪里都没版本。
+重出快照: `git -C <仓库> diff > patches/<文件>`。

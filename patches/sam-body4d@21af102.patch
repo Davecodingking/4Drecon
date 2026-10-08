@@ -1,3 +1,915 @@
+diff --git a/NOTES_5090.md b/NOTES_5090.md
+new file mode 100644
+index 0000000..9e1b720
+--- /dev/null
++++ b/NOTES_5090.md
+@@ -0,0 +1,157 @@
++# SAM-Body4D 在 RTX 5090 上的部署记录（2026-09-09）
++
++装在**独立的 `body4d` 环境**里：`source ~/sam3d/env_body4d.sh`。
++用途：动态视频里的人 → 逐帧人体网格。链路 `SAM 3 跟踪 → (Diffusion-VAS 补全) → SAM 3D Body 出网格`。
++
++上游：<https://github.com/gaomingqi/sam-body4d>（MIT），论文 [arXiv 2512.08406](https://arxiv.org/abs/2512.08406)。
++**它自己不训练任何模型**，是三个现成模型的串联。论文只有 7 页、纯定性对比、没投中会议——
++**当参考实现读，别当论文读**。
++
++## ★ 为什么必须独立环境
++
++仓库里 `models/sam3/` 是**内嵌的另一份 SAM 3**，包名同样叫 `sam3`，装法是 `pip install -e models/sam3`。
++装进我们已有的 `sam3` 环境会把 `outdoor_pipeline.py` 的 `track_all.py` 依赖的那份**静默替换掉**。
++两份实测不兼容：`sam3_tracking_predictor.propagate_in_video` 我们那份 yield 5 个值，内嵌那份 yield 6 个。
++
++代价 ~10 GB 磁盘；不这么做的代价是搞坏一条在用的链。
++
++## 安装
++
++```bash
++conda create -n body4d python=3.12 -y && conda activate body4d
++export CUDA_HOME=/usr/local/cuda-12.8 TORCH_CUDA_ARCH_LIST=12.0
++export PATH=$CUDA_HOME/bin:$PATH
++
++# ★ 唯一必须偏离 README 的一处。它写的是 cu118 + torch 2.7.1 ——
++#   5090 是 Blackwell sm_120, cu118 的 wheel 里根本没有这个 arch。
++#   换成本机已验证的组合 (sam3/sam3d/spatiallm/trellis2 四个环境都是这一版):
++pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
++    --index-url https://download.pytorch.org/whl/cu128
++
++pip install 'git+https://github.com/facebookresearch/detectron2.git@a1ce2f9' \
++    --no-build-isolation --no-deps
++cd ~/sam3d/sam-body4d && pip install -e models/sam3 && pip install -e .
++
++# ★ 新版 setuptools(84) 删了 pkg_resources, 但 detectron2 的 model_zoo 还在 import 它
++pip install 'setuptools<81'
++
++# 验收: 这一句过了, detectron2 的 CUDA 扩展就是好的
++python -c "import torch,detectron2,detectron2._C; print(torch.ops.detectron2.box_iou_rotated)"
++```
++
++detectron2 @ `a1ce2f9` 在 torch 2.8 + sm_120 上**编译通过**，`_C.cpython-312-x86_64-linux-gnu.so` 正常，
++`box_iou_rotated` 可用。这个 pin 早于 Blackwell，编得过是这次最大的不确定性，结果没问题。
++
++装完 `numpy` 是 2.2.6（内嵌 sam3 的 metadata 要求 `numpy==1.26`，只是警告，实测不影响）。
++
++## 权重
++
++★ 2026-09-21 已删补全用的三份（Diffusion-VAS ×2、Depth-Anything V2-L，共 16G）：32G 上开补全必 OOM，从没用上。下表是删之前的样子。
++
++`ckpt_root = ~/sam3d/sam-body4d/checkpoints`，写在 `configs/body4d.yaml`（该文件在 `.gitignore` 里）。
++
++| 模型 | 体积 | 来源 | 备注 |
++|---|---|---|---|
++| SAM 3 | 3.45 GB | **软链本地那份**，不重复下 | `facebook/sam3` gated，2026-09 之前已批 |
++| SAM 3D Body | 2.7 GB | `facebook/sam-3d-body-dinov3` | **gated manual，2026-09-09 批下来** |
++| MoGe-2 | 1.3 GB | `Ruicheng/moge-2-vitl-normal` | 估焦距用。**是 v2，别拿缓存里的 `moge-vitl`(v1) 顶** |
++| Diffusion-VAS ×2 | 7.1 GB ×2 | `kaihuac/diffusion-vas-*` | 只有开补全才要 |
++| Depth-Anything V2-L | 1.3 GB | `depth-anything/Depth-Anything-V2-Large` | 给 Diffusion-VAS 喂深度条件 |
++| ViTDet-H | ~2.5 GB | 运行时自动从 fbaipublicfiles 下 | 只有走他们的 `offline_app.py` 才用 |
++
++**SAM 3 软链**：本地 `~/sam3d/sam3/checkpoints/sam3.pt` 和 HF 上那份**字节数完全一致
++（3450062241，curl 核对过 content-length）**，直接软链，省 3.45 GB。
++
++**下载一律 `local_dir=`**，别用裸的 `snapshot_download`——缓存再复制会让 15 GB 变 30 GB。
++装完 `~/.cache/huggingface` 应该是 0。
++
++★ **gated 权限要用 `curl -I` 打真实文件路径验证**，不能拿 `HfApi().model_info()` 成功当证据——
++metadata API 是公开可读的，`resolve/main/<file>` 才是真正的门。踩过：`model_info` 返回正常，
++下文件 403 `GatedRepo`。
++
++## 打的补丁
++
++| # | 文件 | 问题 |
++|---|---|---|
++| 1 | `models/sam3/sam3/model/sam3_video_base.py:1127` | 文字提示路径按 5 个值解包，但同仓库的 `sam3_tracking_predictor.py:877` yield 6 个（新增 `iou_scores`）。他们只用框提示，从没走过这条路 |
++| 2 | `models/sam_3d_body/notebook/utils.py` `save_mesh_results` | 写的是 `f"{save_dir}/{pid+1}/"`，`pid` 是 `enumerate(outputs)` 的**位置序号**，而 `outputs` 只含这一帧存在的人 |
++| 3 | `scripts/offline_app.py` `rendered_frames_individual` | 同 2，`ri+1` |
++| 4 | 环境 | `setuptools<81`（见上） |
++| 5 | `models/sam_3d_body/notebook/utils.py` `save_mesh_results` | 2026-10-08 加: 模型的一手参数也存下来（`mhr_4d_individual/`），给骨骼动画用 |
++| 6 | `scripts/offline_app.py` 取每帧结果 | 2026-10-08: `mask_outputs[frame_id-num_empth_ids]` 错，列表本来就是每帧一项；一批里有"一个人都没有"的帧时后面的网格错位。改成 `[frame_id]` |
++| 7 | `models/sam_3d_body/notebook/utils.py` 两处 `process_frames(...)` + `meta_arch/sam3d_body.py` 体型锁定 | 2026-10-08: **所有人共用第一个人第一帧的体型**。模型按 `hid in range(num_human)` 记体型, 带遮罩这条路一次只送一个人, 每个人都是 hid=0。修法: 字典按 `obj_id` 分格(`setdefault(obj_id, {})`); 锁定时取这一批里有效帧的中位, 没有有效帧就先不锁(人不在的帧全是 NaN, 取 t=0 会把中途进画面的人锁成 NaN -> 整段空网格)。实测 nfl1: 修前 8 人身高全是 1.664 m, 修后 1.64~1.72 m |
++
++**2 和 3 是同一个根源，也是最危险的一个：用位置序号冒充身份 ID。**
++他们的流程里 id 永远是连续的 1..N 且从不中途消失，所以两者恰好等价。
++一旦挑人（比如只要 1/2/4）或有人中途走出画面，等价就断——
++**后面的人被写进前面人的目录，同一个目录里前半段是甲后半段是乙，而且一声不吭。**
++
++实测：mayday 挑 1/2/4，原 id2 在第 66 帧离场，修之前网格数是 84/84/66（错），修之后 84/66/84（对，
++和跟踪完全一致）。修法是用同一函数里现成的 `id_current[pid]`（他们选颜色时就是这么用的）。
++
++## 自己写的脚本
++
++不用 `scripts/offline_app.py`，因为它是"检人→跟踪→出网格"一条龙、中间不能停，
++而且首帧检人用的是 SAM 3D Body 自带的 ViTDet、只在首帧下一次框（中途走进画面的人永远跟不到）。
++
++### `body4d_track_5090.py` —— 第一段：SAM 3 文字提示跟踪
++
++```bash
++python body4d_track_5090.py --frames 帧目录 --out 输出目录 [--prompt person] [--conf 0.5]
++```
++产出 `<out>/{images/00000000.jpg, masks/00000000.png, track_report.json}`，
++**格式和他们 `on_mask_generation()` 写出来的一模一样**，所以第二段能直接接。
++`track_report.json` 里有每人每帧的面积/质心/包围盒，以及串号/跳变告警。
++
++用文字提示而不是框，好处是 SAM 3 的 detect 分支每帧重做语义匹配，**中途进画面的人能被捞到**
++（mayday 实测捞到一个第 69 帧才出现的）。
++
++### `body4d_check_5090.py` —— 体检：一个 mp4 + 一张总览图
++
++```bash
++python body4d_check_5090.py --dir 02_body4d目录     # ★ 必须用 body4d 环境, imageio-ffmpeg 只在这儿
++```
++`images/`、`masks/` 那几百张是喂模型的中间产物，**人不该一张张点**。这一步压成：
++`03_track.mp4`（每人固定颜色，串号=某人换色）+ `03_check.jpg`（id×帧 时间轴 + 关键帧）。
++
++### `body4d_mesh_5090.py` —— 第二段：出人体网格
++
++```bash
++python body4d_mesh_5090.py --dir 02_body4d目录 [--ids 1,2,4] [--completion 0|1] [--batch-size 8]
++```
++`--ids` 不给就读 `<dir>/picked.json`（人工闸）。会建独立运行目录 `04_mesh_occ{0,1}/`，
++`images` 用软链不复制，`masks` 过滤+重编号成连续 1..N（见补丁 2 的原因），
++并写 `relabel.json` 记住"新 id ↔ 原跟踪 id"。
++
++## 实测
++
++| 场景 | 帧 | 分辨率 | 人 | 补全 | 耗时 | 显存峰值 |
++|---|---|---|---|---|---|---|
++| mayday 跟踪 | 84 | 1024×430 | 跟出 6 个 | — | 13.5 s | 6.2 G |
++| mayday 出网格 | 84 | 1024×430 | 挑 3 个 | 关 | 129 s | **12.1 G** |
++| mayday 出网格 | — | — | 3 | **开** | — | **OOM**（撞 25 G 还要再要 7.2 G） |
++
++**开补全在 32 G 上跑不动**（默认 batch=8、max_occ_len=25）。要开得先降这两个数，或者分两趟。
++论文自测是 A100-80G + 96G 内存。
++
++## 已知的坑
++
++1. **`OfflineApp.__init__` 是 `OmegaConf.load(config_path)`，从文件读。**
++   在内存里改 cfg 对象再把原路径传进去，改动完全不生效（踩过：`--completion 0` 没关掉补全，
++   然后 OOM 在 diffusers 的 attention 里）。覆盖必须落成临时 yaml 再传路径。
++2. **`on_4d_generation()` 遍历的是 `RUNTIME['out_obj_ids']` 这个内存变量**，不是从 `masks/` 扫的。
++   独立调用必须自己赋值——这也正好是"挑哪几个人"的天然接口。
++3. **两套补零宽度**：我们的帧目录是四位（仓库惯例），他们的 `images/` 是八位。别在 glob 里搞混。
++4. **`images/` 的 glob 吃 6 种扩展名**（jpg/jpeg/png/gif/bmp/tiff/webp），往那个目录扔任何调试图
++   都会混进序列。
++5. **输出是每帧独立的相机坐标系**，不是统一世界坐标。"4D" 指的是"身份和体型时序一致"，
++   不是"世界空间里的运动轨迹"。镜头一动就更不能直接叠。
++6. **输出是裸模**（MHR 参数化人体：骨架+体型），**没有衣服几何、没有贴图**。
++7. **SAM 3 只在首帧下提示**（他们的 `inference()`）；我们换成文字提示缓解了，但仍不保证捞全。
++8. **mask 残缺 → bbox 缩水**。`process_image_with_mask` 里 bbox 是 `cv2.findNonZero(mask)` 算的。
++   被遮挡的人 bbox 会偏小，尺度和三维位置跟着错。而 MHR 永远输出**完整的人**，
++   所以遮挡的后果不是"缺条腿"而是"**腿的姿势是编的**"。
++9. **关补全时 `occ_dict` 被填成全 1**，即所有帧都当成"没遮挡"处理，模型连有遮挡都不知道。
++10. **本机没有系统 ffmpeg**。视频走 `imageio-ffmpeg` 自带的二进制（装 body4d 时带进来的）。
++    `cv2.VideoWriter` + `mp4v` **不报错但出的是 MPEG-4 Part 2，浏览器一律不认**——
++    必须 `libx264` + `yuv420p` + 宽高偶数。
+diff --git a/body4d_check_5090.py b/body4d_check_5090.py
+new file mode 100644
+index 0000000..5e59671
+--- /dev/null
++++ b/body4d_check_5090.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python
++"""跟踪结果体检: 出一个 mp4 + 一张总览图。人只看这两样, 不点 images/ 里的散帧。
++
++images/ 和 masks/ 那几百张是喂给 SAM 3D Body 的中间产物, 不是给人看的。
++这一步把它们压成两个东西:
++
++  <前缀>_track.mp4   每人一个固定颜色的叠加视频, 拖着看。串号的表现就是"某个人换了颜色"
++  <前缀>_check.jpg   一屏看完: 上半是 id x 帧 的存在性时间轴, 下半是几张关键帧
++
++★ 颜色必须按 id 固定, 不能按"当前帧第几个"分配 —— 后者会让所有人每帧都在换色,
++  那张图就废了。
++
++用法:
++  python body4d_check_5090.py --dir 02_body4d目录 [--fps 8] [--out-prefix 03]
++"""
++import argparse, json, os
++import cv2, numpy as np
++from PIL import Image
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--dir", required=True, help="含 images/ masks/ track_report.json 的目录")
++ap.add_argument("--out-dir", default=None, help="默认写到 --dir 的上一级")
++ap.add_argument("--fps", type=float, default=8.0)
++ap.add_argument("--prefix", default="03", help="产物编号前缀")
++a = ap.parse_args()
++
++OUT = a.out_dir or os.path.dirname(os.path.abspath(a.dir))
++IMG, MSK = f"{a.dir}/images", f"{a.dir}/masks"
++rep = json.load(open(f"{a.dir}/track_report.json"))
++FILES = sorted(os.listdir(IMG))
++N = len(FILES)
++W, H = rep["wh"]
++ids = sorted(int(i) for i in rep["coverage"])
++
++# BGR。前 10 个手挑, 保证互相区分度高 (打架场景衣服都是深色, 别用低饱和)
++BASE = [(60, 60, 255), (60, 220, 60), (255, 160, 40), (255, 60, 220), (40, 230, 230),
++        (255, 255, 60), (140, 90, 240), (90, 200, 255), (200, 120, 60), (120, 255, 190)]
++COL = {i: BASE[k % len(BASE)] for k, i in enumerate(ids)}
++alarm_frames = {x["frame"] for x in rep["alarms"]}
++
++def overlay(fi):
++    img = cv2.imread(f"{IMG}/{FILES[fi]}")
++    m = np.array(Image.open(f"{MSK}/{FILES[fi][:-4]}.png"))
++    o = img.copy()
++    for oid in np.unique(m):
++        if oid == 0:
++            continue
++        sel = m == oid
++        c = COL.get(int(oid), (200, 200, 200))
++        o[sel] = (0.45 * np.array(c) + 0.55 * img[sel]).astype(np.uint8)
++        ys, xs = np.nonzero(sel)
++        cv2.putText(o, str(oid), (int(xs.mean()) - 8, max(int(ys.min()) + 22, 22)),
++                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, c, 2)
++    cv2.putText(o, f"#{fi}", (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2)
++    return o
++
++# ---------- 1. mp4 ----------
++# ★ 必须是 H.264 (libx264), 不能用 cv2 的 mp4v。mp4v 是 MPEG-4 Part 2,
++#   浏览器一律不认, 很多播放器也打不开 —— 踩过, 出来的文件点不开。
++#   本机没有系统 ffmpeg, 走 imageio-ffmpeg 自带的那个二进制 (装 body4d 时带进来的)。
++# ★ pix_fmt 必须 yuv420p: libx264 默认可能出 yuv444p, Safari/QuickTime 不认。
++# ★ 宽高必须是偶数, libx264 的 yuv420p 要求 —— 1024x430 正好, 但别的素材会栽。
++import imageio.v2 as imageio
++vp = f"{OUT}/{a.prefix}_track.mp4"
++EW, EH = W - W % 2, H - H % 2
++wr = imageio.get_writer(vp, fps=a.fps, codec="libx264", quality=8,
++                        macro_block_size=1, ffmpeg_params=["-pix_fmt", "yuv420p"])
++for fi in range(N):
++    wr.append_data(cv2.cvtColor(overlay(fi)[:EH, :EW], cv2.COLOR_BGR2RGB))
++wr.close()
++print(f"[视频] {vp}  {N} 帧 @ {a.fps}fps  H.264/yuv420p {EW}x{EH}")
++
++# ---------- 2. 时间轴 ----------
++# 一眼看出: 谁在哪些帧有 mask (实心), 哪些帧报了警 (顶部红点)。
++# 这张图回答的是"跟丢了没 / 串号了没", 不需要看任何一张原图。
++ROW, PAD, LEFT = 34, 8, 96
++th = len(ids) * (ROW + PAD) + 60
++tl = np.full((th, LEFT + W, 3), 28, np.uint8)
++cov = {int(k): v for k, v in rep["coverage"].items()}
++pf = {int(k): {int(f) for f in v} for k, v in rep["per_frame"].items()}
++for r, oid in enumerate(ids):
++    y = 40 + r * (ROW + PAD)
++    c = COL[oid]
++    cv2.putText(tl, f"id{oid}", (8, y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, c, 2)
++    cv2.putText(tl, f"{cov[oid]*100//N:>3d}%", (48, y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
++                (170, 170, 170), 1)
++    for fi in range(N):
++        x0 = LEFT + fi * W // N
++        x1 = LEFT + (fi + 1) * W // N
++        cv2.rectangle(tl, (x0, y), (x1 - 1, y + ROW),
++                      c if fi in pf.get(oid, ()) else (52, 52, 52), -1)
++for fi in alarm_frames:                       # 告警画在最上面一条, 和人无关, 是"这一帧可疑"
++    x = LEFT + fi * W // N
++    cv2.rectangle(tl, (x, 8), (x + max(W // N, 2), 22), (60, 60, 255), -1)
++cv2.putText(tl, f"告警 {len(rep['alarms'])} 处", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
++            (60, 60, 255), 1)
++
++# ---------- 3. 关键帧 ----------
++# 优先挑报了警的帧 (最可能出问题的地方), 不够再均匀补。
++af = sorted(alarm_frames)
++# ★ 告警要在告警帧里均匀取, 不能 [:4] —— 打架场景告警全挤在动作最猛的那几秒,
++#   取前 4 个等于只看了视频的前三分之一。
++af = [af[i * len(af) // 3] for i in range(3)] if len(af) >= 3 else af
++pick = sorted(set(af + [0, N // 3, 2 * N // 3, N - 1]))
++grid = np.vstack([overlay(fi) for fi in pick])
++
++sheet = np.vstack([cv2.copyMakeBorder(tl, 0, 12, 0, 0, cv2.BORDER_CONSTANT, value=(28, 28, 28)),
++                   cv2.copyMakeBorder(grid, 0, 0, LEFT, 0, cv2.BORDER_CONSTANT, value=(28, 28, 28))])
++sp = f"{OUT}/{a.prefix}_check.jpg"
++cv2.imwrite(sp, sheet, [cv2.IMWRITE_JPEG_QUALITY, 88])
++print(f"[体检图] {sp}  {sheet.shape[1]}x{sheet.shape[0]}  关键帧 {pick}")
++print(f"[覆盖] " + "  ".join(f"id{i}:{cov[i]}/{N}" for i in ids))
+diff --git a/body4d_mesh_5090.py b/body4d_mesh_5090.py
+new file mode 100644
+index 0000000..c0208e3
+--- /dev/null
++++ b/body4d_mesh_5090.py
+@@ -0,0 +1,195 @@
++#!/usr/bin/env python
++"""第二段: 拿盘上的 images/ + masks/ 出人体网格 (SAM 3D Body [+ Diffusion-VAS 补全])。
++
++为什么单独写, 不直接用 scripts/offline_app.py:
++
++  1. ★ 他们的 inference() 是"检人 -> 跟踪 -> 出网格"一条龙, 中间不能停。
++     检人用的是 SAM 3D Body 自带的 ViTDet, 只在首帧下一次框 ——
++     中途走进画面的人永远跟不到。我们前一步用 SAM 3 的文字提示 "person" 替掉了
++     这一段 (见 body4d_track_5090.py), 所以这里只需要后半段。
++  2. ★ on_4d_generation() 遍历的是 self.RUNTIME['out_obj_ids'] 这个内存变量,
++     不是从 masks/ 里扫出来的。也就是说"哪几个人要还原"是个显式入参 ——
++     这正好是人工闸该在的位置: 跟踪跟出 6 个 id, 人看一眼决定只要 1/2/4。
++     不在名单上的 id 留在 PNG 里没关系, 不会被处理, 所以不用重写 mask。
++  3. 补全 (Diffusion-VAS) 是最贵最吃显存的一环, 拆出来才能单独开关重跑。
++
++前置: <out>/images/*.jpg + <out>/masks/*.png (八位补零, 像素值=obj_id),
++      由 body4d_track_5090.py 产出; <out>/picked.json 记人工挑的 id。
++
++用法:
++  python body4d_mesh_5090.py --dir 02_body4d目录 [--ids 1,2,4] [--completion 0|1]
++                             [--batch-size 8] [--max-occ-len 25]
++  --ids 不给就读 <dir>/picked.json; 都没有就用 masks 里出现过的全部 id。
++"""
++import argparse, json, os, sys, time
++import numpy as np
++import torch
++
++ROOT = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, ROOT)
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--dir", required=True, help="含 images/ masks/ 的目录, 也是输出目录")
++ap.add_argument("--config", default=f"{ROOT}/configs/body4d.yaml")
++ap.add_argument("--ids", default="", help="逗号分隔; 空则读 picked.json")
++ap.add_argument("--completion", type=int, default=-1,
++                help="1 开补全, 0 关, -1 用 config 里的值")
++ap.add_argument("--batch-size", type=int, default=0, help="0 = 用 config 的值")
++ap.add_argument("--max-occ-len", type=int, default=0)
++ap.add_argument("--out", default="", help="运行目录; 默认 <b1>/04_mesh_occ{0,1}")
++ap.add_argument("--individual-renders", action="store_true",
++                help="也画每个人单独一张的检查图(rendered_frames_individual/)。默认不画: 没人读, 占这一步近一半时间")
++ap.add_argument("--cam-json", default="", help="场景重建的 cameras.json。给了就用它的焦距, 不让 MoGe-2 自己估 ——\n"
++                "人离镜头多远是 SAM 3D Body 用焦距换算出来的, 焦距跟场景不一致, 人的远近就跟场景不一致")
++a = ap.parse_args()
++
++# ---------- 先定人选, 再载模型 ----------
++# 顺序是刻意的: 载模型要几十秒和十几 G 显存, 人选定不下来就别载。
++if a.ids:
++    ids = [int(x) for x in a.ids.split(",") if x.strip()]
++elif os.path.exists(f"{a.dir}/picked.json"):
++    ids = json.load(open(f"{a.dir}/picked.json"))["keep_ids"]
++    print(f"[人选] 读 picked.json: {ids}")
++else:
++    from PIL import Image
++    import glob
++    u = set()
++    for p in sorted(glob.glob(f"{a.dir}/masks/*.png")):
++        u |= set(np.unique(np.array(Image.open(p))).tolist())
++    ids = sorted(int(x) for x in u if x != 0)
++    print(f"[人选] 没有 picked.json, 用 masks 里全部 id: {ids}")
++if not ids:
++    raise SystemExit("[失败] 没有要处理的 id")
++
++from omegaconf import OmegaConf
++cfg = OmegaConf.load(a.config)
++if a.completion >= 0:
++    cfg.completion.enable = bool(a.completion)
++if a.batch_size:
++    cfg.sam_3d_body.batch_size = a.batch_size
++if a.max_occ_len:
++    cfg.max_occ_len = a.max_occ_len
++    cfg.completion.max_occ_len = a.max_occ_len
++
++# ★ 缺权重要在载模型之前报清楚, 不要等 torch.load 抛一个看不懂的 KeyError。
++need = [("SAM 3", cfg.sam3.ckpt_path), ("SAM 3D Body", cfg.sam_3d_body.ckpt_path),
++        ("MHR", cfg.sam_3d_body.mhr_path), ("MoGe-2(估焦距)", cfg.sam_3d_body.fov_path)]
++if cfg.completion.enable:
++    need += [("Diffusion-VAS mask", cfg.completion.model_path_mask),
++             ("Diffusion-VAS rgb", cfg.completion.model_path_rgb),
++             ("Depth-Anything V2", cfg.completion.model_path_depth)]
++miss = [(n, p) for n, p in need if not os.path.exists(str(p))]
++if miss:
++    for n, p in miss:
++        print(f"[缺权重] {n}: {p}")
++    raise SystemExit("[失败] 上面的权重不在。gated 的仓库要先在 HF 上申请通过")
++
++print(f"[配置] 补全={bool(cfg.completion.enable)}  batch={cfg.sam_3d_body.batch_size}  "
++      f"max_occ_len={cfg.completion.max_occ_len}  要还原的人: {ids}")
++
++# ---------- 建一个独立的运行目录, 并把 mask 重编号 ----------
++# ★ 为什么必须重编号: save_mesh_results 里写的是 f"{save_dir}/{pid+1}/..." ——
++#   pid 是 enumerate 的**位置序号**, 不是 obj_id; 而 on_4d_generation 建目录用的是
++#   out_obj_ids 的**值**。id 连续时两者恰好重合, 不连续就炸 (踩过: 挑 1/2/4,
++#   第三个人要写 mesh_4d_individual/3/ 而那个目录不存在)。
++#   他们自己一路都是 1..N 连续, 所以永远踩不到。
++# ★ 为什么另开目录而不是就地改: masks/ 是跟踪那一步的产物, 是"全部人"的真相,
++#   不该被"这一轮挑了谁"污染。另外补全开/关两轮要并排比较, 也不能互相覆盖。
++import shutil, glob as _glob
++from PIL import Image as _Image
++RUN = os.path.abspath(a.out or f"{os.path.dirname(os.path.abspath(a.dir))}/"
++                      f"04_mesh_occ{1 if (cfg.completion.enable) else 0}")
++os.makedirs(f"{RUN}/masks", exist_ok=True)
++if os.path.islink(f"{RUN}/images") or os.path.exists(f"{RUN}/images"):
++    if os.path.islink(f"{RUN}/images"):
++        os.remove(f"{RUN}/images")
++if not os.path.exists(f"{RUN}/images"):
++    os.symlink(os.path.abspath(f"{a.dir}/images"), f"{RUN}/images")   # 图不复制, 省盘
++relabel = {o: i + 1 for i, o in enumerate(ids)}                       # 1,2,4 -> 1,2,3
++from utils import DAVIS_PALETTE as _PAL
++for mp in sorted(_glob.glob(f"{a.dir}/masks/*.png")):
++    m = np.array(_Image.open(mp))
++    n = np.zeros_like(m)
++    for o, v in relabel.items():
++        n[m == o] = v
++    q = _Image.fromarray(n).convert("P"); q.putpalette(_PAL)
++    q.save(f"{RUN}/masks/{os.path.basename(mp)}")
++json.dump(dict(relabel={str(k): v for k, v in relabel.items()},
++               note="左=跟踪出的原始 id, 右=送进 SAM 3D Body 的连续 id。"
++                    "mesh_4d_individual/<右>/ 对应的是 <左> 那个人"),
++          open(f"{RUN}/relabel.json", "w"), ensure_ascii=False, indent=1)
++ids_run = sorted(relabel.values())
++print(f"[重编号] {relabel}  -> 运行目录 {RUN}")
++
++# ★ OfflineApp.__init__ 是 OmegaConf.load(config_path) —— 从**文件**重新读的,
++#   在内存里改 cfg 对它一点用没有 (踩过: --completion 0 完全没生效, 补全照开不误,
++#   然后 OOM 在 diffusers 的 attention 里)。所以覆盖必须落成一个临时 yaml 再传路径。
++cfg_path = a.config
++if (a.completion >= 0) or a.batch_size or a.max_occ_len:
++    cfg_path = f"{RUN}/_body4d_effective.yaml"
++    OmegaConf.save(cfg, cfg_path)
++    print(f"[配置] 覆盖过, 写到 {cfg_path}")
++
++# 载模型很重, 放在检查之后
++sys.argv = [sys.argv[0]]                       # offline_app 里有 argparse, 别让它吃到我们的参数
++import scripts.offline_app as _oa
++from scripts.offline_app import OfflineApp
++
++# ★ 2026-10-08: 不画"每人单独一张"的检查图(rendered_frames_individual/)。
++#   上游每算完一帧画两种图: 所有人合在一张(rendered_frames/, 体检视频和 mesh_merge 都读它, 留着),
++#   和每个人各一张(谁都不读)。后者占这一步约 44% 的时间(nfl1 40 帧实测: 推理 73s, 单人图 77s)。
++#   网格是先算好再画图的, 跳过画图不改网格。offline_app 按模块全局名调用 visualize_sample,
++#   所以改模块属性就生效, 不用动上游文件。要这些图的话加 --individual-renders。
++if not a.individual_renders:
++    _oa.visualize_sample = lambda *args, **kw: []
++
++t0 = time.time()
++app = OfflineApp(config_path=cfg_path)
++# ★ OfflineApp.__init__ 会按 gen_id() 建一个时间戳+uuid 的空目录, 这里直接改掉。
++#   他们 inference() 也是这么干的 (offline_app.py:489), 不算 hack。
++app.OUTPUT_DIR = RUN
++app.RUNTIME["out_obj_ids"] = ids_run           # ← 人工闸就是这一行 (已重编号)
++
++# ★ 焦距换成场景的。SAM 3D Body 不吃深度图, 人离镜头多远 = 焦距 x 人的真实大小 / 画面里的大小,
++#   焦距默认是 MoGe-2 一帧一帧估的, 和场景重建的相机不是一回事。pedestrian 实测 MoGe 给
++#   1465px、场景 1412px, 人的远近跟着差 3.8%。换成场景的焦距后, 剩下的差距只来自
++#   "人的真实大小"那一项, 下游(body_into_scene)再用场景深度校正。
++#   场景各帧焦距只差 1% 上下(office 626~634 @688 宽), 取中位数当常数, 按每张图的实际尺寸缩放。
++if a.cam_json:
++    _cams = json.load(open(a.cam_json))["cameras"]
++    _fy_rel = float(np.median([np.array(v["intrinsic_3x3"])[1][1] / v["input_hw"][0] for v in _cams.values()]))
++
++    class _SceneK:
++        """替掉 MoGe-2 的 FOV 估计器: 接口和 FOVEstimator.get_cam_intrinsics 一样, 返回 (1,3,3)。"""
++        def get_cam_intrinsics(self, img, **kw):
++            H, W = img.shape[:2]
++            f = _fy_rel * H                             # 方像素, 和 MoGe 那条路一样用竖直焦距
++            return torch.tensor([[[f, 0.0, W / 2.0], [0.0, f, H / 2.0], [0.0, 0.0, 1.0]]])
++
++    app.sam3_3d_body_model.fov_estimator = _SceneK()
++    print(f"[焦距] 用场景相机: f = {_fy_rel:.4f} x 图高 (1080 高时 {_fy_rel * 1080:.0f}px), 不用 MoGe-2")
++print(f"[载模型] {time.time()-t0:.0f}s  显存 {torch.cuda.memory_allocated()/2**30:.1f}G")
++
++t1 = time.time()
++with torch.autocast("cuda", enabled=False):    # 照抄他们 inference() 的做法
++    out = app.on_4d_generation()
++peak = torch.cuda.max_memory_allocated() / 2**30
++print(f"[出网格] {time.time()-t1:.0f}s  显存峰值 {peak:.1f}G  -> {out}")
++if not a.individual_renders:                   # 上游建好的空目录, 清掉, 免得看起来像漏画了
++    shutil.rmtree(f"{RUN}/rendered_frames_individual", ignore_errors=True)
++
++# ---------- 落一份机器可读的账 ----------
++# 每个人到底有多少帧真出了网格 —— 这是"遮挡帧掉不掉网格"的唯一硬数字,
++# 也是 补全开/关 两轮唯一能拿来对比的东西。
++res = {}
++for i in ids_run:
++    d = f"{RUN}/mesh_4d_individual/{i}"
++    res[str(i)] = len(os.listdir(d)) if os.path.isdir(d) else 0
++n_img = len(os.listdir(f"{RUN}/images"))
++json.dump(dict(ids=ids, ids_run=ids_run, relabel={str(k):v for k,v in relabel.items()}, frames=n_img, meshes_per_id=res,
++               completion=bool(cfg.completion.enable),
++               batch_size=int(cfg.sam_3d_body.batch_size),
++               peak_vram_gb=round(peak, 2), seconds=round(time.time() - t1, 1)),
++          open(f"{RUN}/mesh_report.json", "w"), ensure_ascii=False, indent=1)
++print(f"[网格数] 共 {n_img} 帧: " + "  ".join(f"id{k}:{v}" for k, v in res.items()))
++print(f"[done] -> {RUN}/{{mesh_4d_individual,rendered_frames}}/ + mesh_report.json")
+diff --git a/body4d_occ_5090.py b/body4d_occ_5090.py
+new file mode 100644
+index 0000000..e0efbc4
+--- /dev/null
++++ b/body4d_occ_5090.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python
++"""找出遮挡最重的帧, 出对比图。用来判断"要不要开 Diffusion-VAS 补全"。
++
++为什么需要这一步 —— "遮挡严不严重"不能靠翻视频找感觉, 得有个能排序的量:
++
++    人框重叠 = 两人包围盒交集 / 较小者。1.00 就是一个人的框完全落在另一个里面
++    面积缩水 = 这一帧的 mask 面积相对他自己中位面积掉了多少
++
++两个量都指向同一件事: 这个人这一帧被别人盖掉了多少。
++
++出的图是三列 —— 原片 | SAM 3 给的 mask | 出来的网格。★ 中间那列是重点:
++遮挡下 mask 不是"变小", 是被遮挡物横穿切成互不相连的碎片; 而右边的网格无论
++mask 剩多少永远是完整一个人。差额就是模型编出来的部分。
++
++用法:
++  python body4d_occ_5090.py --run 04_mesh_occ0目录 --track 02_body4d目录
++                            [--top 3] [--id 原id] [--prefix 06]
++  --id 不给就自动选"被盖得最狠"的那个人。
++"""
++import argparse, itertools, json, os
++import cv2, numpy as np
++from PIL import Image
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--run", required=True)
++ap.add_argument("--track", required=True)
++ap.add_argument("--out-dir", default=None)
++ap.add_argument("--top", type=int, default=3, help="出几帧")
++ap.add_argument("--id", type=int, default=0, help="盯哪个原id; 0=自动挑被盖最狠的")
++ap.add_argument("--prefix", default="06")
++a = ap.parse_args()
++
++OUT = a.out_dir or os.path.dirname(os.path.abspath(a.run))
++tr = json.load(open(f"{a.track}/track_report.json"))
++rl = {int(k): v for k, v in json.load(open(f"{a.run}/relabel.json"))["relabel"].items()}
++W, H = tr["wh"]
++pf = {int(k): {int(f): v for f, v in d.items()} for k, d in tr["per_frame"].items()
++      if int(k) in rl}
++med = {k: float(np.median([v["area"] for v in d.values()])) for k, d in pf.items()}
++
++
++def cover(b1, b2):
++    """交集 / 较小者。衡量"小的那个被盖了多少", 比 IoU 更贴题 ——
++    IoU 会因为两人体型差异被稀释, 而我们关心的是被盖的那个。"""
++    x0, y0 = max(b1[0], b2[0]), max(b1[1], b2[1])
++    x1, y1 = min(b1[2], b2[2]), min(b1[3], b2[3])
++    if x1 <= x0 or y1 <= y0:
++        return 0.0
++    ar = lambda z: max((z[2] - z[0]) * (z[3] - z[1]), 1)
++    return (x1 - x0) * (y1 - y0) / min(ar(b1), ar(b2))
++
++
++# 逐帧算, 记下"这一帧最惨的是谁、惨到什么程度"
++rows = []
++for f in range(tr["frames"]):
++    ps = [(k, pf[k][f]) for k in pf if f in pf[k]]
++    worst_id, worst = None, 0.0
++    for (ka, va), (kb, vb) in itertools.combinations(ps, 2):
++        c = cover(va["bbox"], vb["bbox"])
++        # 被盖的是面积小的那个
++        vic = ka if va["area"] <= vb["area"] else kb
++        if c > worst:
++            worst, worst_id = c, vic
++    shrink = max((1 - pf[k][f]["area"] / med[k] for k, _ in ps), default=0.0)
++    rows.append(dict(frame=f, cover=worst, victim=worst_id, shrink=max(shrink, 0.0)))
++
++rows.sort(key=lambda r: -(r["cover"] * 0.6 + r["shrink"] * 0.4))
++top = rows[:a.top]
++OID = a.id or (top[0]["victim"] or sorted(pf)[0])
++print(f"[遮挡排行] 盯 原id{OID} (新id{rl[OID]})")
++print(f"{'帧':>4} {'人框重叠':>8} {'面积缩水':>8}")
++for r in top:
++    print(f"{r['frame']:>4} {r['cover']:>8.2f} {r['shrink']:>8.2f}")
++
++# 只取这个人真的有 mask 的帧, 按"他自己缩水多少"重排
++cand = [r["frame"] for r in rows if r["frame"] in pf[OID]]
++cand.sort(key=lambda f: pf[OID][f]["area"] / med[OID])
++picks = sorted(cand[:a.top])
++if not picks:
++    raise SystemExit(f"[失败] 原id{OID} 没有任何帧")
++
++HW, HH = 190, 205
++tiles = []
++for fi in picks:
++    img = cv2.imread(f"{a.run}/images/{fi:08d}.jpg")
++    msk = np.array(Image.open(f"{a.track}/masks/{fi:08d}.png")) == OID
++    rp = f"{a.run}/rendered_frames/{fi:08d}.jpg"
++    ren = cv2.imread(rp) if os.path.exists(rp) else np.full_like(img, 255)
++    if ren.shape != img.shape:
++        ren = cv2.resize(ren, (img.shape[1], img.shape[0]))
++    x0, y0, x1, y1 = pf[OID][fi]["bbox"]
++    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
++    X0, Y0 = max(0, cx - HW), max(0, cy - HH)
++    X1, Y1 = min(img.shape[1], cx + HW), min(img.shape[0], cy + HH)
++    crop = lambda z: cv2.resize(z[Y0:Y1, X0:X1], (2 * HW, 2 * HH))
++    hi = (msk[..., None] * np.array([60, 230, 230], np.uint8) +
++          (~msk)[..., None] * (img // 3)).astype(np.uint8)
++    pct = pf[OID][fi]["area"] / med[OID] * 100
++    # ★ 标签一律英文: cv2.putText 不支持中文, 中文会画成一串问号
++    panes = [(crop(img), f"#{fi} frame"),
++             (crop(hi), f"mask {pct:.0f}% of median"),
++             (crop(ren), "mesh (always complete)")]
++    row = []
++    for z, t in panes:
++        cv2.putText(z, t, (6, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
++        row.append(z)
++    tiles.append(np.hstack(row))
++    print(f"  帧 {fi}: mask 只剩中位面积的 {pct:.0f}%")
++
++sheet = np.vstack(tiles)
++sp = f"{OUT}/{a.prefix}_occlusion.jpg"
++cv2.imwrite(sp, sheet, [cv2.IMWRITE_JPEG_QUALITY, 90])
++json.dump(dict(watch_orig_id=OID, watch_run_id=rl[OID], frames=picks,
++               ranking=[{k: (round(v, 3) if isinstance(v, float) else v)
++                         for k, v in r.items()} for r in rows[:10]]),
++          open(f"{OUT}/{a.prefix}_occlusion.json", "w"), ensure_ascii=False, indent=1)
++print(f"[done] {sp}  ({sheet.shape[1]}x{sheet.shape[0]})")
+diff --git a/body4d_report_5090.py b/body4d_report_5090.py
+new file mode 100644
+index 0000000..bea34e4
+--- /dev/null
++++ b/body4d_report_5090.py
+@@ -0,0 +1,133 @@
++#!/usr/bin/env python
++"""验收: 网格叠回原片的 mp4 + 一份交叉核对的摘要。
++
++★ 这一步存在的唯一理由是那次身份串号: 只看"每人出了多少帧网格"是看不出错的,
++  必须和"跟踪时每人有多少帧 mask"逐个对上。修补丁之前是 84/84/66, 之后是 84/66/84,
++  数字长得一样体面, 只有对照才发现前者第二个目录里前后装了两个人。
++  所以这里不做美化, 做的是**两个独立来源的数字对账**。
++
++叠加图是判断"位置和尺度准不准"的唯一办法 —— 他们自己出的 rendered_frames 是白底,
++网格再漂亮也看不出有没有对齐。
++
++用法:
++  python body4d_report_5090.py --run 04_mesh_occ0目录 --track 02_body4d目录 [--fps 8]
++"""
++import argparse, json, os, glob
++import cv2, numpy as np
++import imageio.v2 as imageio
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--run", required=True, help="含 rendered_frames/ mesh_4d_individual/ 的运行目录")
++ap.add_argument("--track", required=True, help="含 track_report.json 的跟踪目录")
++ap.add_argument("--out-dir", default=None, help="默认写到 --run 的上一级")
++ap.add_argument("--fps", type=float, default=8.0)
++ap.add_argument("--prefix", default="05")
++ap.add_argument("--alpha", type=float, default=0.6)
++ap.add_argument("--min-px", type=int, default=120,
++                help="人像高度低于它就认为是尺寸问题。SAM 3D Body 按人裁 patch 再放大")
++a = ap.parse_args()
++
++MIN_PX = a.min_px
++OUT = a.out_dir or os.path.dirname(os.path.abspath(a.run))
++tr = json.load(open(f"{a.track}/track_report.json"))
++mr = json.load(open(f"{a.run}/mesh_report.json"))
++rl = {int(k): v for k, v in json.load(open(f"{a.run}/relabel.json"))["relabel"].items()}
++
++FILES = sorted(os.listdir(f"{a.run}/images"))
++N = len(FILES)
++W, H = tr["wh"]
++
++# ---------- 1. 叠加视频 ----------
++# 白底之外的像素才算网格。他们渲染的底色是纯白, 245 这个阈值留了点抗锯齿的余量。
++EW, EH = W - W % 2, H - H % 2
++vp = f"{OUT}/{a.prefix}_mesh_overlay.mp4"
++wr = imageio.get_writer(vp, fps=a.fps, codec="libx264", quality=8,
++                        macro_block_size=1, ffmpeg_params=["-pix_fmt", "yuv420p"])
++n_ov = 0
++for fi in range(N):
++    img = cv2.imread(f"{a.run}/images/{FILES[fi]}")
++    rp = f"{a.run}/rendered_frames/{FILES[fi][:-4]}.jpg"
++    if not os.path.exists(rp):
++        continue
++    ren = cv2.imread(rp)
++    if ren.shape != img.shape:
++        ren = cv2.resize(ren, (img.shape[1], img.shape[0]))
++    fg = (ren.min(axis=2) < 245).astype(np.float32)[..., None]
++    ov = (img * (1 - a.alpha * fg) + ren * (a.alpha * fg)).astype(np.uint8)
++    cv2.putText(ov, f"#{fi}", (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
++    wr.append_data(cv2.cvtColor(ov[:EH, :EW], cv2.COLOR_BGR2RGB))
++    n_ov += 1
++wr.close()
++print(f"[叠加视频] {vp}  {n_ov} 帧 @ {a.fps}fps")
++
++# ---------- 2. 对账 ----------
++# ★ 只比数量是不够的, 因为"对不上"有两个完全不同的原因, 严重性差一个数量级:
++#     网格 > mask : 这一帧这个人没有 mask 却出了网格 —— 别人的帧写进了他的目录。
++#                   这就是身份串号, 致命, 必须让 pipeline 挂掉。
++#     网格 < mask : 有 mask 却没出网格 —— SAM 3D Body 主动跳过了。
++#                   实测是人太小 (像素高不足 ~120px 它按 patch 裁完放大就是糊的),
++#                   属于分辨率不够, 提 LONG_SIDE 就能修, 不该让整条链失败。
++#   所以判据不是比数量, 而是逐帧比集合。
++cov = {int(k): v for k, v in tr["coverage"].items()}
++pf = {int(k): {int(f) for f in v} for k, v in tr["per_frame"].items()}
++mesh = {int(k): v for k, v in mr["meshes_per_id"].items()}
++bbox_h = {int(k): {int(f): v["bbox"][3] - v["bbox"][1] for f, v in d.items()}
++          for k, d in tr["per_frame"].items()}
++
++lines, fatal, warn, warn_small = [], 0, 0, 0
++lines.append(f"场景目录 {os.path.abspath(OUT)}")
++lines.append(f"帧 {N}  分辨率 {W}x{H}  补全 {'开' if mr['completion'] else '关'}  "
++             f"batch {mr['batch_size']}  显存峰值 {mr['peak_vram_gb']}G  耗时 {mr['seconds']}s")
++lines.append("")
++lines.append(f"{'原id':>5} {'新id':>5} {'mask帧':>7} {'网格帧':>7} {'像素高中位':>10}   结论")
++for oid in sorted(rl):
++    nid = rl[oid]
++    md = f"{a.run}/mesh_4d_individual/{nid}"
++    got = {int(f[:-4]) for f in os.listdir(md)} if os.path.isdir(md) else set()
++    want = pf.get(oid, set())
++    ghost = sorted(got - want)          # 有网格却没 mask -> 串号
++    skip = sorted(want - got)           # 有 mask 却没网格 -> 被跳过
++    hs = sorted(bbox_h.get(oid, {}).values())
++    hmed = hs[len(hs) // 2] if hs else 0
++    if ghost:
++        note = f"★★ 串号: {len(ghost)} 帧有网格却无 mask (如 {ghost[:5]})"
++        fatal += 1
++    elif skip:
++        sh_ = sorted(bbox_h[oid][f] for f in skip)
++        smed = sh_[len(sh_) // 2]
++        # ★ 原因不要猜。这里只报事实, 因为猜了两次都是错的:
++        #   猜 1 "人太小" —— pedestrian 从 1024 提到原生 1920 (人像高 78->148),
++        #                    跳过的还是同样那 8/1/3 帧, 一帧没救回来。证伪。
++        #   猜 2 "mask 形状不成人形" —— 量了高宽比/实心率/连通块, 和保留的帧几乎一样。证伪。
++        #   真实机制: SAM 3D Body 自己返回了全零 bbox, 被
++        #   models/sam_3d_body/notebook/utils.py 的 `bbox[0]+bbox[2] > 0` 哨兵滤掉。
++        #   也就是**模型自己拒绝出这一帧**, 拒绝的判据在它内部, 还没定位。
++        #   观察到的规律: 缺的帧是**连续的一段**且多在某个人序列的开头 (id2 缺 0-7, id5 缺 8-10)。
++        why = ("模型拒绝出网格; 该人像高中位 %d < %d, 尺寸**可能**有关但已被证伪过一次"
++               % (smed, MIN_PX) if smed < MIN_PX else "模型拒绝出网格; 该人不小, 原因未定位")
++        note = f"跳过 {len(skip)} 帧 (像素高中位 {smed}, {why})"
++        warn += 1
++        warn_small += 1 if smed < MIN_PX else 0
++    else:
++        note = "一致"
++    lines.append(f"{oid:>5} {nid:>5} {len(want):>7} {len(got):>7} {hmed:>10}   {note}")
++lines.append("")
++if warn and not fatal:
++    lines.append("※ \"跳过\" = SAM 3D Body 对那几帧返回了全零 bbox, 被下游哨兵滤掉。"
++                 "这是模型自己不出, 不是身份错误。实测提分辨率救不回来。")
++lines.append(f"跟踪告警 {len(tr['alarms'])} 处 (质心跳变/IoU断裂)。"
++             f"快速运动会误报, 看 03_track.mp4 确认颜色有没有换过。")
++lines.append(f"跟踪跟出 {tr['n_instances_raw']} 个实例, 人工挑了 {sorted(rl)}, "
++             f"丢掉 {sorted(i for i in cov if i not in rl)}")
++lines.append("")
++lines.append("边界(不是bug): 输出是 MHR 参数化裸模, 无衣服无贴图; "
++             "每帧独立相机系, 不是统一世界坐标。")
++txt = "\n".join(lines)
++sp = f"{OUT}/{a.prefix}_summary.txt"
++open(sp, "w").write(txt + "\n")
++print(txt)
++print(f"\n[摘要] {sp}")
++if fatal:
++    raise SystemExit(f"[失败] {fatal} 个人身份被写串了")
++if warn:
++    print(f"[注意] {warn} 个人有帧被跳过, 是分辨率问题不是错误, 详见上表")
+diff --git a/body4d_track_5090.py b/body4d_track_5090.py
+new file mode 100644
+index 0000000..ba513f6
+--- /dev/null
++++ b/body4d_track_5090.py
+@@ -0,0 +1,162 @@
++#!/usr/bin/env python
++"""SAM 3 文字提示跟踪 -> 产出 SAM-Body4D 后半段要吃的 images/ + masks/。
++
++为什么要自己写这一步, 而不是直接用 scripts/offline_app.py:
++
++  1. ★ 他们的首帧检人用的是 SAM 3D Body 自带的 ViTDet
++     (offline_app.py:103 HumanDetector(name="vitdet")), 而 SAM 3D Body 的权重是
++     gated 的。也就是说没有那个权限, 连"跟踪"这半段都跑不起来 —— 因为
++     OfflineApp.__init__ 一次性构造全部模型, 缺一个就整个失败。
++     用文字提示 "person" 让 SAM 3 自己找人, 就把这层依赖摘掉了。
++  2. ★ 他们只在首帧 (准确说是"第一个检出人的帧") 下一次提示, 后面全靠传播。
++     人中途走进画面就永远不会被跟到。文字提示走的是 SAM 3 的 detect 分支,
++     每帧都会重新做语义匹配, 新进来的人有机会被捞到 (代价是 ID 可能不稳,
++     所以本脚本把每帧的 ID 变化都记下来给人看)。
++  3. 拆出来之后, 贵的那半段 (补全 + 出网格) 可以独立重跑, 不用重新跟踪。
++
++输出目录结构和 on_mask_generation() 写出来的一模一样, 所以后半段能直接接:
++    <out>/images/00000000.jpg      八位补零 —— ★ 这是他们的约定, 不是我们的四位
++    <out>/masks/00000000.png       调色板 PNG, 像素值 = obj_id (0 是背景)
++    <out>/track_report.json        每个 id 每帧的面积/质心/包围盒 + 跳变告警
++
++用法:
++  python body4d_track_5090.py --frames 帧目录 --out 输出目录 [--prompt person]
++                              [--conf 0.5] [--min-area-pct 0.1]
++"""
++import argparse, json, os, sys
++import numpy as np
++import cv2
++import torch
++from PIL import Image
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from sam3.model_builder import build_sam3_video_predictor
++from utils import DAVIS_PALETTE
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--frames", required=True, help="四位补零的 jpg 帧目录")
++ap.add_argument("--out", required=True)
++ap.add_argument("--prompt", default="person")
++ap.add_argument("--ckpt", default=os.path.expanduser("~/sam3d/sam3/checkpoints/sam3.pt"))
++ap.add_argument("--conf", type=float, default=0.5, help="new_det_thresh; 人多的场景调高")
++ap.add_argument("--min-area-pct", type=float, default=0.1,
++                help="小于画面这个百分比的实例整条丢掉。远处的路人给 SAM 3D Body 也是糊的")
++ap.add_argument("--jump-th", type=float, default=0.08, help="质心跳变告警阈值(占画面宽的比例)")
++ap.add_argument("--iou-th", type=float, default=0.20, help="相邻帧 IoU 低于它且面积没大变 -> 疑似串号")
++a = ap.parse_args()
++
++FILES = sorted(f for f in os.listdir(a.frames) if f.endswith(".jpg"))
++if not FILES:
++    raise SystemExit(f"[失败] {a.frames} 里没有 jpg")
++H, W = cv2.imread(f"{a.frames}/{FILES[0]}").shape[:2]
++print(f"[输入] {len(FILES)} 帧 {W}x{H}  提示词 '{a.prompt}'")
++
++IMG_DIR, MSK_DIR = f"{a.out}/images", f"{a.out}/masks"
++os.makedirs(IMG_DIR, exist_ok=True); os.makedirs(MSK_DIR, exist_ok=True)
++
++pred = build_sam3_video_predictor(checkpoint_path=a.ckpt)
++sid = pred.handle_request(request=dict(
++    type="start_session", resource_path=a.frames,
++    # 一级防 OOM: 视频和状态都放 CPU。84 帧 x 5 人的 bool 全图在显存里没必要
++    offload_video_to_cpu=True, offload_state_to_cpu=True))["session_id"]
++
++old = pred.model.new_det_thresh
++pred.model.new_det_thresh = a.conf
++try:
++    pred.handle_request(request=dict(type="add_prompt", session_id=sid,
++                                     frame_index=0, text=a.prompt))
++    per_frame = {}          # frame_idx -> {obj_id: mask}
++    for r in pred.handle_stream_request(request=dict(type="propagate_in_video", session_id=sid)):
++        fi = int(r["frame_index"]); o = r["outputs"]
++        d = {}
++        for k, oid in enumerate(o["out_obj_ids"].tolist()):
++            m = o["out_binary_masks"][k].astype(bool)
++            if m.any():
++                d[int(oid)] = m
++        per_frame[fi] = d
++        if fi % 20 == 0:
++            print(f"  帧 {fi:3d}: {len(d)} 个实例  (显存 {torch.cuda.memory_allocated()/2**30:.1f}G)",
++                  flush=True)
++finally:
++    pred.model.new_det_thresh = old
++    pred.handle_request(request=dict(type="close_session", session_id=sid))
++
++# ---------- 按总面积筛掉太小的实例 ----------
++# 逐帧筛会让一个人忽有忽无; 按"他出现过的最大面积"整条决定, 要么全留要么全丢。
++area_max = {}
++for d in per_frame.values():
++    for oid, m in d.items():
++        area_max[oid] = max(area_max.get(oid, 0), int(m.sum()))
++th = a.min_area_pct / 100.0 * W * H
++keep = sorted(o for o, v in area_max.items() if v >= th)
++drop = sorted(o for o, v in area_max.items() if v < th)
++print(f"[筛选] 共 {len(area_max)} 个实例; 留 {len(keep)} 个, "
++      f"丢 {len(drop)} 个(最大面积不到画面的 {a.min_area_pct}%)")
++
++# ★ 重新编号成 1..N。0 在调色板 PNG 里是背景, 不能拿来当 id。
++remap = {o: i + 1 for i, o in enumerate(keep)}
++
++# ---------- 落盘 + 统计 ----------
++stat = {v: {} for v in remap.values()}
++for fi, fn in enumerate(FILES):
++    img = cv2.imread(f"{a.frames}/{fn}")
++    msk = np.zeros((H, W), np.uint8)
++    for oid, m in per_frame.get(fi, {}).items():
++        if oid not in remap:
++            continue
++        nid = remap[oid]
++        msk[m] = nid
++        ys, xs = np.nonzero(m)
++        stat[nid][fi] = dict(area=int(m.sum()),
++                             cx=float(xs.mean()), cy=float(ys.mean()),
++                             bbox=[int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())])
++    cv2.imwrite(f"{IMG_DIR}/{fi:08d}.jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
++    p = Image.fromarray(msk).convert("P"); p.putpalette(DAVIS_PALETTE)
++    p.save(f"{MSK_DIR}/{fi:08d}.png")
++
++# ---------- 串号 / 跳变告警 ----------
++# 两个独立的判据, 都是"这一帧的 mask 不可能是上一帧那个人自然移动过来的":
++#   质心跳变: 7.5fps 下打架的人一帧最多移动画面宽的 2~4%, 8% 是宽松的margin
++#   IoU 断裂 + 面积没变: 形状没变却整个挪走了 —— 这是换人, 不是运动
++alarms = []
++for nid, fr in stat.items():
++    ks = sorted(fr)
++    for p_, c in zip(ks, ks[1:]):
++        if c - p_ != 1:
++            continue                       # 中间断了帧, 不比
++        A, B = fr[p_], fr[c]
++        dx = abs(A["cx"] - B["cx"]) / W
++        dy = abs(A["cy"] - B["cy"]) / H
++        d = max(dx, dy)
++        ar = B["area"] / max(A["area"], 1)
++        if d > a.jump_th:
++            alarms.append(dict(id=nid, frame=c, kind="质心跳变",
++                               move_pct=round(d * 100, 1), area_ratio=round(ar, 2)))
++        elif 0.6 < ar < 1.6:
++            # 面积没大变, 再查 IoU。IoU 低说明位置完全不重叠 = 换了个人
++            ma = per_frame[p_]; mb = per_frame[c]
++            oa = [o for o, v in remap.items() if v == nid]
++            if oa and oa[0] in ma and oa[0] in mb:
++                x, y = ma[oa[0]], mb[oa[0]]
++                iou = float((x & y).sum()) / max(float((x | y).sum()), 1)
++                if iou < a.iou_th:
++                    alarms.append(dict(id=nid, frame=c, kind="IoU断裂",
++                                       iou=round(iou, 3), area_ratio=round(ar, 2)))
++
++rep = dict(frames=len(FILES), wh=[W, H], prompt=a.prompt, conf=a.conf,
++           n_instances_raw=len(area_max), kept_ids=list(remap.values()),
++           dropped_raw_ids=drop, remap={str(k): v for k, v in remap.items()},
++           coverage={str(k): len(v) for k, v in stat.items()},
++           alarms=alarms,
++           per_frame={str(k): {str(f): v for f, v in d.items()} for k, d in stat.items()})
++json.dump(rep, open(f"{a.out}/track_report.json", "w"), ensure_ascii=False, indent=1)
++
++print(f"\n[覆盖] 共 {len(FILES)} 帧")
++for nid in sorted(stat):
++    n = len(stat[nid]); ks = sorted(stat[nid])
++    print(f"   id {nid}: {n:3d}/{len(FILES)} 帧 ({n/len(FILES)*100:3.0f}%)  "
++          f"帧 {ks[0]}~{ks[-1]}  最大面积 {max(v['area'] for v in stat[nid].values())/(W*H)*100:.1f}%")
++print(f"[告警] {len(alarms)} 处疑似串号/跳变" + ("" if not alarms else ":"))
++for x in alarms[:12]:
++    print("   ", x)
++print(f"[done] -> {a.out}/{{images,masks}}/  + track_report.json")
 diff --git a/configs/body4d.yaml b/configs/body4d.yaml
 index 43079e4..179383c 100644
 --- a/configs/body4d.yaml
