@@ -83,14 +83,15 @@ SEGMENTS = {
         # ★ 段名按"这段跑完你要在闸口看什么"起, 不按步骤性质。solo(逐实例生成)和召回是
         #   两件事, 之所以同段: solo 要读 06_all_boxes.json 决定哪些实例值得单独生成,
         #   而那个文件是上一段 boxes 步才产的 —— 依赖关系决定的顺序。
-        ("逐实例+召回", ["solo", "boxes_wd", "compare", "detect", "recall", "recall_mask"], "check_recall"),
+        ("逐实例+召回", ["solo", "detect", "recall", "recall_mask"],                    "check_recall"),
         # people 排在 phys 之前(物理要拿人走过的路当路障), people_glb 在 phys 之后 —— 和室内同序。
         # 没配 BODY_RUN 的场景这两步自己跳过, 不用分两张段表。
+        # ★ 2026-10-08 去掉 WildDet3D 对照那一支之后, 第 6 段只剩 building_scene(beach 才跑, 几秒),
+        #   不值一道闸, 并进验收段; 室外从六段变五段。老轮次停在"第 6 道闸"的状态由 main() 兜住。
         ("验收",   ["recall_gen", "recall_merge", "assemble", "people", "phys",
-                    "people_glb", "render"],                                    "check_scene"),
-        ("收尾",   ["building_scene", "assemble_wd", "phys_wd", "render_wd"],          "check_final"),
+                    "people_glb", "render", "building_scene"],                  "check_scene"),
     ],
-    # 室内物体链: 多了提亮/抽帧/z朝上三步, 墙壳走 walls+shell, 没有 WD 对照那一支
+    # 室内物体链: 多了提亮/抽帧/z朝上三步, 墙壳走 walls+shell
     "indoor": [
         ("地基",   ["frames", "bright", "sub", "vlm", "da3", "up"],                    "check_ground"),
         ("生成前", ["track", "people_track", "dedup", "relabel", "pick", "verify", "override"], "check_picks"),
@@ -433,14 +434,10 @@ def check_recall(R1, tag, scene, kind="outdoor", run="r1"):
     lines += [l for l in (t.stdout + t.stderr).strip().split("\n") if l.strip()]
     return lines, [f"{R1}/95_recall_check_2d.jpg",
                    f"{R1}/05_review_sheet_afterrecall.jpg",
-                   f"{R1}/05_reuse_table_afterrecall.jpg",
-                   f"{R1}/92_compare_pca_vs_wd.jpg"]
-
-def check_final(R1, tag, scene, kind="outdoor", run="r1"):
-    return ["全部跑完"], [f"{R1}/08_render_back_phy.jpg", f"{R1}/18_render_back_wd_phy.jpg"]
+                   f"{R1}/05_reuse_table_afterrecall.jpg"]
 
 CHECKS = dict(check_ground=check_ground, check_picks=check_picks, check_scale=check_scale,
-              check_scene=check_scene, check_recall=check_recall, check_final=check_final)
+              check_scene=check_scene, check_recall=check_recall)
 
 def gate_report(i, R1, tag, scene, kind, run, last=False):
     segs = SEGMENTS[kind]
@@ -450,7 +447,7 @@ def gate_report(i, R1, tag, scene, kind, run, last=False):
         lines, look = CHECKS[fn](R1, tag, scene, kind, run)
     except Exception as e:
         lines, look = [f"(检查本身出错了: {e})"], []
-    if 2 <= i <= 4:      # 闸 3/4/5: 盒子量完才有得看; 闸 6 和闸 5 之间场景没变, 不重算; 闸 1/2 没盒子
+    if 2 <= i <= 4:      # 闸 3/4/5: 盒子量完才有得看; 闸 1/2 没盒子
         ensure_box_view(R1)
         lines.append("3D: open the gate page (tools/gate_ui.py) and press 3D in the top bar")
     for l in lines: print("  " + l)
@@ -632,6 +629,10 @@ def main():
     if not a.status:
         take_run_lock(R1)
     s = load_state(R1)
+    if s["段"] >= len(segs):
+        # 段表变短了(10-08 室外六段变五段): 老轮次停在原来的第 6 道闸, 段号 5 已经越界。
+        # 它前面五段都跑完了, 当作"全部跑完"; 不抛 IndexError, 也不重跑。
+        s = dict(段=len(segs), 停在闸口=False)
 
     if a.reset:
         save_state(R1, dict(段=0, 停在闸口=False)); print(f"[重置] {a.scene} 回到第一段"); return

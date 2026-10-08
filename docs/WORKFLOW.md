@@ -1,6 +1,6 @@
-# 室外重建流水线 · 六段六闸
+# 室外重建流水线 · 五段五闸
 
-一条视频进去,一个摆好的三维场景出来。中间断六次,每断一次人看一眼。
+一条视频进去,一个摆好的三维场景出来。中间断五次,每断一次人看一眼。
 自动的部分自动跑,机器判不了的地方停下来等人。
 
 ```
@@ -93,36 +93,27 @@ flowchart TD
   G3 -->|"--go"| solo
   subgraph S4["第 4 段 · 召回"]
     direction TB
-    solo["solo<br/>逐实例生成"] --> boxes_wd["boxes_wd<br/>WD 量盒子"] --> compare["compare<br/>两种出框对照"] --> detect["detect<br/>全图按词检测"] --> recall["recall<br/>聚类 + 合并"] --> recall_mask["recall_mask<br/>框喂回 SAM3 补抠"]
+    solo["solo<br/>逐实例生成"] --> detect["detect<br/>全图按词检测"] --> recall["recall<br/>聚类 + 合并"] --> recall_mask["recall_mask<br/>框喂回 SAM3 补抠"]
   end
   recall_mask --> G4{{"闸 4 · 审召回<br/>★ 要你填"}}
 
   G4 -->|"--go"| recall_gen
   subgraph S5["第 5 段 · 验收"]
     direction TB
-    recall_gen["recall_gen<br/>漏检实例生成"] --> recall_merge["recall_merge<br/>盒子并进主文件"] --> assemble["assemble<br/>摆回街上 + 地面"] --> phys["phys<br/>落地 + 推开穿模"] --> render["render<br/>渲染回图"]
+    recall_gen["recall_gen<br/>漏检实例生成"] --> recall_merge["recall_merge<br/>盒子并进主文件"] --> assemble["assemble<br/>摆回街上 + 地面"] --> phys["phys<br/>落地 + 推开穿模"] --> render["render<br/>渲染回图"] --> building_scene["building_scene<br/>楼单独出"]
   end
-  render --> G5{{"闸 5 · 看场景<br/>只看"}}
-
-  G5 -->|"--go"| building_scene
-  subgraph S6["第 6 段 · 收尾"]
-    direction TB
-    building_scene["building_scene<br/>楼单独出"] --> assemble_wd["assemble_wd<br/>WD 版组装"] --> phys_wd["phys_wd<br/>WD 版物理"] --> render_wd["render_wd<br/>WD 版回图"]
-  end
-  render_wd --> G6{{"闸 6 · 看成品<br/>只看"}}
-  G6 -->|"--go"| DONE(["全部跑完"])
+  building_scene --> G5{{"闸 5 · 看场景<br/>只看"}}
+  G5 -->|"--go"| DONE(["全部跑完"])
 
   G2 -. "① 决定变了 → 回跑" .-> relabel
   G4 -. "① 决定变了 → 回跑" .-> relabel
   G2 -. "改完不加 --go 再跑<br/>图重出, 状态不动" .-> G2
   G4 -. "改完不加 --go 再跑<br/>图重出, 状态不动" .-> G4
-  boxes_wd -. "WD 盒子" .-> assemble_wd
 
   class frames,vlm,da3,up,track,dedup,relabel,pick,verify,override auto
   class gen,ratio,meshes,boxes,vlm_sizes,scale,solo,detect,recall,recall_mask auto
-  class recall_gen,recall_merge,assemble,phys,render,building_scene,render_wd auto
-  class boxes_wd,compare,assemble_wd,phys_wd br
-  class G1,G3,G5,G6 gate
+  class recall_gen,recall_merge,assemble,phys,render,building_scene auto
+  class G1,G3,G5 gate
   class G2,G4 human
   class STOP stop
 ```
@@ -172,8 +163,6 @@ flowchart TD
 | 步骤 | 环境 | GPU | 干什么 | 产物 |
 |---|---|:-:|---|---|
 | `solo` | sam3d | ● | 不复用的词,每个实例各裁一张图单独生成 mesh;挑中那帧不到 `SOLO_MIN_PX`(256 像素)的不生成,组装时借同词别人的 | `outputs/` |
-| `boxes_wd` | wilddet | ● | 换 WildDet3D 再量一遍盒子,和上面那套对照 | `06_all_boxes_wilddet.json` |
-| `compare` | sam3d | | 两种出框方式并排比,出一张对照图 | `92_compare_pca_vs_wd.jpg` |
 | `detect` | wilddet | ● | WildDet3D 在整幅画面上按词找一遍,捞 SAM3 漏掉的 | `12_wd_detections.json` |
 | `recall` | sam3d | | 检测框做三维聚类,和 SAM3 已有的实例合并去重 | `13_recall.json` |
 | `recall_mask` | sam3 | ● | 把漏检的框当提示喂回 SAM3,补出 mask | `14_recall_ready.json` |
@@ -187,15 +176,10 @@ flowchart TD
 | `assemble` | sam3d | | 按盒子把 mesh 缩放、转向、摆回街上,再铺一块地面 | `07_scene.glb` |
 | `phys` | sam3d | | 让物体落到地面上,把互相穿模的推开 | `07_scene_phy.glb` |
 | `render` | sam3d | | 用原相机把场景渲染回去,和实拍并排比 | `08_render_back_phy.jpg` |
-
-### 第 6 段 · 收尾 —— 楼单独出一份,再出 WildDet3D 版的整个场景做对照
-
-| 步骤 | 环境 | GPU | 干什么 | 产物 |
-|---|---|:-:|---|---|
 | `building_scene` | sam3d | | 楼单独出 glb(**只有 `BUILDING_MODE=building+scene` 才真跑**,默认是 `scene`,跳过) | `20_buildings_phy.glb` |
-| `assemble_wd` | sam3d | | 用 WildDet3D 的盒子,把整个场景再摆一遍 | `17_scene_wd.glb` |
-| `phys_wd` | sam3d | | WD 版的落地和推开 | `17_scene_wd_phy.glb` |
-| `render_wd` | sam3d | | WD 版渲染回图,和主线那版并排比 | `18_render_back_wd_phy.jpg` |
+
+2026-10-08 去掉了 WildDet3D 对照那一支(`boxes_wd` / `compare` / `assemble_wd` / `phys_wd` / `render_wd`,原第 6 段):
+它每轮多出一份没人用的对照场景,量的盒子也不看排除词。WildDet3D 本身还在召回里用(`detect`)。
 
 ---
 
@@ -359,8 +343,7 @@ relabel → pick → verify → override → gen → ratio → boxes → solo
 - **`scale` 一致率不达标** → 退非零码。`scale` 是第 3 段最后一步,所以那种情况下**闸 3 根本出不来**,
   报告在 `world_scale_estimate.json`。
 - **`scale` 施加成功后会在同一步里重量一遍盒子**(深度变了,老盒子作废)。
-- **WildDet3D 是并行对照路线,不是支线** —— 它在默认链上,每次全跑都会跑,而且吃显存。
-  `boxes_wd` 有两个下游:同段的 `compare`,和第 6 段那整套 WD 版场景。
+- **WildDet3D 只剩召回在用**(`detect`),对照路线 2026-10-08 去掉了。
 - **`buildings` / `merge` 才是真支线** —— 不属于任何一段,`drive.py` 永远跑不到,
   只能手工 `--only` 触发。楼的摆放是坏的,这是有意保留的。
 
@@ -388,7 +371,7 @@ relabel → pick → verify → override → gen → ratio → boxes → solo
 | 这份文档的哪一节 | 去哪核 |
 |---|---|
 | 分段、每段步骤、哪道闸 | `.claude/skills/run-recon-pipeline/drive.py` 的 `SEGMENTS` |
-| 每道闸看什么图 | `drive.py` 的 `check_ground` / `check_picks` / `check_scale` / `check_recall` / `check_scene` / `check_final` —— 每个函数第二个返回值就是"该看的图" |
+| 每道闸看什么图 | `drive.py` 的 `check_ground` / `check_picks` / `check_scale` / `check_recall` / `check_scene` —— 每个函数第二个返回值就是"该看的图" |
 | 回跑清单 | `drive.py` 的 `apply_decisions`,`LOOP` 和 `todo` 那两行 |
 | 步骤名、环境、说明 | `pipeline/outdoor_pipeline.py` 的 `STEPS`;跑 `--list` 直接打印 |
 | 产物、依赖 | 同文件的 `ARTIFACTS` / `DEPS` |

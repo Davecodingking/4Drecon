@@ -19,7 +19,7 @@ description: 跑场景重建流水线, 室内室外同一个驱动 —— 分段
 
 ## 分段和闸
 
-**室外**(六段):
+**室外**(五段; 2026-10-08 去掉 WildDet3D 对照那一支之后, 原第 6 段并进验收段):
 
 
 ## 用法
@@ -45,7 +45,7 @@ $PY $D --scene cyberpunk --indoor --status
 `--status` 实测:
 
 ```
-场景 carpark  共 6 段
+场景 carpark  共 5 段
   1. 地基       frames vlm da3 up                                            ← 现在
   2. 生成前      track pick verify override
   3. 尺度       gen ratio meshes boxes vlm_sizes scale
@@ -55,7 +55,7 @@ $PY $D --scene cyberpunk --indoor --status
 ### 闸 1 实测输出
 
 ```
-闸 1/6 — 地基
+闸 1/5 — 地基
   天的方向偏离老假设 29.19°, 地面拟合内点比例 0.962
   地面高度 -29.71 m
   相机 132 帧, 轨迹总长 9.49 m, 首尾 7.57 m
@@ -140,7 +140,7 @@ $PY $D --scene cyberpunk --indoor --status
 ### 闸 3 实测输出
 
 ```
-闸 3/6 — 尺度
+闸 3/5 — 尺度
   标定倍数 k = 6.4283, 一致率 0.778, 采用 11/12 类, 施加=True
       barrier          5个  量到 0.07 m  真实 1.00 m  倍数 15.39  <- 离群不用
       car             19个  量到 0.23 m  真实 1.50 m  倍数 6.65
@@ -156,7 +156,7 @@ $PY $D --scene cyberpunk --indoor --status
 闸 5 会自己生成 `95_recall_check_2d.jpg`(召回结果逐个画在照片上),并打印:
 
 ```
-闸 5/6 — 召回
+闸 4/5 — 召回
   召回: 42 个和已有的对上, 4 个是漏检 (总 46)
     漏检按词: {'bus': 2, 'awning': 1, 'billboard': 1}
     IoU > 0.3:   0 个 —— SAM3 其实已经有了, 属于重复

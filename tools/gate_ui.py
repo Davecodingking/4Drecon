@@ -2199,7 +2199,7 @@ function scRender(){
   const g = document.getElementById("grid");
   g.innerHTML = "";
   const d = SC.state;
-  document.getElementById("gate").textContent = "Gate 3 of 6 — world scale";
+  document.getElementById("gate").textContent = "Gate 3 of 5 — world scale";
   if (d && d.报告文件) document.getElementById("scene").textContent = d.场景 || "";
   if (!d){ g.innerHTML = '<div class="empty">Loading…</div>'; scLoad(); return; }
   if (d.error){ g.innerHTML = '<div class="empty">'+esc(d.error)+'</div>'; return; }
@@ -2372,7 +2372,7 @@ async function boot(){
   document.getElementById("scene").textContent = d.场景;
   // 阶段名(pre/post)对人没意义, 它说的是"召回之前还是之后" —— 直接说那句话。
   document.getElementById("gate").textContent =
-    "Gate " + d.闸 + " of 6 — " + (d.阶段 === "post" ? "after recall" : "before generating");
+    "Gate " + d.闸 + " of 5 — " + (d.阶段 === "post" ? "after recall" : "before generating");
   写文件名(d.决策文件);
   重建索引();
   if (GATE === 'scale') scLoad(); else render();

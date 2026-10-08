@@ -24,8 +24,8 @@
 frames → vlm → da3 → up → track → pick → verify → override
        → gen → ratio → meshes → boxes → vlm_sizes → scale
        → solo → assemble → phys → render
-       → boxes_wd → compare → detect → recall → recall_mask
-       → recall_gen → recall_merge → building_scene → assemble_wd → phys_wd → render_wd
+       → detect → recall → recall_mask
+       → recall_gen → recall_merge → building_scene
 ```
 
 室内是同一套脚本,自己一份步骤表(`pipeline/indoor_pipeline.py`)。

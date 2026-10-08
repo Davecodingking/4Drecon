@@ -149,6 +149,9 @@ def state(kind, scene, run):
     R1 = r1_of(kind, scene, run)
     rc = _common.load_run_config(R1)
     seg, stop = _drive_state(R1)
+    total = len(_segments(kind))
+    if seg >= total:                      # 段表变短了(10-08 室外六段变五段): 老轮次停在原第 6 道闸 = 全部跑完
+        seg, stop = total, False
     done = seg + (1 if stop else 0)
     busy = running(scene, run)
     if rc is not None:
@@ -160,7 +163,6 @@ def state(kind, scene, run):
         people = "1" if (cfg.get("PEOPLE") == "1" or manual) else "0"
         recall = cfg.get("RECALL", "0")
     until = _common.EDITABLE_UNTIL
-    total = len(_segments(kind))
     body = people_decisions.auto_dir(R1)
     tasks = gpu_tasks(R1) if busy else []
     return {"场景": scene, "轮次": run, "类型": (rc or {}).get("类型", kind), "配置文件": rc is not None,
@@ -190,11 +192,10 @@ def media_paths(kind, scene, run):
             "recall2d":  (f"{R1}/95_recall_check_2d.jpg", "召回核对图"),
             "render":    (f"{R1}/08_render_back_phy.jpg", "渲染回图: 实拍 | 重建 | 叠加"),
             "people4d":  (f"{R1}/09_people_check.mp4", "带人的验收视频: 原片 | 重建+人 | 叠加"),
-            "people4d_prev": (f"{R1}/09_people_check_prev.mp4", "上一版带人验收视频(重跑前的, 对比用)"),
-            "render_wd": (f"{R1}/18_render_back_wd_phy.jpg", "WildDet3D 对照版渲染回图")}
+            "people4d_prev": (f"{R1}/09_people_check_prev.mp4", "上一版带人验收视频(重跑前的, 对比用)")}
 
 GATE_MEDIA = {"check_ground": ["ground"], "check_picks": ["sheet", "check", "track"], "check_scale": ["overlay"],
-              "check_recall": ["recall2d"], "check_scene": ["render", "people4d", "people4d_prev"], "check_final": ["render_wd"]}
+              "check_recall": ["recall2d"], "check_scene": ["render", "people4d", "people4d_prev"]}
 
 
 _PIPE_MOD = {}
@@ -255,10 +256,11 @@ def _timing(R1):
 
 def gate_report(R1, gate, total):
     """驱动打在日志里的第 gate 道闸的报告(最新那次), 去掉路径和 3D 提示 —— 那些在页面上另有地方。"""
-    head = f"闸 {gate}/{total} — "
+    # 总段数不认: 室外 10-08 从六段变五段, 老日志里写的是"闸 3/6", 报告照样要找得到
+    head = re.compile(rf"闸 {gate}/\d+ — ")
     for p in sorted(glob.glob(f"{R1}/logs/drive_*.log"), reverse=True):
         lines = open(p, errors="ignore").read().splitlines()
-        idx = [i for i, l in enumerate(lines) if l.startswith(head)]
+        idx = [i for i, l in enumerate(lines) if head.match(l)]
         if not idx:
             continue
         out = []
@@ -308,7 +310,7 @@ def _gate_extra(check, kind, scene, run):
 
 
 def segments_view(kind, scene, run, seg, stop, busy, recall):
-    """六段(室内五段)各自的状态、步骤、闸口报告、产出。状态: done / waiting(停在这一段的闸)
+    """每一段的状态、步骤、闸口报告、产出。状态: done / waiting(停在这一段的闸)
     / running / stopped(这一段开过头但没跑完, 多半失败了) / pending。"""
     R1 = r1_of(kind, scene, run)
     log, t0 = _latest_log(R1)

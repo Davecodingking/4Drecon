@@ -183,9 +183,6 @@ CFG = dict(
                             # body4d 自己的默认 1.0 是 mayday 近景调的, soccer 远处守门员 0.7% 被它静默丢了
     BODY_RUN    = "",
     RB_FRAMES   = "0,40,88,120,160",   # 渲染回图用哪几个机位
-    WD_FRAMES   = "5",      # WildDet3D 每个实例问几帧, 取中位数
-    WD_MINPIX   = "400",    # 2D 框小于这么多像素就不问, 问了也是噪声
-    WD_DEPTH    = "1",      # 喂 DA3 深度钉尺度。不给内参它默认 focal=max(H,W), 尺度会整体偏
     RECALL      = "0",      # 召回支路(detect/recall/recall_mask/recall_gen/recall_merge)开不开。
                             # ★ 2026-09-24 默认关(用户拍板)。关着时五步照常盖完成戳但什么都不跑,
                             #   组装只认 06_all_boxes.json(盘上留着的 merged 也不用), 驱动第 4 道闸不停。
@@ -879,49 +876,6 @@ def s_render(c, dry):
                   dict(R1=c.R1, FR=c.FR, SCENE=scene, RBOUT=out, FRAMES=c.cfg["RB_FRAMES"])),
            f"{c.LOG}/08_render.log", dry)
 
-def s_boxes_wd(c, dry):
-    """量盒子的第二条路: WildDet3D 把 2D 框抬成 3D 框, 出 06_all_boxes_wilddet.json。
-    在默认链上, 也在 drive.py 的"召回"那一段里, 每次全跑都会跑到 —— 它吃显存, 别按"额外的"估开销。
-    和 boxes 出同一个格式, 下游不用改。
-    存在的理由是现行 PCA 那条有两个几何上无解的毛病: 朝向只有轴没有正反, 尺寸只量得到
-    朝相机那一面所以系统性偏小。这条是学出来的先验, 理论上两个都能补 —— 待验证。"""
-    sh(envcmd(PY["wilddet"], f"{SCRIPTS}/boxes_from_wilddet.py",
-              dict(R1=c.R1, FR=c.FR, WD3=WD3REPO, WD_FRAMES=c.cfg["WD_FRAMES"],
-                   WD_MINPIX=c.cfg["WD_MINPIX"], WD_DEPTH=c.cfg["WD_DEPTH"])),
-       f"{c.LOG}/06_boxes_wilddet.log", dry)
-
-def s_compare(c, dry):
-    """PCA 出框 vs WildDet3D 出框 的对照表。要 boxes 和 boxes_wd 都跑过。"""
-    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/compare_boxes.py", dict(R1=c.R1)),
-       f"{c.LOG}/06_compare.log", dry)
-
-def s_assemble_wd(c, dry):
-    """用 WildDet3D 的盒子摆一遍, 和 PCA 版并存 -> 17_scene_wd.glb。
-    除盒子来源外和 assemble 走完全同一套代码, 这样两版的差异只可能来自出框方式本身。"""
-    ex = c.cfg["EXCLUDE"]
-    if c.cfg["BUILDING_WORDS"]: ex += "," + c.cfg["BUILDING_WORDS"]
-    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/assemble_scene.py",
-              dict(R1=c.R1, TAG=c.tag, GEN_OUT=f"{GEN}/outputs", SOLO_KEEP=c.cfg.get("SOLO_KEEP",""), EXCLUDE=ex, PER_INSTANCE=c.cfg["PER_INSTANCE"],
-                   BOXES=f"{c.R1}/06_all_boxes_wilddet.json", SCENE_OUT="17_scene_wd.glb")),
-       f"{c.LOG}/17_assemble_wd.log", dry)
-
-def s_phys_wd(c, dry):
-    """WildDet3D 版的落地 + 推开穿模。"""
-    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/scene_phys.py",
-              dict(R1=c.R1, SCENE_IN="17_scene_wd.glb", PHY_OUT="17_scene_wd_phy.glb",
-                   SNAP=c.cfg["SNAP"], ITERS=c.cfg["ITERS"], MARGIN=c.cfg["MARGIN"])),
-       f"{c.LOG}/17_phys_wd.log", dry)
-
-def s_render_wd(c, dry):
-    """WildDet3D 版的渲染回图, 和 08_render_back_phy.jpg 并排看。
-    ★ 注意渲染回图看不出绝对尺度错误: 相机/地面/物体在同一个缩小了的世界里互相自洽,
-    carpark 的车只有 1.12m(真值 4.6) 渲出来照样正常。尺度错只有导进引擎或跟别的资产
-    混用才暴露 —— 别拿"渲染对得上"当尺度没问题的证据。"""
-    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/render_back.py",
-              dict(R1=c.R1, FR=c.FR, SCENE="17_scene_wd_phy.glb",
-                   RBOUT="18_render_back_wd_phy.jpg", FRAMES=c.cfg["RB_FRAMES"])),
-       f"{c.LOG}/18_render_wd.log", dry)
-
 def s_building_scene(c, dry):
     """把建筑类单独摆成一个 glb (beach 要"物体一个、建筑一个"), 并跑物理修正。
     做法是复用已验证的 assemble_scene + scene_phys, 只把 EXCLUDE 反过来 —— 除建筑外全排除。
@@ -972,7 +926,7 @@ def s_building_scene(c, dry):
        f"{c.LOG}/20_building.log", dry)
 
 # ---------- 召回支路: WildDet3D 和 SAM3 并行, 捡回 SAM3 漏掉的 ----------
-# 为什么要有这条: geometric 那条(boxes_wd)吃的是 SAM3 的框, SAM3 漏掉的它看都看不到,
+# 为什么要有这条: 量盒子那条吃的是 SAM3 的框, SAM3 漏掉的它看都看不到,
 # 而当初看中 WildDet3D 的理由之一正是召回。这条让它直接看原图, 各找各的, 最后合并。
 #     帧 -> Qwen 列词 -> SAM3 跟踪       -> mask + track ID  ┐
 #                     -> WildDet3D 按词检测(原图)  -> 3D 框  ┤-> 合并
@@ -1093,8 +1047,6 @@ STEPS = [
     ("people_mesh","sam3d",   "人体2: 按闸口勾的人出网格(尺度前)", s_people_mesh),
     ("scale",    "sam3d",     "标定全局尺度 -> 真米 + 重量盒子",   s_scale),
     ("solo",     "sam3d",     "car 逐实例生成",                   s_solo),
-    ("boxes_wd", "wilddet",   "量盒子(WildDet3D)",                s_boxes_wd),
-    ("compare",  "sam3d",     "两种出框方式对照表",               s_compare),
     # ★ 2026-09-09: 召回五步整体挪到 assemble 之前。
     #   原来 assemble 排在 recall_merge 之前, 而且依赖里没有它 —— 五个召回步(三个吃满
     #   显存)照跑, 但 07_scene.glb 早就出好了, 召回捡回来的物体一个也进不去, 而且不报错。
@@ -1110,16 +1062,16 @@ STEPS = [
     ("people_glb","sam3d",    "人放进物理后的场景 + 验收视频",      s_people_glb),
     ("render",   "sam3d",     "渲染回图比对",                     s_render),
     ("building_scene","sam3d", "楼单独出 glb + 物理 + 渲染回图",    s_building_scene),
-    ("assemble_wd","sam3d",   "WildDet3D版组装 -> 17_scene_wd.glb", s_assemble_wd),
-    ("phys_wd",  "sam3d",     "WildDet3D版物理修正",              s_phys_wd),
-    ("render_wd","sam3d",     "WildDet3D版渲染回图",              s_render_wd),
     ("buildings","sam3d",     "楼(★摆放是坏的)",                  s_buildings),
     ("merge",    "sam3d",     "物体+楼合并 + 俯视图",             s_merge),
 ]
-# 主链一路跑到 render_wd: 两个版本的场景 + 两份渲染回图 + 对照表 + 召回, 一条命令出全。
+# 主链一路跑到 building_scene: 场景 + 渲染回图 + 召回 + (beach 那种)楼单独一份, 一条命令出全。
+# ★ 2026-10-08 去掉了 WildDet3D 量盒子那一支(boxes_wd/compare/assemble_wd/phys_wd/render_wd):
+#   它每轮多出一份对照场景 17_scene_wd.glb, 人从来没放进去过, 量的盒子也不看排除词, 130 秒白跑。
+#   WildDet3D 本身还在用 —— 召回那一支(detect)靠它。
 # 召回本来挂在支线上, 跑新场景默认根本不跑 —— 但它在 timesquare 上已经验证过(多找回
 # 48 个物体), 不该再当实验。楼那两步(buildings/merge)仍是支线, 那条摆放是坏的。
-DEFAULT_END = "render_wd"
+DEFAULT_END = "building_scene"
 
 
 # 每一步应当产出什么 (用来做 --check; 只列关键产物, 不求全)
@@ -1149,20 +1101,15 @@ ARTIFACTS = {
     "phys":     ["07_scene_phy.glb"],
     "people_glb": [],
     "render":   ["08_render_back.jpg", "08_render_back_phy.jpg"],
-    "boxes_wd": ["06_all_boxes_wilddet.json"],
     "detect":   ["12_wd_detections.json"],
     "recall":   ["13_recall.json"],
     "recall_mask": ["14_recall_ready.json"],
     "recall_gen": [],
     "recall_merge": ["06_all_boxes_merged.json"],
-    "compare":  [],
     # ★ 这两步都会**按条件跳过**(没有建筑 mask, 或 BUILDING_MODE 不是 building+scene),
     #   而跳过之后驱动照样盖完成戳。声明了产物的话 --check 就永远报"缺", 人会以为该重跑。
     #   条件跳过的步骤只认完成戳, 不认产物。
     "building_scene": [],
-    "assemble_wd": ["17_scene_wd.glb"],
-    "phys_wd":   ["17_scene_wd_phy.glb"],
-    "render_wd": ["18_render_back_wd_phy.jpg"],
     "buildings":[],
     "merge":    ["11_scene_full.glb", "11_topview.jpg"],
 }
@@ -1181,9 +1128,7 @@ DEPS = {
     "solo": ["scale"],          "assemble": ["scale", "solo", "verify", "recall_merge", "boxes"],
     "people": ["assemble", "people_mesh"],     "people_glb": ["phys", "people"],
     "phys": ["assemble", "people"],  "render": ["phys"],
-    "boxes_wd": ["track", "da3", "up", "scale"],
-    "compare": ["boxes", "boxes_wd", "up"],  "building_scene": ["assemble"],
-    "assemble_wd": ["boxes_wd", "solo"], "phys_wd": ["assemble_wd"], "render_wd": ["phys_wd"],
+    "building_scene": ["assemble"],
     # 召回不依赖盒子 —— 二维比对读的是 03_masks 的 mask。写成依赖 boxes 会把它
     # 无谓地拖到 gen/ratio 之后, 而它本可以排在生成之前。
     # detect 反投影用的是深度和相机, 尺度改了它就过期 —— 必须依赖 scale, 否则召回出来的
@@ -1199,7 +1144,7 @@ DEPS = {
 
 # 吃显存的步骤: 开始之前先领一张空卡(_common.GpuSlot)。
 # ★ people_track / people_mesh 故意不在这里: body4d_pipeline.py 自己在 track/mesh 上领卡, 外面再领一张就多占一张不用
-GPU_STEPS = {"vlm", "vlm_sizes", "da3", "track", "verify", "gen", "solo", "boxes_wd", "detect",
+GPU_STEPS = {"vlm", "vlm_sizes", "da3", "track", "verify", "gen", "solo", "detect",
              "recall_mask", "recall_gen"}
 # 内部拆分的步骤: 它起的每一份各领一张卡, 主循环不替它领(领了就多占一张不用)
 FANOUT_STEPS = {"track"}
@@ -1228,7 +1173,7 @@ def do_check(c):
         paths = [p.replace("@FR", c.FR) if p.startswith("@FR") else os.path.join(c.R1, p)
                  for p in arts]
         if not paths:
-            # 没有声明产物的步骤(override / compare / recall_gen / building_scene ...)
+            # 没有声明产物的步骤(override / recall_gen / building_scene ...)
             # ★ 也要判过期。原来这条分支只打印时间就 continue —— 于是这几步永远不会
             #   被报成"该重跑", 而 override 恰好是人工闸的落地点, 它过期是常态。
             st = stamp_path(c, k)

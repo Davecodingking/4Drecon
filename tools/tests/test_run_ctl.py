@@ -150,7 +150,7 @@ def test_steps_view_for_the_wizard():
         segs = s["段列表"]
         assert segs[1]["候选决定"] == {"候选": 6, "会生成": 2, "按词": {"goal post": 1, "cone": 1}, "作废词": ["helmet"]}, \
             segs[1]["候选决定"]
-        assert [x["状态"] for x in segs] == ["done", "done", "waiting", "pending", "pending", "pending"], segs
+        assert [x["状态"] for x in segs] == ["done", "done", "waiting", "pending", "pending"], segs   # 日志里写的是老的"闸 3/6", 照样要认
         assert segs[2]["名"] == "尺度" and segs[2]["步骤"][-1] == {"步骤": "scale", "说明": segs[2]["步骤"][-1]["说明"],
                                                                 "状态": "done", "耗时": None}
         assert [x for x in segs[2]["步骤"] if x["步骤"] == "people_mesh"][0]["耗时"] == 494.3
