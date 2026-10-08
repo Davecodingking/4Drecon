@@ -192,7 +192,9 @@ $PY $D --scene cyberpunk --indoor --status
   - `PARALLEL=0`:关掉并行调度,一步一步跑(只管调度;限线程另有开关)。
   - `CPU_THREADS`(默认 8):每条命令的 CPU 线程数上限(OMP/MKL/OPENBLAS/NUMEXPR)。这台机器 255 个核,
     不限的话每个进程开几百个线程空转,实测限了反而快。要退回不限:`CPU_THREADS=255`。
-  - `FANOUT=1`:打开步骤内部拆分(track 按词、出人网格按人)。默认关,因为实测拆分会改变结果。
+  - 步骤内部分卡(2026-10-08 起默认开, 结果不变): track 按"批"(每 8 个词一批, 几批几张卡)、生成物体按物体
+    (gen/solo/recall_gen, 每份一张卡各起一份 run.py)。`PARALLEL=0` 或 `MAX_GPUS=1` 就不分。
+  - `FANOUT=1`:出人网格按人拆。默认关(体型锁定修好之后还没重测, 别开)。
   - 想钉某张卡:`CUDA_VISIBLE_DEVICES=3 tools/drive_go.sh <场景> <轮次>`,这一轮就只用 3 号卡。
   - 谁在用哪张卡:`<本轮>/logs/.gpu_<卡号>.json`;正在跑哪几步:`<本轮>/logs/.running_<步骤>`。
   - 这几个环境变量要在调 `drive_go.sh` 时给,它会带进 tmux 里的驱动。
