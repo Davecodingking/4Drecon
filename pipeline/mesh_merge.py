@@ -16,7 +16,8 @@ import argparse, json, os, shutil
 import numpy as np
 from PIL import Image
 
-PER_PERSON = ("mesh_4d_individual", "focal_4d_individual", "rendered_frames_individual")
+# mhr_4d_individual: 模型的一手数据(每帧的 MHR 参数, 2026-10-08 起存), 老的输出没有这个目录, 没有就跳过
+PER_PERSON = ("mesh_4d_individual", "focal_4d_individual", "mhr_4d_individual", "rendered_frames_individual")
 WHITE = 235          # 叠加图是白底: 三个通道都不低于这个数的像素当背景。不取 250: JPEG 在人的边上有一圈
                      # 接近白的振铃, 当成前景贴过去会在别人身上留白边
 

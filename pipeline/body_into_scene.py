@@ -271,12 +271,19 @@ def pelvis_rots(Ws):
 def flip_segments(rots, t=None, rate=FLIP_RATE, min_run=MIN_RUN_S):
     """rots: 按帧顺序的骨盆朝向; t: 秒(不给按 24 fps)。返回要换掉的段 [(i0, i1)](闭区间, 下标)。
     一段够长的都没有(从头翻到尾) -> 不知道该信谁, 返回 []。"""
-    n = len(rots)
+    return short_runs([0.0] + [_rot_deg(rots[i - 1], rots[i]) for i in range(1, len(rots))], t, rate, min_run)
+
+
+def short_runs(step, t=None, rate=FLIP_RATE, min_run=MIN_RUN_S):
+    """step[i] = 第 i-1 帧到第 i 帧变了多少度(step[0] 不用); t: 秒(不给按 24 fps)。
+    变得比 rate(度/秒)还快的地方断开, 断开后连着稳不到 min_run 秒的小段 = 跳来跳去, 返回这些段 [(i0, i1)](闭区间, 下标)。
+    一段够长的都没有 -> 不知道该信谁, 返回 []。骨盆朝向(flip_segments)和各段肢体的关节角(body_motion)共用这一条判据。"""
+    n = len(step)
     if n < 2:
         return []
     t = np.arange(n) / 24.0 if t is None else np.asarray(t, float)
     dt = np.diff(t)
-    cuts = [0] + [i for i in range(1, n) if _rot_deg(rots[i - 1], rots[i]) > rate * dt[i - 1]] + [n]
+    cuts = [0] + [i for i in range(1, n) if step[i] > rate * dt[i - 1]] + [n]
     runs = [(a, b - 1) for a, b in zip(cuts[:-1], cuts[1:])]
     long_ = lambda a, b: (b - a + 1) * float(np.median(dt)) >= min_run - 1e-9      # 帧数 × 帧间隔
     if not any(long_(a, b) for a, b in runs):

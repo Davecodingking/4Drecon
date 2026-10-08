@@ -39,10 +39,10 @@ index e61969f..908bde6 100644
  
              # only 1 frames should be propagated
 diff --git a/models/sam_3d_body/notebook/utils.py b/models/sam_3d_body/notebook/utils.py
-index a552bea..0d8a3a4 100644
+index a552bea..ffb4360 100644
 --- a/models/sam_3d_body/notebook/utils.py
 +++ b/models/sam_3d_body/notebook/utils.py
-@@ -233,11 +233,19 @@ def save_mesh_results(
+@@ -233,13 +233,36 @@ def save_mesh_results(
          tmesh = renderer.vertices_to_trimesh(
              person_output["pred_vertices"], person_output["pred_cam_t"], color
          )
@@ -63,7 +63,24 @@ index a552bea..0d8a3a4 100644
 +        with open(f"{focal_dir}/{_pid}/{os.path.basename(image_path)[:-4]}.json", "w") as f:
              json.dump(focal_length, f, indent=4)
  
++        # ★ 2026-10-08: 模型的一手数据也存下来。以前只存网格, 关节数据算完就丢了, 要动作文件只能从网格反推
++        #   (不保证关节角度和模型算的一样, 每人还多花 7 分钟)。
++        #   这三组数就是生成这一帧网格时喂给 MHR 的输入:
++        #     网格 = MHR(shape_params, mhr_model_params, expr_params) / 100, y、z 取反, 再加 pred_cam_t
++        #   放在 focal 目录旁边的 mhr_4d_individual/; 老的下游不认识这个目录, 不受影响。
++        if "mhr_model_params" in person_output:
++            par_dir = f"{os.path.dirname(focal_dir.rstrip('/'))}/mhr_4d_individual/{_pid}"
++            os.makedirs(par_dir, exist_ok=True)
++            np.savez(f"{par_dir}/{os.path.basename(image_path)[:-4]}.npz",
++                     mhr_model_params=np.asarray(person_output["mhr_model_params"], np.float32),
++                     shape_params=np.asarray(person_output["shape_params"], np.float32),
++                     expr_params=np.asarray(person_output["expr_params"], np.float32),
++                     pred_cam_t=np.asarray(person_output["pred_cam_t"], np.float32),
++                     focal_length=np.float32(person_output["focal_length"]))
++
  
+ def display_results_grid(
+     images: List[np.ndarray], titles: List[str], figsize_per_image: tuple = (6, 6)
 diff --git a/scripts/offline_app.py b/scripts/offline_app.py
 index 45be5a3..a2f30e4 100644
 --- a/scripts/offline_app.py

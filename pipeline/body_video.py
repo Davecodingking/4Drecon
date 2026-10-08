@@ -25,15 +25,21 @@ ap.add_argument("--fr", required=True, help="场景那套帧的目录 (文件名
 ap.add_argument("--people", default="10_people.json")
 ap.add_argument("--out", default="09_people_check.mp4")
 ap.add_argument("--tile", type=int, default=640, help="每一栏的宽")
+ap.add_argument("--world-npz", default="", help="人的顶点直接从这个 npz 读(p<人>_V (T,N,3) DA3 世界系 + p<人>_vf 视频帧号), "
+                "不按 10_people.json 重放 —— 一手数据版 body_motion.py 的 people_world.npz")
 a = ap.parse_args()
 
 people, faces, kept = B.load_body(a.body)
 da3, cams, UP, GH, vid2key = B.load_scene(a.r1)
-mesh_run = next(f"{a.body}/{d}" for d in ("04_mesh_occ1", "04_mesh_occ0")
-                if os.path.isdir(f"{a.body}/{d}/mesh_4d_individual"))
-roots = B.load_roots(mesh_run)
-corr = json.load(open(f"{a.r1}/{a.people}"))["people"]
-world = B.apply_corr(people, corr, cams, vid2key, kept, roots)        # DA3 世界系, 和相机同一个系
+if a.world_npz:
+    _z = np.load(a.world_npz)
+    world = {k[1:-2]: dict(zip(_z[k[:-2] + "_vf"].tolist(), _z[k])) for k in _z.files if k.endswith("_V")}
+else:
+    mesh_run = next(f"{a.body}/{d}" for d in ("04_mesh_occ1", "04_mesh_occ0")
+                    if os.path.isdir(f"{a.body}/{d}/mesh_4d_individual"))
+    roots = B.load_roots(mesh_run)
+    corr = json.load(open(f"{a.r1}/{a.people}"))["people"]
+    world = B.apply_corr(people, corr, cams, vid2key, kept, roots)    # DA3 世界系, 和相机同一个系
 key2vid = {k: v for v, k in vid2key.items()}
 
 # 静态场景: glb 是 glTF 系(天 +y), 乘 inverse_T 回到 DA3 世界系, 和 render_back 同一套

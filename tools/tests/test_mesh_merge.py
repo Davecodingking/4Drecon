@@ -19,7 +19,8 @@ def _part(root, k, ids, frames_of):
     p = f"{root}/_part{k}"
     rel = {o: i + 1 for i, o in enumerate(ids)}
     for o, l in rel.items():
-        for d, ext in (("mesh_4d_individual", "ply"), ("focal_4d_individual", "json"), ("rendered_frames_individual", "jpg")):
+        for d, ext in (("mesh_4d_individual", "ply"), ("focal_4d_individual", "json"), ("mhr_4d_individual", "npz"),
+                       ("rendered_frames_individual", "jpg")):
             os.makedirs(f"{p}/{d}/{l}")
             for f in frames_of[o]:
                 # 真实输出里每人的渲染图文件名带本份里的编号: rendered_frames_individual/<编号>/00000000_<编号>.jpg
@@ -57,7 +58,8 @@ def test_merged_layout_matches_an_unsplit_run():
     M.merge(run, trk, [1, 2, 4, 7], 2, seconds=123.4)
     G = {1: 1, 2: 2, 4: 3, 7: 4}                                 # 全体统一编号: 按挑人的顺序 1..N
     for o, g in G.items():
-        for d, ext in (("mesh_4d_individual", "ply"), ("focal_4d_individual", "json"), ("rendered_frames_individual", "jpg")):
+        for d, ext in (("mesh_4d_individual", "ply"), ("focal_4d_individual", "json"), ("mhr_4d_individual", "npz"),
+                       ("rendered_frames_individual", "jpg")):
             got = sorted(os.listdir(f"{run}/{d}/{g}"))
             want = [f"{f:08d}_{g}.{ext}" if d == "rendered_frames_individual" else f"{f:08d}.{ext}" for f in frames_of[o]]
             assert got == want, (d, o, got)                      # 文件名里的编号也换成全体统一的
