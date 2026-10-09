@@ -161,6 +161,27 @@ def test_steps_view_for_the_wizard():
         assert nxt["段"] == 4 and nxt["停在"] == 5, nxt                              # 跑第 4 段, 跳过闸 4, 停在闸 5
 
 
+def test_scene_gate_offers_the_fbx_downloads():
+    """验收那道闸的产出里有两个下载: 场景 + 人的 FBX、只有场景的 FBX(motion 步出的); 没出就不列。"""
+    with tempfile.TemporaryDirectory() as T:
+        _sandbox(T)
+        R1 = run_ctl.new_run("outdoor", "soccer", "r1", people="1", recall="0")
+        _state(R1, 4, True)                                    # 停在最后一道闸(验收)
+        last = lambda: run_ctl.state("outdoor", "soccer", "r1")["段列表"][-1]
+        assert last()["名"] == "验收" and not [m for m in last()["产出"] if m.get("下载")]
+        os.makedirs(f"{R1}/12_motion")
+        open(f"{R1}/12_motion/soccer_scene_people.fbx", "wb").write(b"x" * 2_500_000)
+        open(f"{R1}/12_motion/soccer_scene.fbx", "wb").write(b"x" * 100_000)
+        dl = [m for m in last()["产出"] if m.get("下载")]
+        assert [(m["what"], m["下载"], m["大小MB"]) for m in dl] == [("fbx_scene_people", "soccer_scene_people.fbx", 2.5),
+                                                                  ("fbx_scene", "soccer_scene.fbx", 0.1)], dl
+        assert all(not m["视频"] for m in dl)
+        assert "blender" not in [m["what"] for m in last()["产出"]]                  # Blender 渲的视频是加了 --video 才有的: 没出就不列
+        open(f"{R1}/12_motion/soccer_blender.mp4", "wb").write(b"x")
+        v = [m for m in last()["产出"] if m["what"] == "blender"]
+        assert len(v) == 1 and v[0]["视频"] and not v[0]["下载"], v                   # 出了就当视频放, 不是下载链接
+
+
 def test_new_run_from_loose_video():
     """选数据集根目录下散放的 mp4: 建 <场景>/video.mp4(硬链接, 不复制不移动原文件)再开跑。"""
     with tempfile.TemporaryDirectory() as T:

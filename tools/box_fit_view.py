@@ -384,9 +384,7 @@ if bdir and bdir != "off":
         with contextlib.redirect_stdout(io.StringIO()):
             bpeople, _faces, kept = bis.load_body(bdir)
             _, _, _, _, vid2key = bis.load_scene(R1)
-            mesh_run = next(f"{bdir}/{d}" for d in ("04_mesh_occ1", "04_mesh_occ0")
-                            if os.path.isdir(f"{bdir}/{d}/mesh_4d_individual"))
-            roots = bis.load_roots(mesh_run)
+            roots = bis.load_roots(bis.mesh_run_of(bdir))
         PJ = json.load(open(pj)); corr = PJ["people"]; rep = PJ.get("报告", {})
         world = bis.apply_corr(bpeople, corr, cams, vid2key, kept, roots)
         nv = len(next(iter(next(iter(world.values())).values())))

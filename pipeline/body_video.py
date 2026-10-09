@@ -35,9 +35,7 @@ if a.world_npz:
     _z = np.load(a.world_npz)
     world = {k[1:-2]: dict(zip(_z[k[:-2] + "_vf"].tolist(), _z[k])) for k in _z.files if k.endswith("_V")}
 else:
-    mesh_run = next(f"{a.body}/{d}" for d in ("04_mesh_occ1", "04_mesh_occ0")
-                    if os.path.isdir(f"{a.body}/{d}/mesh_4d_individual"))
-    roots = B.load_roots(mesh_run)
+    roots = B.load_roots(B.mesh_run_of(a.body))
     corr = json.load(open(f"{a.r1}/{a.people}"))["people"]
     world = B.apply_corr(people, corr, cams, vid2key, kept, roots)    # DA3 世界系, 和相机同一个系
 key2vid = {k: v for v, k in vid2key.items()}

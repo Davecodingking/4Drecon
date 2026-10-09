@@ -88,8 +88,9 @@ SEGMENTS = {
         # 没配 BODY_RUN 的场景这两步自己跳过, 不用分两张段表。
         # ★ 2026-10-08 去掉 WildDet3D 对照那一支之后, 第 6 段只剩 building_scene(beach 才跑, 几秒),
         #   不值一道闸, 并进验收段; 室外从六段变五段。老轮次停在"第 6 道闸"的状态由 main() 兜住。
+        # ★ 2026-10-08 motion: 导出动作文件(场景+人的 FBX), 接在合成后面; 没有人的轮次自己跳过
         ("验收",   ["recall_gen", "recall_merge", "assemble", "people", "phys",
-                    "people_glb", "render", "building_scene"],                  "check_scene"),
+                    "people_glb", "motion", "render", "building_scene"],        "check_scene"),
     ],
     # 室内物体链: 多了提亮/抽帧/z朝上三步, 墙壳走 walls+shell
     "indoor": [
@@ -103,7 +104,7 @@ SEGMENTS = {
         # zup 排在 scale 之后(见 indoor_pipeline 的注释), 所以它在这一段不在地基段
         # ★ people / people_glb 以前也漏在外面 —— 室内走驱动从来没把人放进场景过。和室外同序
         ("验收",   ["recall_gen", "recall_merge", "zup", "shell",
-                    "assemble", "people", "phys", "people_glb", "render"],             "check_scene"),
+                    "assemble", "people", "phys", "people_glb", "motion", "render"],   "check_scene"),
     ],
 }
 

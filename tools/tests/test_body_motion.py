@@ -123,6 +123,145 @@ def test_fast_arm_is_kept_and_slow_jitter_removed():
     assert jit(Vo) < 0.6 * jit(Vn), (jit(Vo), jit(Vn))                       # 小腿上的抖动去掉 40% 以上
 
 
+def _seat_case(T=9, seed=3):
+    """一个坐着的人: 骨盆朝向每帧乱晃(±15°), 腿和上身每帧都不一样。"""
+    rng = np.random.default_rng(seed)
+    pose = rng.normal(0, 0.15, (T, 130))
+    Q = (Rotation.from_euler("y", rng.normal(0.4, 0.1, (T, 1))) * Rotation.from_rotvec(rng.normal(0, 0.15, (T, 3)))).as_matrix()
+    bis = list(range(10, 10 + T))
+    yaw = rng.normal(0, 0.2, T); yaw[4] = 0.0
+    fix = dict(ref=bis[4], freeze=False, sigma=1e-3, up=[0.0, 1.0, 0.0], seat=None,
+               yaw={str(b): float(y) for b, y in zip(bis, yaw)}, pos={str(b): [0.1 * i, 0.5, 2.0] for i, b in enumerate(bis)})
+    return pose, Q, bis, fix, yaw, rng.normal(0, 0.5, 45)
+
+
+def _global_rots(shape, pose, Q, joints):
+    P0 = np.zeros((len(pose), 204)); P0[:, 6:136] = pose
+    S = M.forward(shape, M.set_root(P0, Q, np.zeros((len(pose), 3))), False)[1]
+    jn = [str(x) for x in M.skeleton()["names"]]
+    return {j: Rotation.from_quat(S[:, jn.index(j), 3:7]).as_matrix() for j in joints}
+
+
+def test_bone_lengths_are_locked_to_the_median_of_reliable_frames():
+    """管长度的参数: 每人全程一个值 = 可信帧的中位数。不可信的帧(被翻转补帧换掉的)不参与取值, 但一样改成这个值。别的参数一个不动。"""
+    rng = np.random.default_rng(0); n, D = 9, 20; cols = np.array([3, 7, 11])
+    pose = rng.normal(0, 1, (n, D)); reliable = np.ones(n, bool); reliable[[2, 5]] = False
+    pose[2, cols], pose[5, cols] = 50.0, -50.0                                  # 不可信的两帧: 离谱的长度
+    keep = pose.copy()
+    out = BM.fix_bone_lengths(pose, reliable, cols)
+    assert np.allclose(out[:, cols], np.median(keep[reliable][:, cols], axis=0))  # 每一帧都是同一个值, 没被那两帧带偏
+    others = np.setdiff1d(np.arange(D), cols)
+    assert np.array_equal(out[:, others], keep[:, others]) and np.array_equal(pose, keep)   # 别的参数没动; 传进来的数组也没被改
+
+
+def test_bone_lengths_use_all_frames_when_none_is_reliable():
+    """整段都是补出来的(一帧可信的都没有): 用全部帧取中位数, 不留着不管。"""
+    rng = np.random.default_rng(1); pose = rng.normal(0, 1, (6, 10)); cols = np.array([1, 4])
+    out = BM.fix_bone_lengths(pose, np.zeros(6, bool), cols)
+    assert np.allclose(out[:, cols], np.median(pose[:, cols], axis=0))
+
+
+def test_locked_lengths_make_every_bone_constant_in_the_real_skeleton():
+    """拿真的 MHR 骨架验: 长度参数每帧不一样时, 骨头(关节到父关节的距离)跟着变; 锁住之后, 人怎么动每根骨头都一样长。
+    也就是说 length_params() 找全了 —— 没有别的姿势参数还在偷偷改骨头长度。"""
+    rng = np.random.default_rng(2); n = 12
+    P = np.zeros((n, 204)); P[:, 6:136] = rng.normal(0, 0.3, (n, 130))            # 每帧一个随便的姿势
+    cols = M.length_params()
+    P[:, cols] = rng.normal(0, 0.5, (n, len(cols)))                              # 长度每帧都不一样
+    par = M.skeleton()["parents"]; kid = np.where(par >= 0)[0]
+    def bones(params):
+        _, sk = M.forward(np.zeros(45), params, False)
+        return np.linalg.norm(sk[:, kid, :3] - sk[:, par[kid], :3], axis=2)       # (帧, 骨头) 厘米
+    assert np.ptp(bones(P), axis=0).max() > 0.5                                   # 修之前: 有骨头全程差出半厘米以上
+    Q = P.copy(); Q[:, 6:136] = BM.fix_bone_lengths(P[:, 6:136], np.ones(n, bool), cols - 6)
+    assert np.ptp(bones(Q), axis=0).max() < 1e-3, np.ptp(bones(Q), axis=0).max()  # 修之后: 每根骨头全程一样长
+
+
+def test_person_merged_from_two_ids_gets_one_set_of_bone_scales():
+    """核对身份把两个编号并成一个人: 上游给每个编号各锁了一套骨骼缩放, 并起来之后前后两段骨头不一样长。
+    同一条规则(每人全程一个值)用在骨骼缩放上: 全程一样长, 用的是占多数的那个编号的值。"""
+    rng = np.random.default_rng(3); n = 12
+    P = np.zeros((n, 204)); P[:, 6:136] = rng.normal(0, 0.3, (n, 130)); P[:, M.length_params()] = 0.0
+    P[:8, 136:], P[8:, 136:] = rng.normal(0, 0.2, 68), rng.normal(0, 0.2, 68)       # 前 8 帧来自一个编号, 后 4 帧来自另一个
+    par = M.skeleton()["parents"]; kid = np.array([j for j in range(len(par)) if par[j] >= 0 and par[par[j]] >= 0])
+    def bones(params):
+        _, sk = M.forward(np.zeros(45), params, False)
+        return np.linalg.norm(sk[:, kid, :3] - sk[:, par[kid], :3], axis=2)
+    assert np.ptp(bones(P), axis=0).max() > 0.5
+    Q = P.copy(); Q[:, 136:] = BM.fix_bone_lengths(P[:, 136:], np.ones(n, bool), np.arange(68))
+    assert np.ptp(bones(Q), axis=0).max() < 1e-3 and np.allclose(Q[:, 136:], P[0, 136:])   # 全程一样长; 值 = 多数那一段的
+
+
+def test_seat_fix_lower_body_is_the_reference_frame_turned_about_up():
+    """坐姿修正搬到关节上: 下半身(根 + 两条腿, 连腿长/髋宽)整段是参考帧的, 只绕竖轴转 fix 里那个角;
+    上身在世界里的朝向不跟着骨盆变 —— 根换了朝向, 差的那点由腰补上(老办法是上身顶点原样留着)。"""
+    pose, Q, bis, fix, yaw, shape = _seat_case()
+    out, Qn = BM.seat_fix_params(pose, Q, bis, fix)
+    r = 4
+    want_root = np.stack([Rotation.from_euler("y", a).as_matrix() @ Q[r] for a in yaw])
+    assert np.abs(Qn - want_root).max() < 1e-9
+    for name in ("l_upleg_ry", "r_knee_bend", "l_foot_bend", "leg_length_flexible", "hip_width_flexible"):
+        assert np.abs(out[:, COL(name)] - pose[r, COL(name)]).max() < 1e-12, name
+    js = ("c_spine0", "c_spine3", "c_head", "l_wrist", "r_lowleg")
+    g0, g1 = _global_rots(shape, pose, Q, js), _global_rots(shape, out, Qn, js)
+    deg = lambda A, B_: np.degrees(Rotation.from_matrix(np.einsum("tji,tjk->tik", A, B_)).magnitude()).max()
+    for j in ("c_spine0", "c_spine3", "c_head", "l_wrist"):                 # 上身: 和修之前一样(sigma 取得极小 = 不平滑)
+        assert deg(g0[j], g1[j]) < 0.01, (j, deg(g0[j], g1[j]))
+    turned = np.stack([Rotation.from_euler("y", a).as_matrix() @ g0["r_lowleg"][r] for a in yaw])
+    assert deg(turned, g1["r_lowleg"]) < 0.01                               # 小腿: 参考帧的, 绕竖轴转
+    # 腰以上的关节角原样(只有腰那三个角被拿去补)
+    assert np.abs(out[:, COL("l_elbow_bend")] - pose[:, COL("l_elbow_bend")]).max() < 1e-9
+    assert np.abs(out[:, COL("spine1_ry_flexible")] - pose[:, COL("spine1_ry_flexible")]).max() < 1e-9
+
+
+def test_seat_fix_upper_body_is_smoothed_over_neighbouring_frames():
+    """上身每帧的动作保留, 但按相邻帧做一次时间平滑(和老办法同一个 sigma: 按 body4d 帧号算的 1 帧)。"""
+    pose, Q, bis, fix, yaw, shape = _seat_case()
+    fix = dict(fix, sigma=1.0)
+    pose[:, COL("l_elbow_bend")] = 0.0; pose[4, COL("l_elbow_bend")] = 1.0   # 一帧的尖
+    out, _ = BM.seat_fix_params(pose, Q, bis, fix)
+    w = np.exp(-0.5 * np.arange(-3, 4.0) ** 2); w /= w.sum()
+    assert np.allclose(out[3:6, COL("l_elbow_bend")], w[2:5], atol=1e-9), out[:, COL("l_elbow_bend")]   # 前后各 3 帧都在的那几帧
+    assert 0 < out[1, COL("l_elbow_bend")] < 0.01 and out[0, COL("l_elbow_bend")] == 0                # 3 帧以外不沾
+
+
+def test_seat_fix_frozen_person_is_the_reference_frame_throughout():
+    """骨盆朝向估计整段都不可信(freeze)的人: 整个人定成参考帧, 不转。"""
+    pose, Q, bis, fix, yaw, shape = _seat_case()
+    out, Qn = BM.seat_fix_params(pose, Q, bis, dict(fix, freeze=True))
+    assert np.abs(out - pose[4]).max() < 1e-12 and np.abs(Qn - Q[4]).max() < 1e-12
+
+
+def test_seat_fix_position_follows_the_same_contact_rule():
+    """位置: 水平按 fix["pos"]; 竖直按老办法那条规则量交付的网格 —— 没对上椅子的最低点踩在地上,
+    对上椅子的屁股压进椅面 1 cm; 物理之后椅子挪了(shift)人跟着挪。"""
+    pose, Q, bis, fix, yaw, shape = _seat_case()
+    P = B.load_parts(); UP = np.array([0.0, 1.0, 0.0]); GH = 0.2
+    out, Qn = BM.seat_fix_params(pose, Q, bis, fix)
+    P0 = np.zeros((len(bis), 204)); P0[:, 6:136] = out
+    P0 = M.set_root(P0, Qn, np.zeros((len(bis), 3)))
+    W = M.forward(shape, P0, True)[0]
+    def placed(fx):
+        return M.forward(shape, M.set_root(P0, None, BM.seat_root_pos(M.root_pos(P0), W, bis, fx, GH)), True)[0]
+    V = placed(fix)                                                          # 没对上椅子
+    want = np.array([fix["pos"][str(b)] for b in bis])
+    assert np.abs(V[:, P["pelvis"]].mean(1)[:, [0, 2]] - want[:, [0, 2]]).max() < 1e-4
+    assert np.abs((V @ UP).min(1) - GH).max() < 1e-4, (V @ UP).min(1) - GH    # 每一帧最低点都在地面上
+    V = placed(dict(fix, seat=dict(chair="chair_1", 椅面离地=0.43), shift=[0.0, 0.0, 0.3]))
+    assert np.abs((V @ UP)[:, P["seat"]].min(1) - (GH + 0.43 - B.SEAT_SINK)).max() < 1e-4
+    assert np.abs(V[:, P["pelvis"]].mean(1)[:, [0, 2]] - (want[:, [0, 2]] + [0.0, 0.3])).max() < 1e-4
+
+
+def test_seat_fix_refuses_frames_it_has_no_decision_for():
+    """fix 是老流程按它自己的帧算的: 这边多出一帧它没算过的, 直接失败, 不悄悄跳过。"""
+    pose, Q, bis, fix, yaw, shape = _seat_case()
+    del fix["yaw"][str(bis[-1])]
+    try:
+        BM.seat_fix_params(pose, Q, bis, fix); assert False
+    except SystemExit as e:
+        assert "people" in str(e), e
+
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_") and callable(f):

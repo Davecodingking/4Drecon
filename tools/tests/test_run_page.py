@@ -106,6 +106,14 @@ def test_media_whitelist():
         open(f"{R1}/09_people_check_prev.mp4", "wb").write(b"\x00\x00\x00 ftypisom")
         assert _h("GET", "/run/media", dict(q, what="people4d_prev")).code == 200
         assert _h("GET", "/run/media", dict(q, what="../../etc/passwd")).code == 404
+        # 动作导出的两个 FBX: 当文件下载(不是图也不是视频), 文件名带场景名
+        assert _h("GET", "/run/media", dict(q, what="fbx_scene_people")).code == 404           # motion 步还没跑
+        os.makedirs(f"{R1}/12_motion")
+        open(f"{R1}/12_motion/soccer_scene_people.fbx", "wb").write(b"Kaydara FBX Binary  \x00")
+        open(f"{R1}/12_motion/soccer_scene.fbx", "wb").write(b"Kaydara FBX Binary  \x00")
+        for w in ("fbx_scene_people", "fbx_scene"):
+            h = _h("GET", "/run/media", dict(q, what=w))
+            assert h.code == 200 and h.ctype == "application/octet-stream" and h.body().startswith(b"Kaydara"), (w, h.code, h.ctype)
 
 
 if __name__ == "__main__":

@@ -9,12 +9,13 @@
     远近 / 位置 / 贴地   整个人平移                      根关节的位置
     认错人的帧           两帧网格之间逐顶点过渡           关节参数插值, 根朝向球面插值; 只有一头就定住
     姿势抖动             骨盆系里逐顶点平滑               每个关节参数按时间平滑, 根朝向按四元数平滑
+    坐姿(有椅子的场景)   下半身的顶点换成稳定帧的         腿的关节用稳定帧的, 根只绕竖轴转, 上身朝向由腰补回来
 
 ★ 判据一条没动, 全部调 body_into_scene 里现成的: 哪几帧算认错人(flip_segments)、远近按场景深度(frame_ratios)、
   补帧怎么补(occ_plan)、位置整理(tidy_track)。它们要吃世界系的网格 —— 现在的网格是从参数生成的。
 
-★ 还没接进流水线: 不写 10_people.json, 不管椅子/坐姿/路线(那些还在 body_into_scene 里)。先对着同一轮的老结果
-  比指标、出对比视频, 人看过再接。
+★ 接在流水线的 motion 步里(motion_export.py 调它), 排在摆人和合成之后。它不写 10_people.json, 不管椅子和路线 ——
+  物理用的路障、网页上的验收视频还是 body_into_scene 那条(网格上修的)。坐着的人怎么摆读 10_people.json 里定好的。
 
 用法:
   python body_motion.py --r1 <场景结果目录> --mesh-run <带 mhr_4d_individual 的出网格目录> --out <输出目录>
@@ -32,6 +33,7 @@ sys.path.insert(0, os.path.expanduser("~/sam3d/data/outdoor/scripts"))
 import body_into_scene as B
 import mhr_body as M
 from world_frame import export_T
+import cam_track
 
 POSE = slice(6, M.NPOSE)          # 各关节(含手)的参数; [0:6] 是根
 
@@ -143,12 +145,27 @@ def fix_limb_spikes(pose, t, groups, thr=LIMB_SPIKE_DEG, half=LIMB_SPIKE_HALF):
 
 
 def fix_bone_lengths(pose, reliable, cols):
-    """管骨头长度的那几个参数(cols): 模型每帧给同一个人估的都不一样, 仿真里骨架该是固定的。
-    pose (T,D) 关节参数; reliable (T,) bool: 这一帧模型可信(没被翻转补帧换掉); cols: 这几个参数在 pose 里的列。
-    返回新的 pose。现在什么都不改 —— 要不要定成每人一个常数、取什么值, 还没定。"""
-    pose = np.array(pose, float, copy=True)
-    # TODO(human): 每人每个长度参数定成一个常数。例如 pose[:, cols] = 某个统计量(pose[reliable][:, cols])。
+    """决定骨头长度的参数(cols): 每人全程定成一个值。用在两处(见 solve):
+      - 姿势参数里管长度的那 6 个(脊柱/脖子/手臂/腿的长度、肩宽、胯宽)
+      - 骨骼缩放那 68 个
+    ★ 为什么: SAM 3D Body 一帧只看一张图, 不知道前后帧是同一个人, 姿势里那 6 个数每帧各估各的(nfl1 人 6 的前臂差到近 10 cm)。
+      上游的视频版把体型和骨骼缩放锁成了一个值, 那 6 个在姿势参数里, 漏了。而且它是按"编号"锁的: 一个人由几个编号并成
+      (核对身份, 见 people_identity.py)时, 各段的骨骼缩放不一样(office r10 人 2 = 编号 2 + 6 + 10, 脚的骨头前后差 2 cm)。
+      仿真和换骨架都要骨头长度固定。体型那 45 个数 load_params 已经按人取了中位, 这里不用管。
+    取值 = 模型可信的帧(reliable: 没被翻转补帧换掉的)的中位数 —— 被换掉的帧模型本来就是错的, 不让它们参与;
+    一帧可信的都没有(整段都是补的)就用全部帧。别的参数不动。
+    pose (T,D) 关节参数; reliable (T,) bool; cols: 这几个参数在 pose 里的列。返回新的 pose。"""
+    pose = np.array(pose, float, copy=True); reliable = np.asarray(reliable, bool)
+    src = pose[reliable] if reliable.any() else pose
+    pose[:, cols] = np.median(src[:, cols], axis=0)
     return pose
+
+
+def lock_shift(shape, P_before, P_after, dev="cpu"):
+    """锁骨头长度让身体表面挪了多少(厘米): 同一帧、根关节不动, 锁之前 vs 锁之后的网格。返回 (平均, 最大)。只给报告用。"""
+    Va, _ = M.forward(shape, P_before, False, dev); Vb, _ = M.forward(shape, P_after, False, dev)
+    d = np.linalg.norm(np.asarray(Vb) - np.asarray(Va), axis=2) * 100
+    return float(d.mean()), float(d.max())
 
 
 def fill_flips(pose, Q, p, bis, occ):
@@ -166,7 +183,80 @@ def fill_flips(pose, Q, p, bis, occ):
     return pose, Q, p
 
 
-def solve(par, shape, cams, vid2key, kept, UP, GH, mesh_run, da3, fps, focals, dev="cpu"):
+_SEAT = {}
+def _seat_consts(dev="cpu"):
+    """坐姿修正要的骨架常数: 下半身的参数列、腰(c_spine0)三个角各由哪些参数加出来、腰的预旋转。"""
+    if dev not in _SEAT:
+        from scipy.spatial.transform import Rotation
+        sk = M.skeleton(dev); names = [str(x) for x in sk["names"]]; par = sk["parents"].astype(int)
+        PT = M.model(dev).character_torch.parameter_transform.parameter_transform.cpu().numpy()[:, POSE]
+        leg = np.array([n in ("l_upleg", "r_upleg") for n in names])
+        for j in range(1, len(names)):                       # 父关节的编号都比子关节小: 顺着往下把两条腿整棵标出来
+            leg[j] |= leg[par[j]]
+        lower = np.array([c for c in range(PT.shape[1]) if len(np.nonzero(PT[:, c])[0])
+                          and leg[np.nonzero(PT[:, c])[0] // 7].all()])              # 只驱动腿上关节的参数(连腿长、髋宽)
+        r = names.index("c_spine0") * 7
+        A = PT[r + 3:r + 6]                                  # (3,130): 腰的 rx/ry/rz = A @ 关节参数
+        flex = np.array([int(np.nonzero((A[k] == 1.0) & (np.count_nonzero(PT, axis=0) == 1))[0][0]) for k in range(3)])
+        S = M.forward(np.zeros(M.NSHAPE), np.zeros((1, M.NPOSE + M.NSCALE)), False, dev)[1][0]
+        G = lambda j: Rotation.from_quat(S[names.index(j), 3:7]).as_matrix()
+        _SEAT[dev] = dict(lower=lower, A=A, flex=flex, pre=G("root").T @ G("c_spine0"))
+    return _SEAT[dev]
+
+
+def seat_fix_params(pose, Q, bis, fix, dev="cpu"):
+    """坐姿修正搬到关节数据上。fix 是 body_into_scene.seat_fix 算好的那份(10_people.json 里的 seat_fix):
+    用哪一帧的腿、每帧绕竖轴转多少、定不定住 —— 判据和数值都不重算, 这里只管"改的是什么":
+      下半身(根 + 两条腿, 连腿长/髋宽)整段用参考帧的, 根只绕竖轴转 fix["yaw"];
+      上身每帧的动作保留, 按相邻帧做一次时间平滑(sigma 按 body4d 帧号算, 和老办法一样);
+      上身在世界里的朝向不跟着骨盆变(老办法是上身的顶点原样留着): 根换了朝向, 差的那一点由腰(c_spine0)补上;
+      定住(freeze)的人整段就是参考帧。
+    pose (T,130) 关节参数, Q (T,3,3) 根在 DA3 世界里的朝向。返回 (pose, Q); 根关节的位置见 seat_root_pos。"""
+    from scipy.spatial.transform import Rotation
+    K = _seat_consts(dev); T = len(bis)
+    miss = [b for b in bis if str(int(b)) not in fix["yaw"]]
+    if miss or fix["ref"] not in bis:
+        raise SystemExit(f"[失败] 坐姿修正里没有这几帧的决定: {miss or fix['ref']} —— 10_people.json 和这一轮的人体网格对不上, 重跑 people")
+    r = list(bis).index(fix["ref"])
+    if fix["freeze"]:
+        return np.repeat(pose[r:r + 1], T, 0), np.repeat(Q[r:r + 1], T, 0)
+    b = np.asarray(bis, float)
+    wt = np.exp(-0.5 * ((b[:, None] - b[None, :]) / fix["sigma"]) ** 2)
+    wt[np.abs(b[:, None] - b[None, :]) > 3 * fix["sigma"]] = 0.0
+    wt /= wt.sum(1, keepdims=True)
+    E = lambda e: Rotation.from_euler("xyz", e).as_matrix()
+    q = Rotation.from_matrix(Q @ K["pre"] @ E(pose @ K["A"].T)).as_quat()    # 修之前腰在世界里的朝向 = 上身的朝向
+    for i in range(1, T):                                                    # q 和 -q 同一个朝向, 先接成连续的
+        if q[i] @ q[i - 1] < 0:
+            q[i] = -q[i]
+    q = wt @ q
+    Gs = Rotation.from_quat(q / np.linalg.norm(q, axis=1, keepdims=True)).as_matrix()
+    out = wt @ pose
+    out[:, K["lower"]] = pose[r, K["lower"]]
+    UP = np.asarray(fix["up"], float)
+    Qn = np.stack([B._rot_up(UP, fix["yaw"][str(int(bb))]) @ Q[r] for bb in bis])
+    e = M._continuous_euler(Rotation.from_matrix(K["pre"].T @ np.swapaxes(Qn, 1, 2) @ Gs).as_euler("xyz"))
+    out[:, K["flex"]] += e - out @ K["A"].T                                   # 腰那三个角补到刚好
+    return out, Qn
+
+
+def seat_root_pos(p, W, bis, fix, GH):
+    """坐着的人的根关节位置。p (T,3) 现在的根关节位置, W (T,N,3) 用它生成的网格, GH 地面高。
+    水平: 骨盆(那圈顶点的中心)落在 fix["pos"] 上。
+    竖直: 和老办法同一条规则, 但量的是这里要交付的网格 —— 对上椅子的, 屁股压进椅面 SEAT_SINK; 没对上的, 最低点踩在地上。
+          (直接抄 fix["pos"] 的高度的话, 两边的腿差几毫米, 脚就会陷进地面一点: office r8 人 8 陷 1.3 cm。)
+    最后加物理之后椅子挪的 fix["shift"]。"""
+    P = B.load_parts(); UP = np.asarray(fix["up"], float)
+    C = W[:, P["pelvis"]].mean(1)
+    h = (W - C[:, None, :]) @ UP                                              # 每个顶点比骨盆高多少
+    seat = fix.get("seat")
+    y = (GH + seat["椅面离地"] - B.SEAT_SINK - h[:, P["seat"]].min(1)) if seat else (GH - h[:, P["low"]].min(1))
+    pos = np.array([fix["pos"][str(int(b))] for b in bis])
+    want = pos - np.outer(pos @ UP, UP) + np.outer(y, UP) + np.asarray(fix.get("shift", [0, 0, 0]), float)
+    return p + want - C
+
+
+def solve(par, shape, cams, vid2key, kept, UP, GH, mesh_run, da3, fps, focals, dev="cpu", seat_fixes=None):
     """返回 {人: dict(frames, vf, params(世界系 DA3), shape, conf)}, 报告。流程和 body_into_scene.solve_people 一一对应。"""
     RATIO_TOL = 0.25
     todo, all_r = {}, []
@@ -205,8 +295,13 @@ def solve(par, shape, cams, vid2key, kept, UP, GH, mesh_run, da3, fps, focals, d
             mroot = B.mask_roots(pid, bis, rt, rf, focals[pid], mesh_run, cams, vid2key, kept)
             occ = B.occ_plan(bis, segs, tmap, dict(zip(bis, p)), mroot)
             pose, Q, p = fill_flips(pose, Q, p, bis, occ)
-        # 1a') 骨头长度: 模型逐帧估的都不一样(见 fix_bone_lengths; 现在还没处理, 原样通过)
-        pose = fix_bone_lengths(pose, np.array([str(b) not in occ for b in bis]), M.length_params(dev) - POSE.start)
+        # 1a') 骨头长度: 每人全程定成一个值(见 fix_bone_lengths) —— 姿势参数里管长度的那几个, 和骨骼缩放那一段
+        reliable = np.array([str(b) not in occ for b in bis])
+        P_len = Pw.copy(); P_len[:, POSE] = pose
+        pose = fix_bone_lengths(pose, reliable, M.length_params(dev) - POSE.start)
+        Pw = Pw.copy(); Pw[:, M.NPOSE:] = fix_bone_lengths(Pw[:, M.NPOSE:], reliable, np.arange(M.NSCALE))
+        P_fix = Pw.copy(); P_fix[:, POSE] = pose
+        len_shift = lock_shift(shape[pid], P_len, P_fix, dev)
         # 1b') 肢体级的毛刺: 单条手臂/腿的关节角跳出去又跳回来的那几帧, 换成前后的过渡(见 fix_limb_spikes)
         groups = {n: c - POSE.start for n, c in M.limb_groups(dev).items()}
         pose, limb_fix = fix_limb_spikes(pose, tt, groups)
@@ -215,11 +310,16 @@ def solve(par, shape, cams, vid2key, kept, UP, GH, mesh_run, da3, fps, focals, d
         if T >= 5:
             pose, Q = smooth_joints(pose, tt, limb_speed_fn(shape[pid], Pw[0, M.NPOSE:], tt, dev)), smooth_rots(Q, tt)
         # 2) 轨迹整理: 骨盆位置三个方向一起平滑 + 贴地 + 腾空(tidy_track 吃网格, 网格从整理好姿势的参数生成)
+        #    坐着的人换一种摆法(老流程也是: 位置整理的结果不用, 按坐姿修正重算), 见 seat_fix_params
+        fix = (seat_fixes or {}).get(pid)
+        if fix:
+            Q_free = Q
+            pose, Q = seat_fix_params(pose, Q, bis, fix, dev)
         Pw = Pw.copy(); Pw[:, POSE] = pose
         Pw = M.set_root(Pw, Q, p)
         W, _ = M.forward(shape[pid], Pw, True, dev)
         conf = np.array([B.CONF_SUB if str(b) in occ else 1.0 for b in bis])
-        delta = B.tidy_track(dict(zip(bis, W)), bis, tt, conf, UP, GH)
+        delta = (seat_root_pos(p, W, bis, fix, GH) - p) if fix else B.tidy_track(dict(zip(bis, W)), bis, tt, conf, UP, GH)
         p = p + delta
         Pw = M.set_root(Pw, Q, p)
         feet = np.array([float(((v + d) @ UP).min() - GH) for v, d in zip(W, delta)])
@@ -230,9 +330,15 @@ def solve(par, shape, cams, vid2key, kept, UP, GH, mesh_run, da3, fps, focals, d
                         量到深度的帧=len(ratios), 翻转补帧=B._fix_report(occ, flips, kept),
                         肢体跳变修复={n: [[int(kept[bis[i0]]), int(kept[bis[i1]])] for i0, i1 in v] for n, v in limb_fix.items()},
                         关节参数平滑_改动中位_度=round(float(np.degrees(np.median(np.abs(pose - pose_raw)))), 2) if T >= 5 else None,
+                        锁骨头长度_表面挪动_厘米=[round(len_shift[0], 2), round(len_shift[1], 2)],
                         脚离地范围=[round(float(feet.min()), 3), round(float(feet.max()), 3)],
                         帧间位移最大_前=round(float(step0.max()), 3), 帧间位移最大_后=round(float(step.max()), 3),
                         可信帧比例=round(float((conf >= 1.0).mean()), 2))
+        if fix:
+            turn = np.degrees(np.arccos(np.clip((np.einsum("tij,tij->t", Q_free, Q) - 1) / 2, -1, 1)))
+            rep[pid]["坐姿修正"] = dict(参考帧=int(kept[fix["ref"]]), 定住=bool(fix["freeze"]),
+                                    椅子=(fix.get("seat") or {}).get("chair"),
+                                    骨盆朝向改动_度=[round(float(np.median(turn)), 1), round(float(turn.max()), 1)])
     return out, rep
 
 
@@ -240,6 +346,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--r1", required=True); ap.add_argument("--mesh-run", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--people", default="10_people.json", help="摆人那步的结果(相对 r1): 只读里面的坐姿修正")
     ap.add_argument("--body", default="", help="body4d 那一轮(读 00_frames/frames.json); 不给就读 09_body4d_report.json")
     a = ap.parse_args()
     import torch
@@ -250,9 +357,14 @@ def main():
     fj = json.load(open(f"{body}/00_frames/frames.json")); kept, fps = fj["kept_indices"], fj["src_fps"]
     par, shape = load_params(a.mesh_run)
     print(f"一手数据: {len(par)} 人, 每人 {[len(v) for v in par.values()]} 帧; 视频 {fps:.2f} fps; 设备 {dev}")
-    res, rep = solve(par, shape, cams, vid2key, kept, UP, GH, a.mesh_run, da3, fps, B.load_focals(a.mesh_run), dev)
+    # 坐着的人怎么摆是摆人那步(body_into_scene)定的: 谁算坐着、用哪一帧的腿、坐哪把椅子。这里照着做, 不重判
+    pj = f"{a.r1}/{a.people}"
+    seat = {p: c["seat_fix"] for p, c in json.load(open(pj))["people"].items() if c.get("seat_fix")} if os.path.exists(pj) else {}
+    print(f"坐姿修正: {sorted(seat, key=int) or '没有人要做'}" + ("" if os.path.exists(pj) else f"  ★ 没有 {pj}, 当作没人坐着"))
+    res, rep = solve(par, shape, cams, vid2key, kept, UP, GH, a.mesh_run, da3, fps, B.load_focals(a.mesh_run), dev, seat)
     FL = export_T(UP)
     mo, wv = dict(fps=np.float32(fps)), dict(fps=np.float32(fps))
+    mo.update(cam_track.track(cams, vid2key, FL), video_wh=np.array(fj["out_wh"], np.int32))   # 相机序列: 和人同一个世界系、同一套帧号
     for pid, r in res.items():
         V, _ = M.forward(r["shape"], r["params"], True, dev)
         wv[f"p{pid}_V"] = V.astype(np.float32); wv[f"p{pid}_vf"] = r["vf"].astype(np.int32)
@@ -262,7 +374,12 @@ def main():
         q = rep[pid]
         print(f"  人 {pid}: {q['帧数']:3d} 帧  远近 x{q['远近比例']:.3f}" + (" (离群, 用全体中位)" if q["用全体中位"] else "")
               + f"  脚离地 {q['脚离地范围']}  最大一步 {q['帧间位移最大_前']:.2f} -> {q['帧间位移最大_后']:.2f} m"
-              + f"  关节平滑改动中位 {q['关节参数平滑_改动中位_度']}°")
+              + f"  关节平滑改动中位 {q['关节参数平滑_改动中位_度']}°"
+              + f"  锁骨头长度: 表面挪了平均 {q['锁骨头长度_表面挪动_厘米'][0]} / 最大 {q['锁骨头长度_表面挪动_厘米'][1]} cm")
+        if q.get("坐姿修正"):
+            z = q["坐姿修正"]
+            print(f"         坐姿修正: 腿用第 {z['参考帧']} 帧的" + (", 整个人定住" if z["定住"] else "")
+                  + (f", 坐在 {z['椅子']}" if z["椅子"] else ", 没对上椅子(脚着地)") + f"; 骨盆朝向改了 中位 {z['骨盆朝向改动_度'][0]}° 最大 {z['骨盆朝向改动_度'][1]}°")
         if q["肢体跳变修复"]:
             print("         肢体跳变: " + "; ".join(f"{n} {' '.join(f'{a}~{b}' for a, b in v)}" for n, v in q["肢体跳变修复"].items()))
         for g in q["翻转补帧"]:

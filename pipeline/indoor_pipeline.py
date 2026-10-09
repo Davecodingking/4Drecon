@@ -1215,17 +1215,28 @@ def o_people(c, dry):
        f"{c.LOG}/10_people.log", dry)
 
 def o_people_glb(c, dry):
-    """合成(物理之后): 按 10_people.json 把会动的人放进 07_scene_phy.glb -> 09_scene_4d.glb,
-    再出验收视频 09_people_check.mp4 (原视频 | 同一个相机看到的重建+人 | 两者叠加)。"""
+    """合成(物理之后): 07_scene_phy.glb 摘掉静态人形 -> 09_scene_nopeople.glb, 按 10_people.json 出几帧验收图,
+    再出验收视频 09_people_check.mp4 (原视频 | 同一个相机看到的重建+人 | 两者叠加)。
+    (会动的人的交付物是 motion 那步的 FBX; 顶点动画的 09_scene_4d.glb 2026-10-08 起不出了。)"""
     body = _body(c, dry)
     if not body:
         print("    这个场景没配 BODY_RUN(没有人), 跳过"); return
     sh(envcmd(PY["sam3d"], f"{PIPE}/body_into_scene.py", None,
               ["--r1", c.R1, "--body", body, "--mode", "compose", "--scene-glb", "07_scene_phy.glb",
-               "--out", "09_scene_4d.glb", "--render", "--fr", c.FRO]), f"{c.LOG}/10_people_glb.log", dry)
+               "--render", "--fr", c.FRO]), f"{c.LOG}/10_people_glb.log", dry)
     sh(envcmd(PY["sam3d"], f"{PIPE}/body_video.py", None,
               ["--r1", c.R1, "--body", body, "--scene", "07_scene_phy.glb", "--fr", c.FRO]),
        f"{c.LOG}/10_people_glb.log", dry)
+
+def o_motion(c, dry):
+    """导出动作文件(合成之后): 在模型的一手数据(关节参数)上做修复 -> 12_motion/:
+    场景 + 人的 FBX(人带骨骼)、只有场景的 FBX、.blend、每人每帧的原始参数。三段脚本和自检见 motion_export.py。
+    出网格那一轮没存一手数据(2026-10-08 之前跑的)会直接失败, 不悄悄跳过。"""
+    body = _body(c, dry)
+    if not body:
+        print("    这个场景没配 BODY_RUN(没有人), 跳过"); return
+    sh(envcmd(PY["sam3d"], f"{PIPE}/motion_export.py", None, ["--r1", c.R1, "--body", body]),
+       f"{c.LOG}/12_motion.log", dry)
 
 def o_walls(c, dry):
     """★ 已从 obj 链摘掉 —— 留着只为 lm 链和查阅。房间壳改从点云自己算足迹了。
@@ -1343,6 +1354,7 @@ STEPS_OBJ = [
     ("people",      "sam3d",     "摆人: 远近/脚着地/坐哪把椅子/走过的路", o_people),
     ("phys",        "sam3d",     "落地 + 推开穿模(墙是静态碰撞体)",       o_phys),
     ("people_glb",  "sam3d",     "人放进物理后的场景 + 验收视频",         o_people_glb),
+    ("motion",      "sam3d",     "导出动作文件: 场景+人的 FBX(带骨骼)",   o_motion),
     ("render",      "sam3d",     "渲染回图比对",                       o_render),
 ]
 
@@ -1430,6 +1442,7 @@ ARTIFACTS_OBJ = {
     "people":       [],                     # 没有人的场景这步是空的, 产物不能写死
     "phys":         ["07_scene_phy.glb"],
     "people_glb":   [],
+    "motion":       [],                     # 同上: 没有人就跳过, 产物在 12_motion/ 底下、文件名带场景名
     "render":       ["08_render_back.jpg"],
 }
 DEPS_OBJ = {
@@ -1460,6 +1473,7 @@ DEPS_OBJ = {
     "people": ["assemble", "people_mesh"],
     "phys": ["assemble", "people"],
     "people_glb": ["phys", "people"],
+    "motion": ["people_glb"],               # 场景用合成那步出的 09_scene_nopeople.glb
     "render": ["phys"],
 }
 
@@ -1470,7 +1484,7 @@ DEPS_OBJ = {
 #   shell 内部会调 o_walls —— 那里有 wait_gpu 但没有锁, 挡不住另一条流水线。
 # ★ people_track / people_mesh 故意不在这里: body4d_pipeline.py 自己在 track/mesh 上领卡, 外面再领一张就多占一张不用
 GPU_STEPS = {"vlm", "vlm_sizes", "vlm_rest", "da3", "track", "verify", "gen", "solo",
-             "detect", "recall_mask", "recall_gen", "shell",   # 物体链
+             "detect", "recall_mask", "recall_gen", "shell", "motion",   # 物体链
              "lm", "mask", "floor"}                            # SpatialLM 链
 # 内部拆分的步骤: 它起的每一份各领一张卡, 主循环不替它领
 # gen 只在物体链上是分卡的(o_gen -> _gen_dirs); lm 链的 s_gen 自己领卡, 所以 gen 由主循环按链加进来

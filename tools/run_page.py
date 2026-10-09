@@ -102,7 +102,8 @@ def handle(h, method, path, q, body=None):
             p = run_ctl.media_paths(kind, scene, run).get(q.get("what", ""), (None,))[0]
             if not p or not os.path.exists(p):
                 h._json({"error": "no such media"}, 404); return True
-            h._send(200, "video/mp4" if p.endswith(".mp4") else "image/jpeg", open(p, "rb").read()); return True
+            ctype = {".mp4": "video/mp4", ".fbx": "application/octet-stream"}.get(os.path.splitext(p)[1], "image/jpeg")
+            h._send(200, ctype, open(p, "rb").read()); return True
         if path == "/run/video":
             p = f"{body4d}/03_track.mp4"
             if not os.path.exists(p):
@@ -235,6 +236,8 @@ RUN_PAGE = """<!doctype html><meta charset=utf-8><title>本轮</title>""" + _STY
  .media{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}
  .media figure{margin:0} .media img,.media video{width:100%;border-radius:6px;border:1px solid var(--line);display:block;background:#000}
  .media figcaption{font-size:12px;color:var(--dim);margin-top:3px}
+ a.dl{display:inline-block;padding:7px 12px;border:1px solid var(--line);border-radius:6px;text-decoration:none;color:inherit}
+ a.dl:hover{border-color:currentColor}
  .decide{border-left:3px solid var(--hi);padding:2px 0 2px 12px;margin-top:14px}
  table.kv{border-collapse:collapse;font-size:13px} table.kv td{padding:3px 14px 3px 0;border-top:1px solid var(--line)}
  .thumb{height:64px;border-radius:4px;vertical-align:middle;margin-right:6px}
@@ -365,7 +368,11 @@ function segHTML(g){
   if (g.跳过的物体 && g.跳过的物体.length) h += '<h3>没摆进场景的物体</h3><table class=kv>' + g.跳过的物体.map(x =>
     '<tr><td>' + esc(x.词) + ' #' + x.实例 + '</td><td>' + esc(x.原因) + '</td><td class=dim>' +
     (x.尺寸 ? x.尺寸.map(v => v.toFixed(1)).join(' × ') + ' m' : '') + '</td></tr>').join('') + '</table>';
-  if (g.产出.length) h += '<h3>新产出</h3><div class=media>' + g.产出.map(m =>
+  const dl = g.产出.filter(m => m.下载), shown = g.产出.filter(m => !m.下载);
+  if (dl.length) h += '<h3>下载</h3><div class=row>' + dl.map(m =>
+    '<a class=dl href="' + U('/run/media', {what:m.what}) + '" download="' + esc(m.下载) + '">⬇ ' + esc(m.说明) +
+    ' <span class=dim>' + esc(m.下载) + ' · ' + m.大小MB + ' MB</span></a>').join('') + '</div>';
+  if (shown.length) h += '<h3>新产出</h3><div class=media>' + shown.map(m =>
     '<figure>' + (m.视频 ? '<video controls preload=metadata src="' + U('/run/media', {what:m.what}) + '"></video>'
       : '<a href="' + U('/run/media', {what:m.what}) + '" target=_blank><img src="' + U('/run/media', {what:m.what}) + '"></a>') +
     '<figcaption>' + esc(m.说明) + '</figcaption></figure>').join('') + '</div>';

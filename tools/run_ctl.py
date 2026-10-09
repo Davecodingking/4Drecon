@@ -184,6 +184,7 @@ def state(kind, scene, run):
 # 每道闸摆什么图/视频。键是 /run/media?what= 的白名单, 路径只在这里拼, 不收任意路径。
 def media_paths(kind, scene, run):
     R1 = r1_of(kind, scene, run); body = people_decisions.auto_dir(R1)
+    mo = f"{R1}/12_motion/{os.path.basename(os.path.dirname(R1))}"     # motion 步的产物, 文件名带场景名(见 motion_export.py)
     return {"ground":    (f"{R1}/02_ground_check.jpg", "地基核对图: 抽帧 + 点云俯视(相机轨迹) + 侧视(地面线)"),
             "sheet":     (f"{R1}/05_review_sheet.jpg", "候选联络图(改决定在候选页)"),
             "check":     (f"{body}/03_check.jpg", "人体跟踪体检图"),
@@ -192,10 +193,15 @@ def media_paths(kind, scene, run):
             "recall2d":  (f"{R1}/95_recall_check_2d.jpg", "召回核对图"),
             "render":    (f"{R1}/08_render_back_phy.jpg", "渲染回图: 实拍 | 重建 | 叠加"),
             "people4d":  (f"{R1}/09_people_check.mp4", "带人的验收视频: 原片 | 重建+人 | 叠加"),
-            "people4d_prev": (f"{R1}/09_people_check_prev.mp4", "上一版带人验收视频(重跑前的, 对比用)")}
+            "people4d_prev": (f"{R1}/09_people_check_prev.mp4", "上一版带人验收视频(重跑前的, 对比用)"),
+            "blender":   (f"{mo}_blender.mp4", "Blender 里从原视频的视角渲的视频(场景 + 人, 用的就是交付的那份数据)"),
+            # 交付的文件: 页面上是下载链接, 不是图
+            "fbx_scene_people": (f"{mo}_scene_people.fbx", "场景 + 人 + 相机的 FBX(人带骨骼动画, 相机带每帧的位姿和焦距)"),
+            "fbx_scene": (f"{mo}_scene.fbx", "只有场景的 FBX")}
 
 GATE_MEDIA = {"check_ground": ["ground"], "check_picks": ["sheet", "check", "track"], "check_scale": ["overlay"],
-              "check_recall": ["recall2d"], "check_scene": ["render", "people4d", "people4d_prev"]}
+              "check_recall": ["recall2d"],
+              "check_scene": ["render", "people4d", "people4d_prev", "blender", "fbx_scene_people", "fbx_scene"]}
 
 
 _PIPE_MOD = {}
@@ -345,7 +351,10 @@ def segments_view(kind, scene, run, seg, stop, busy, recall):
                 else "等你" if st == "waiting" else "通过" if st == "done" else None)
         item = {"段": i + 1, "名": name, "状态": st, "闸": gate, "步骤": rows,
                 "报告": gate_report(R1, i + 1, len(_segments(kind))) if st in ("done", "waiting") else [],
-                "产出": [{"what": w, "说明": media[w][1], "视频": media[w][0].endswith(".mp4")}
+                "产出": [{"what": w, "说明": media[w][1], "视频": media[w][0].endswith(".mp4"),
+                          # 不是图也不是视频的(FBX): 页面上给下载链接, 这里带上文件名和大小
+                          "下载": os.path.basename(media[w][0]) if media[w][0].endswith(".fbx") else None,
+                          "大小MB": round(os.path.getsize(media[w][0]) / 1e6, 1)}
                          for w in GATE_MEDIA.get(check, []) if os.path.exists(media[w][0])]}
         if st in ("done", "waiting"):
             item.update(_gate_extra(check, kind, scene, run))
