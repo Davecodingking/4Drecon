@@ -20,7 +20,12 @@
 已知的局限: 甲走了, 乙后来正好站到同一个位置、两人从没同框 —— 分不出来, 会并成一个人(并了谁都记在 identity.json 里)。
 
 结果落成 <人体目录>/06_identity/, 结构和出网格目录一样(网格 / 相机 / 一手参数是链接, 抠图按新编号重画), 外加 identity.json。
-摆人之后的步骤(合成、验收视频、动作导出、3D 页)都用 mesh_run_of() 找人体数据, 读到的是同一份核对过的人。
+摆人那步(body_motion.py)用 mesh_run_of() 找人体数据, 读到的是核对过的人。
+
+★ 人号 = 跟踪编号(2026-10-09)。编号本来有三套: 跟踪编号(挑人卡片、03_check.jpg 上的数字) -> 出网格时重排成连续的 1..N
+  (<出网格目录>/relabel.json) -> 核对后的人号。三个场景里它们碰巧一样(没人被点掉过), 所以一直没出事; 但在闸口点掉
+  一个人, 后面的人全部往前挪一号: FBX 里的 P5 和上一版视频里的 5 号不是同一个人, 网页上的截图也对到别人头上。
+  现在核对完的人直接用他的跟踪编号命名(track_ids), 从这里往后(10_people.json、验收视频、FBX 里的名字)只有这一套号。
 """
 import json, os, shutil
 import numpy as np
@@ -32,9 +37,13 @@ DIR = "06_identity"
 PER_PERSON = {"mesh_4d_individual": ".ply", "focal_4d_individual": ".json", "mhr_4d_individual": ".npz"}
 
 
-def resolve(tracks, up=None):
+def resolve(tracks, up=None, name=None, taken=()):
     """tracks: {编号: {帧号: (秒, 世界坐标 (3,))}} —— 只放出了网格的帧。up: 给了就只比水平方向的距离。
-    返回 (people, log): people = {人: [(原编号, 帧号), ...] 按帧号排}; log = [dict(事, 编号, 帧, ...)] 给人看的记录。"""
+    name: {tracks 里的编号: 跟踪编号}(见 track_ids), 给了人号和记录里的编号就用跟踪编号; taken: 已经被占的跟踪编号
+    (包括闸口上点掉的), 另起新号时避开。
+    返回 (people, log): people = {人: [(原编号, 帧号), ...] 按帧号排}(原编号还是 tracks 里的, 找文件用);
+    log = [dict(事, 编号, 帧, ...)] 给人看的记录。"""
+    name = {str(r): str((name or {}).get(str(r), r)) for r in tracks}
     up = None if up is None else np.asarray(up, float) / np.linalg.norm(up)
     flat = (lambda p: p - (p @ up) * up) if up is not None else (lambda p: p)
     segs = []
@@ -82,17 +91,17 @@ def resolve(tracks, up=None):
             n[segs[k][0]] = n.get(segs[k][0], 0) + len(segs[k][1])
         if len(frames[g]) < MIN_FRAMES:
             for k in ks:
-                log.append(dict(事="不算人", 编号=segs[k][0], 帧=list(segs[k][1]),
+                log.append(dict(事="不算人", 编号=name[segs[k][0]], 帧=list(segs[k][1]),
                                 原因=f"核对完这个人只有 {len(frames[g])} 帧(不到 {MIN_FRAMES} 帧), 也并不到别人身上"))
             continue
-        pid = max(n, key=lambda r: (n[r], -int(r)))                                  # 用出帧最多的那个编号当这个人的号
+        pid = name[max(n, key=lambda r: (n[r], -int(r)))]                            # 用出帧最多的那个编号当这个人的号
         if pid in used:                                                              # 同一个编号被拆成了两个人(极少): 另起一个号
-            pid = str(max(int(r) for r in list(tracks) + list(used)) + 1)
+            pid = str(max(int(r) for r in list(name.values()) + list(used) + [str(x) for x in taken]) + 1)
         used.add(pid)
         people[pid] = sorted(((segs[k][0], b) for k in ks for b in segs[k][1]), key=lambda x: x[1])
         for k in ks:
-            if segs[k][0] != pid:
-                log.append(dict(事="并进别人", 编号=segs[k][0], 帧=list(segs[k][1]), 并进=pid,
+            if name[segs[k][0]] != pid:
+                log.append(dict(事="并进别人", 编号=name[segs[k][0]], 帧=list(segs[k][1]), 并进=pid,
                                 原因=f"和人 {pid} 从不同时在场, 位置接得上(不到 {SAME_M} 米)"))
     return dict(sorted(people.items(), key=lambda x: int(x[0]))), sorted(log, key=lambda x: (int(x["编号"]), x["帧"][0]))
 
@@ -111,6 +120,33 @@ def raw_run(body):
     raise SystemExit(f"[失败] {body} 下没有 mesh_4d_individual, 先跑 body4d_pipeline 的 mesh 那步(people_mesh)")
 
 
+def track_ids(run):
+    """{出网格目录里的编号: 跟踪编号}。出网格那步把挑中的人重排成连续的 1..N, 对照写在 relabel.json
+    (左 = 跟踪编号, 右 = 重排后的)。老的出网格目录没有这个文件 = 没重排过, 原样。"""
+    p = f"{run}/relabel.json"
+    if os.path.exists(p):
+        return {str(v): int(k) for k, v in json.load(open(p))["relabel"].items()}
+    return {r: int(r) for r in _frame_counts(run)}
+
+
+def all_track_ids(body, run):
+    """跟踪给过的所有编号(连闸口上点掉的): 另起新人号时不能撞上它们。"""
+    ids = set(track_ids(run).values())
+    p = f"{body}/02_body4d/picked.json"
+    if os.path.exists(p):
+        d = json.load(open(p))
+        ids |= {int(x) for x in d.get("keep_ids", [])} | {int(x) for x in d.get("dropped", {})}
+    return sorted(ids)
+
+
+def source_of(body):
+    """这份人体网格的"指纹": 哪个目录、每个编号多少帧、编号对的是跟踪的谁。核对身份和摆人的结果都记着它,
+    读的时候再算一遍对一下 —— 人体网格重出过(或者挑的人变了)就对不上。
+    ★ 只比帧数不够: 点掉甲、留下乙, 两人帧数一样的话帧数表一模一样, 但 1 号已经换了人; 所以带上编号对照。"""
+    raw = raw_run(body)
+    return dict(来源=os.path.basename(raw), 来源帧数=_frame_counts(raw), 编号对照=track_ids(raw))
+
+
 def mesh_run_of(body, resolved=True):
     """人体数据在哪: 核对过身份就是 06_identity/, 没核对过(老轮次)就是出网格的目录。resolved=False 强制要原始的。
     核对之后人体网格又重出过 -> 报错, 不拿过期的身份往下走。"""
@@ -118,8 +154,8 @@ def mesh_run_of(body, resolved=True):
     meta = f"{body}/{DIR}/identity.json"
     if not resolved or not os.path.exists(meta):
         return raw
-    m = json.load(open(meta))
-    if m["来源"] != os.path.basename(raw) or m["来源帧数"] != _frame_counts(raw):
+    m, src = json.load(open(meta)), source_of(body)
+    if any(m.get(k, v) != v for k, v in src.items()):                 # 10-09 之前写的没有编号对照那一项: 只比有的
         raise SystemExit(f"[失败] {body}/{DIR} 是按旧的人体网格核对的(网格重出过) —— 重跑 people(摆人)")
     return f"{body}/{DIR}"
 
@@ -155,7 +191,7 @@ def write(body, run, people, log):
     for pid, items in people.items():
         for rid, b in items:
             by[pid].setdefault(rid, []).append(b)
-    json.dump(dict(来源=os.path.basename(run), 来源帧数=_frame_counts(run), 人=by, 记录=log,
+    json.dump(dict(来源=os.path.basename(run), 来源帧数=_frame_counts(run), 编号对照=track_ids(run), 人=by, 记录=log,
                    规则=dict(中断多久算两段_秒=GAP_S, 同一个位置_米=SAME_M, 至少几帧才算人=MIN_FRAMES)),
               open(f"{tmp}/identity.json", "w"), ensure_ascii=False, indent=1)
     shutil.rmtree(dst, ignore_errors=True)

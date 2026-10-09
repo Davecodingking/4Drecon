@@ -1,10 +1,11 @@
 #!/usr/bin/env python
-"""pipeline/body_motion.py: 在 SAM 3D Body 的一手参数(关节数据)上做修复 —— 不再从网格反推骨骼。
+"""pipeline/body_motion.py: 摆人那步 —— 在 SAM 3D Body 的关节数据上修人, 只算一遍(物理、网页、FBX 都读它的结果)。
 要 MHR 模型文件在盘上。跑: $PY tools/tests/test_body_motion.py"""
 import os, sys
 import numpy as np
 from scipy.spatial.transform import Rotation
 sys.path.insert(0, os.path.expanduser("~/sam3d/pipeline"))
+sys.path.insert(0, os.path.expanduser("~/sam3d/data/outdoor/scripts"))
 import body_into_scene as B
 import mhr_body as M
 import body_motion as BM
@@ -92,7 +93,7 @@ def test_whole_body_flip_fill_on_parameters():
 
 
 def test_fast_arm_is_kept_and_slow_jitter_removed():
-    """姿势平滑作用在关节上: 手臂快速挥(手约 6 m/s)保得不比在网格上平滑差; 站着不动的腿上的抖动去掉大半。
+    """姿势平滑作用在关节上: 手臂快速挥(手约 6 m/s)最多落后 6 cm; 站着不动的腿上的抖动去掉大半。
     "快不快"看的是这个关节带动的肢体末端有多快, 不是关节自己的转速(那样肩、肘各被平滑一半, 手会落后十几厘米)。"""
     rng = np.random.default_rng(0)
     shape = np.zeros(45); scales = np.zeros(68)
@@ -107,7 +108,6 @@ def test_fast_arm_is_kept_and_slow_jitter_removed():
         P0 = np.zeros((T, 204)); P0[:, 6:136] = ps
         return M.forward(shape, P0, False)[0]
     Vc, Vn, Vo = verts(clean), verts(noisy), verts(out)
-    Vm = np.stack(B.smooth_pose(list(Vn), t))                                # 老办法: 在网格上平滑, 当参照
     sk = M.skeleton(); jn = [str(x) for x in sk["names"]]
     dom = np.zeros(Vc.shape[1], int); bw = np.zeros(Vc.shape[1])
     for v, j, w in zip(sk["sk_v"], sk["sk_j"], sk["sk_w"]):
@@ -118,9 +118,25 @@ def test_fast_arm_is_kept_and_slow_jitter_removed():
     sp = np.linalg.norm(np.diff(Vc[:, hand], axis=0), axis=2).max() * 24
     assert sp > 3.0, sp                                                      # 这个测试里的手确实算快
     lag = lambda V: np.linalg.norm(V[:, hand] - Vc[:, hand], axis=2)[5:-5].max()
-    assert lag(Vo) < 0.06 and lag(Vo) <= 1.05 * lag(Vm), (lag(Vo), lag(Vm))  # 实测 5.1 cm, 网格上平滑是 5.8 cm
+    assert lag(Vo) < 0.06, lag(Vo)                                           # 实测 5.1 cm(10-09 之前直接在网格顶点上平滑是 5.8 cm)
     jit = lambda V: np.linalg.norm(V[:, shin] - Vc[:, shin], axis=2)[5:-5].mean()
     assert jit(Vo) < 0.6 * jit(Vn), (jit(Vo), jit(Vn))                       # 小腿上的抖动去掉 40% 以上
+
+
+def test_root_orientation_jitter_is_smoothed_and_a_slow_turn_is_kept():
+    """身体朝向一帧一晃(±2°)去掉一半以上; 慢慢转身(每秒 17°)原样留着。位置不归这里管。"""
+    rng = np.random.default_rng(1)
+    clean = Rotation.from_euler("y", (0.3 * t)[:, None]).as_matrix()
+    noisy = (Rotation.from_matrix(clean) * Rotation.from_rotvec(rng.normal(0, np.radians(2), (T, 3)))).as_matrix()
+    err = lambda Q: np.degrees(np.arccos(np.clip((np.einsum("tij,tij->t", Q, clean) - 1) / 2, -1, 1)))[5:-5].mean()
+    assert err(BM.smooth_rots(noisy, t)) < 0.5 * err(noisy), (err(BM.smooth_rots(noisy, t)), err(noisy))
+    assert err(BM.smooth_rots(clean, t)) < 0.05
+
+
+def test_tracks_shorter_than_five_frames_are_not_smoothed():
+    rng = np.random.default_rng(2)
+    pose = rng.normal(0, 0.1, (4, 130)); Q = Rotation.from_rotvec(rng.normal(0, 0.3, (4, 3))).as_matrix()
+    assert np.array_equal(BM.smooth_joints(pose, t[:4], None), pose) and np.array_equal(BM.smooth_rots(Q, t[:4]), Q)
 
 
 def _seat_case(T=9, seed=3):
@@ -233,8 +249,8 @@ def test_seat_fix_frozen_person_is_the_reference_frame_throughout():
 
 
 def test_seat_fix_position_follows_the_same_contact_rule():
-    """位置: 水平按 fix["pos"]; 竖直按老办法那条规则量交付的网格 —— 没对上椅子的最低点踩在地上,
-    对上椅子的屁股压进椅面 1 cm; 物理之后椅子挪了(shift)人跟着挪。"""
+    """位置: 水平按 fix["pos"]; 竖直量的是修完坐姿之后的网格 —— 没对上椅子的最低点踩在地上,
+    对上椅子的屁股压进椅面 1 cm。(物理之后椅子挪了、人跟着挪的那一下不在这里: 见 test_people_store.py。)"""
     pose, Q, bis, fix, yaw, shape = _seat_case()
     P = B.load_parts(); UP = np.array([0.0, 1.0, 0.0]); GH = 0.2
     out, Qn = BM.seat_fix_params(pose, Q, bis, fix)
@@ -247,19 +263,131 @@ def test_seat_fix_position_follows_the_same_contact_rule():
     want = np.array([fix["pos"][str(b)] for b in bis])
     assert np.abs(V[:, P["pelvis"]].mean(1)[:, [0, 2]] - want[:, [0, 2]]).max() < 1e-4
     assert np.abs((V @ UP).min(1) - GH).max() < 1e-4, (V @ UP).min(1) - GH    # 每一帧最低点都在地面上
-    V = placed(dict(fix, seat=dict(chair="chair_1", 椅面离地=0.43), shift=[0.0, 0.0, 0.3]))
+    V = placed(dict(fix, seat=dict(chair="chair_1", 椅面离地=0.43)))
     assert np.abs((V @ UP)[:, P["seat"]].min(1) - (GH + 0.43 - B.SEAT_SINK)).max() < 1e-4
-    assert np.abs(V[:, P["pelvis"]].mean(1)[:, [0, 2]] - (want[:, [0, 2]] + [0.0, 0.3])).max() < 1e-4
+    assert np.abs(V[:, P["pelvis"]].mean(1)[:, [0, 2]] - want[:, [0, 2]]).max() < 1e-4
 
 
 def test_seat_fix_refuses_frames_it_has_no_decision_for():
-    """fix 是老流程按它自己的帧算的: 这边多出一帧它没算过的, 直接失败, 不悄悄跳过。"""
+    """决定里缺了这个人某一帧的转角: 直接失败, 不悄悄跳过那一帧。"""
     pose, Q, bis, fix, yaw, shape = _seat_case()
     del fix["yaw"][str(bis[-1])]
     try:
         BM.seat_fix_params(pose, Q, bis, fix); assert False
     except SystemExit as e:
-        assert "people" in str(e), e
+        assert "没有这几帧的决定" in str(e), e
+
+
+# ---------------------------------------------------------------- 整个 solve(): 两个造出来的人
+UP = np.array([0.0, -1.0, 0.0])            # 相机不动、平视: 世界 = 相机系(OpenCV, y 朝下), 天是 -y
+GH = -1.5                                  # 相机离地 1.5 m
+NS = 24                                    # 帧数; 视频帧号 = body4d 帧号
+LEN = M.length_params()                    # 管骨头长度的 6 个姿势参数
+
+
+def _scene():
+    cams = {f"{i:04d}.jpg": {"extrinsic_w2c_4x4": np.eye(4).tolist()} for i in range(NS)}
+    return cams, {i: f"{i:04d}.jpg" for i in range(NS)}, list(range(NS))
+
+
+def _people(seed=5):
+    """人 1 站着从左往右走; 人 2 坐着不动(大腿抬平、小腿垂下: 竖直跨度 1.36 m, 屁股到脚 0.42 m)。
+    两个人的骨头长度每帧都不一样(模型逐帧各估各的), 关节上有一点抖动。"""
+    rng = np.random.default_rng(seed)
+    par = {"1": {}, "2": {}}
+    for b in range(NS):
+        for pid in par:
+            P0 = np.zeros(204)
+            P0[6:136] = rng.normal(0, np.radians(1), 130)
+            P0[LEN] = rng.normal(0, 0.15, len(LEN)); P0[136:] = rng.normal(0, 0.02, 68)
+            if pid == "2":
+                for s in "lr":
+                    P0[NAMES.index(f"{s}_upleg_rz")] += -1.5; P0[NAMES.index(f"{s}_knee_bend")] += 1.5
+            ct = np.array([-1.0 + 0.05 * b, 1.5, 6.0]) if pid == "1" else np.array([2.0, 1.5 - 0.44, 5.0])
+            par[pid][b] = (P0, ct)
+    return par, {"1": np.zeros(45), "2": np.zeros(45)}
+
+
+def _chair_under(par, shape):
+    """一把椅子正放在人 2 屁股底下(glTF 系: 天 +y), 椅面离地 0.43 m。返回 (load_chairs 那种, chair_seats 那种)。"""
+    from world_frame import export_T
+    FL = export_T(UP)
+    P0, ct = par["2"][0]
+    V = M.forward(shape["2"], M.to_world(P0[None], ct[None], np.eye(4)[None]), True)[0][0]
+    hip = (V[B.load_parts()["pelvis"]].mean(0) @ FL[:3, :3].T + FL[:3, 3])[[0, 2]]
+    return {"chair_1": (hip, np.eye(2), np.array([0.25, 0.25]))}, {"chair_1": (0.43, hip, np.array([hip[0], 0.3, hip[1]]))}
+
+
+def _solve(chairs=None, seats=None):
+    cams, vid2key, kept = _scene()
+    par, shape = _people()
+    if chairs == "under":
+        chairs, seats = _chair_under(par, shape)
+    res, info, rep = BM.solve(par, shape, cams, vid2key, kept, UP, GH, "/没有这个目录", "/没有这个目录", 24.0, None,
+                              chairs=chairs, seats=seats, seat_h_default=0.43)
+    return par, res, info, rep
+
+
+def test_solve_locks_bone_lengths_and_puts_feet_on_the_ground():
+    par, res, info, rep = _solve()
+    for pid in ("1", "2"):
+        P = res[pid]["params"]
+        assert np.ptp(P[:, LEN], axis=0).max() < 1e-12 and np.ptp(P[:, 136:], axis=0).max() < 1e-12    # 每人全程一个值
+        raw = np.stack([par[pid][b][0] for b in range(NS)])
+        assert np.allclose(P[0, LEN], np.median(raw[:, LEN], 0)) and np.ptp(raw[:, LEN], axis=0).min() > 0.1
+    V = M.forward(res["1"]["shape"], res["1"]["params"], True)[0]
+    feet = (V @ UP).min(1) - GH
+    assert np.abs(feet).max() < 0.02, feet                                                 # 走路的人脚在地上
+    assert rep["1"]["可疑"] == [] and rep["1"]["锁骨头长度_表面挪动_厘米"][1] > 0.5
+
+
+def test_solve_tells_physics_who_walks_where_and_who_sits():
+    """物理读的两样: 站/走着的人每帧一个脚印(路障); 坐着的人没有脚印。场景里没有椅子: 谁也不钉, 也不做坐姿修正。"""
+    _, res, info, rep = _solve()
+    assert info["1"]["seated"] is False and info["1"]["chair"] is None and len(info["1"]["footprints"]) == NS
+    assert [f["vf"] for f in info["1"]["footprints"]] == list(range(NS))
+    assert info["2"]["seated"] is True and info["2"]["footprints"] == [] and info["2"]["chair"] is None
+    assert "seat_fix" not in info["2"] and "坐姿修正" not in rep["2"]
+    assert rep["2"]["坐着的帧"] == NS and rep["1"]["坐着的帧"] == 0 and rep["1"]["路线脚印"] == NS
+
+
+def test_solve_seats_the_sitting_person_on_the_chair_under_them():
+    """有椅子: 坐着的人对上屁股底下那把(物理要钉住它); 坐姿是在锁好骨头的身体上定的, 定完直接改进参数 ——
+    交付的参数生成的网格, 屁股正好压进椅面 1 cm, 下半身整段一个姿势。走路的人不受影响。"""
+    _, res0, _, _ = _solve()
+    _, res, info, rep = _solve(chairs="under")
+    assert info["2"]["chair"] == "chair_1" and info["2"]["seat_fix"]["seat"] == dict(chair="chair_1", 椅面离地=0.43)
+    assert info["1"]["chair"] is None and "seat_fix" not in info["1"]
+    assert np.array_equal(res["1"]["params"], res0["1"]["params"])                         # 别人的椅子不影响走路的人
+    P = res["2"]["params"]
+    V = M.forward(res["2"]["shape"], P, True)[0]
+    seat = (V @ UP)[:, B.load_parts()["seat"]].min(1) - GH
+    assert np.abs(seat - (0.43 - B.SEAT_SINK)).max() < 1e-3, seat
+    legs = np.r_[M.limb_groups()["l_upleg"], M.limb_groups()["r_upleg"]]
+    assert np.ptp(P[:, legs], axis=0).max() < 1e-9                                         # 腿整段用同一帧的
+    assert np.ptp(P[:, LEN], axis=0).max() < 1e-12                                         # 坐姿修正没把锁好的长度弄乱
+    assert rep["2"]["坐姿修正"]["高度来源"] == "chair_1" and abs(rep["2"]["坐姿修正"]["屁股到椅面_后"] + B.SEAT_SINK) < 2e-3
+
+
+def test_suspicious_people_are_named_with_the_reason():
+    assert B.suspicious(1.0, 1.0, 1.0, 1.0, 0.3) == []
+    why = B.suspicious(0.49, 0.97, 0.97, 0.4, 3.0)                                         # office 那件外套 + 另外两条
+    assert len(why) == 3 and "深度离群" in why[0] and "0.49" in why[0] and "40%" in why[1] and "3.0 m" in why[2]
+
+
+def test_identity_record_lists_where_every_track_id_went():
+    """闸口上摆的那张表: 按跟踪编号, 每个编号的帧最后算谁的。这里 3 号在闸口被点掉了(出网格时 5、8 号重排成 3、4)。"""
+    names = {"1": 1, "2": 2, "3": 5, "4": 8}
+    who = {"1": [("1", b) for b in range(60)], "2": [("2", b) for b in range(30)] + [("4", b) for b in range(40, 60)],
+           "5": [("3", b) for b in range(60)]}
+    log = [dict(事="并进别人", 编号="8", 帧=list(range(40, 60)), 并进="2", 原因="位置接得上"),
+           dict(事="不算人", 编号="5", 帧=[70], 原因="只有 1 帧")]
+    rec = BM.identity_record(names, who, log, [3 * b for b in range(80)])
+    assert rec["勾的人"] == [1, 2, 5, 8] and rec["人"] == {"1": [1], "2": [2, 8], "5": [5]}
+    assert list(rec["去向"]) == ["1", "2", "5", "8"]
+    assert rec["去向"]["8"] == [dict(事="并进别人", 人="2", 帧数=20, 视频帧=[120, 177], 原因="位置接得上")]
+    assert rec["去向"]["2"] == [dict(事="人", 人="2", 帧数=30, 视频帧=[0, 87])]
+    assert [x["事"] for x in rec["去向"]["5"]] == ["人", "不算人"] and rec["去向"]["5"][1]["视频帧"] == [210, 210]
 
 
 if __name__ == "__main__":

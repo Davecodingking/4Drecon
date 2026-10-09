@@ -25,7 +25,10 @@ description: 跑场景重建流水线, 室内室外同一个驱动 —— 分段
 `<场景>_scene.fbx`(只有场景), 网页验收那道闸有下载链接。场景 + 人的 FBX 里带相机(每帧的位姿和焦距, 2026-10-09 起);
 要 Blender 从原视频视角渲的视频, 单独跑 `pipeline/motion_export.py --r1 <R1> --body <人体目录> --video`(默认不渲)。没有人的轮次这步自己跳过。以前的 `09_scene_4d.glb` 不出了。
 **人的身份**(2026-10-09 起): 跟踪给的编号不直接当成人。`people`(摆人)那步先按房间里的位置核对一遍
-(并掉同一个人的几个编号、去掉不是人的), 结果在 `<人体目录>/06_identity/identity.json`; 之后的步骤都读核对过的那份。
+(并掉同一个人的几个编号、去掉不是人的), 结果在 `<人体目录>/06_identity/identity.json`。人号 = 跟踪编号(挑人卡片上的数字)。
+**人只修一遍**(2026-10-09 起): `people` 那步(`pipeline/body_motion.py`)在模型的关节数据上修, 存成 `<R1>/10_people*.{json,npz}`;
+物理、验收视频、3D 页、FBX 读的都是这一份(`pipeline/people_store.py`) —— 网页上验收的人就是 FBX 里的人。
+改了修人的代码要重出: `--only people,phys,people_glb,motion`。10-08 之前出的人体网格没存关节数据, 得先重跑 `people_mesh`。
 
 
 ## 用法

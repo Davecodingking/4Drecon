@@ -45,13 +45,10 @@ def _body(n=40):
 
 def test_two_sided_gap_interpolates_position_and_pose():
     W, root = _body()
-    bad = dict(W); bad[20] = W[20] + [3.0, 0, -2.0]                # 第 20 帧套到了别人身上
     occ = B.occ_plan([b for b in range(40)], [(18, 22)], {b: b / 24 for b in range(40)}, root, None)
     assert sorted(occ) == ["18", "19", "20", "21", "22"] and occ["20"][:2] == [17, 23]
-    out = B.fill_occluded(bad, root, occ)
     assert np.allclose(np.asarray(occ["20"][3]), root[20], atol=1e-9)   # 匀速走 -> 插值就是真值
-    assert np.abs(out[20] - W[20]).max() < 0.01, np.abs(out[20] - W[20]).max()
-    assert out[17] is bad[17] and out[23] is bad[23]               # 好帧不动
+    assert abs(occ["20"][2] - 0.5) < 1e-6                          # 动作在前后两个好帧正中间(照着改参数: body_motion.fill_flips)
 
 
 def test_one_sided_tail_holds_pose_and_follows_mask():
@@ -61,10 +58,7 @@ def test_one_sided_tail_holds_pose_and_follows_mask():
     mroot = {b: root[b] + [0, 0.4, 0] for b in range(40)}
     occ = B.occ_plan(list(range(40)), [(35, 39)], t, root, mroot)
     assert occ["39"][:3] == [34, 34, 0.0]
-    out = B.fill_occluded(W, root, occ)
-    assert np.allclose(np.asarray(occ["39"][3]), root[39])         # 位置跟 mask 走, 偏差按锚点那帧扣掉
-    L34 = W[34] - root[34]
-    assert np.allclose(out[39] - root[39], L34)                     # 动作定在最后一个好帧
+    assert np.allclose(np.asarray(occ["39"][3]), root[39])         # 位置跟 mask 走, 偏差按锚点那帧扣掉; 动作定在第 34 帧(A = B)
     # mask 那一帧是空的(整个人被挡没了) -> 位置停在上一帧
     mroot[37] = None
     occ = B.occ_plan(list(range(40)), [(35, 39)], t, root, mroot)
@@ -74,20 +68,6 @@ def test_one_sided_tail_holds_pose_and_follows_mask():
 def test_whole_clip_bad_is_left_alone():
     W, root = _body(10)
     assert B.occ_plan(list(range(10)), [(0, 9)], {b: b for b in range(10)}, root, None) == {}
-
-
-def test_apply_corr_replays_occ():
-    I = np.eye(4).tolist()
-    cams = {f"{i:04d}.jpg": {"extrinsic_w2c_4x4": I} for i in range(3)}
-    vid2key, kept = {i: f"{i:04d}.jpg" for i in range(3)}, [0, 1, 2]
-    V = np.array([[0.0, 0, 0], [0, 1, 0]])                          # GL 系: 根在原点, 头在 +y
-    people = {"1": {0: V + [0, 0, -5], 1: V + [9, 0, -5], 2: V + [2, 0, -5]}}   # 中间那帧套到了别人
-    roots = {"1": {b: np.array(people["1"][b][0] * [1, -1, -1]) for b in range(3)}}
-    zero = {str(b): [0, 0, 0] for b in range(3)}
-    corr = {"1": dict(ratio=1.0, frames=[0, 1, 2], delta=zero,
-                      occ={"1": [0, 2, 0.5, [1.0, 0.0, 5.0]]})}
-    w = B.apply_corr(people, corr, cams, vid2key, kept, roots)["1"]
-    assert np.allclose(w[1][0], [1, 0, 5]) and np.allclose(w[1][1], [1, -1, 5]), w[1]
 
 
 if __name__ == "__main__":

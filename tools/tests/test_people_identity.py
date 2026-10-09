@@ -138,6 +138,70 @@ def test_resolved_people_are_written_as_a_mesh_run_everyone_reads():
             assert "重跑 people" in str(e)
 
 
+def test_people_are_named_by_their_track_id_not_by_position_in_the_kept_list():
+    """闸口上点掉了 3 号: 出网格那步把剩下的 1/2/5/8 重排成 1/2/3/4。核对完的人要叫回 1/2/5/8(挑人卡片上的数字),
+    不然点掉一个人, 后面所有人的号都往前挪 —— FBX 里的 P3 和上一版视频里的 3 号就不是同一个人了。"""
+    names = {"1": 1, "2": 2, "3": 5, "4": 8}                           # 出网格目录里的编号 -> 跟踪编号
+    tr = {"1": _track(range(0, 60), (1, 0, 5)), "2": _track(range(0, 30), (5, 0, 5)),
+          "3": _track(range(0, 60), (9, 0, 2)), "4": _track(range(40, 60), (5.2, 0, 5))}   # 4(跟踪 8 号)是 2 号走开又回来
+    people, log = ID.resolve(tr, name=names)
+    assert list(people) == ["1", "2", "5"], list(people)
+    assert _ids(people) == {"1": ["1"], "2": ["2", "4"], "5": ["3"]}  # 成员还是出网格目录里的编号: 找文件用
+    assert [(x["事"], x["编号"], x["并进"]) for x in log] == [("并进别人", "8", "2")], log    # 给人看的记录用跟踪编号
+    assert ID.resolve(tr)[0].keys() == {"1", "2", "3"}                 # 不给对照(老的出网格目录): 原样
+
+
+def test_a_new_person_number_never_reuses_a_dropped_track_id():
+    """一个编号被拆成了两个人(极少): 2 号先在甲处站了 10 帧; 后来只有 2 帧出现在很远的乙处(接不上甲处那段),
+    和 3 号在乙处的 1 帧接上了 —— 乙处这个人出帧最多的编号也是 2, 可"人 2"已经是甲处那位了, 只能另起一个号。
+    另起的号要避开所有跟踪编号, 包括闸口上点掉的(taken) —— 不然网页拿这个号去要截图, 要到的是被点掉的那个人。"""
+    tr = {"1": _track(range(0, 60), (0, 0, 9)),
+          "2": {**_track(range(0, 10), (0, 0, 0)), **_track(range(30, 32), (9, 0, 0))},
+          "3": _track([40], (9.1, 0, 0))}
+    people, log = ID.resolve(tr, name={"1": 1, "2": 2, "3": 3}, taken=[1, 2, 3, 4, 7])
+    assert list(people) == ["1", "2", "8"], list(people)               # 4、7 是点掉的: 新号从 8 起
+    assert _ids(people)["8"] == ["2", "3"] and _ids(people)["2"] == ["2"]
+    assert ID.resolve(tr)[0].keys() == {"1", "2", "4"}                 # 不知道有谁被点掉时: 只避开在场的编号
+
+
+def test_track_ids_come_from_the_mesh_step_relabel_file():
+    with tempfile.TemporaryDirectory() as T:
+        run = _fake_run(T, {"1": [0, 1, 2], "2": [0, 1, 2]})
+        assert ID.track_ids(run) == {"1": 1, "2": 2}                   # 老的出网格目录没有 relabel.json: 没重排过
+        json.dump(dict(relabel={"4": 1, "9": 2}, note="左=跟踪出的原始 id, 右=送进 SAM 3D Body 的连续 id"), open(f"{run}/relabel.json", "w"))
+        assert ID.track_ids(run) == {"1": 4, "2": 9}
+        os.makedirs(f"{T}/02_body4d")
+        json.dump(dict(keep_ids=[4, 9], dropped={"7": 30, "12": 3}), open(f"{T}/02_body4d/picked.json", "w"))
+        assert ID.all_track_ids(T, run) == [4, 7, 9, 12]               # 连点掉的 7、12 也算占着号
+
+
+def test_swapping_who_was_picked_is_noticed_even_when_frame_counts_match():
+    """点掉甲、留下乙, 两人帧数一样: 出网格目录的帧数表一模一样, 但 1 号已经换了人 —— 核对过的身份必须算过期。"""
+    with tempfile.TemporaryDirectory() as T:
+        run = _fake_run(T, {"1": [0, 1, 2], "2": [0, 1, 2]})
+        json.dump(dict(relabel={"1": 1, "2": 2}), open(f"{run}/relabel.json", "w"))
+        ID.write(T, run, {"1": [("1", b) for b in range(3)], "2": [("2", b) for b in range(3)]}, [])
+        assert ID.mesh_run_of(T) == f"{T}/{ID.DIR}"
+        src = ID.source_of(T)
+        assert src == dict(来源="04_mesh_occ0", 来源帧数={"1": 3, "2": 3}, 编号对照={"1": 1, "2": 2})
+        json.dump(dict(relabel={"1": 1, "3": 2}), open(f"{run}/relabel.json", "w"))    # 2 号换成了跟踪的 3 号, 帧数没变
+        assert ID.source_of(T) != src
+        try:
+            ID.mesh_run_of(T); assert False
+        except SystemExit as e:
+            assert "重跑 people" in str(e)
+
+
+def test_identity_written_before_the_relabel_was_recorded_still_reads():
+    """10-09 之前核对的(identity.json 里没有编号对照那一项): 只比有的那两项, 老轮次照旧能读。"""
+    with tempfile.TemporaryDirectory() as T:
+        run = _fake_run(T, {"1": [0, 1, 2]})
+        ID.write(T, run, {"1": [("1", b) for b in range(3)]}, [])
+        m = json.load(open(f"{T}/{ID.DIR}/identity.json")); del m["编号对照"]
+        json.dump(m, open(f"{T}/{ID.DIR}/identity.json", "w"))
+        assert ID.mesh_run_of(T) == f"{T}/{ID.DIR}"
+
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_") and callable(f):

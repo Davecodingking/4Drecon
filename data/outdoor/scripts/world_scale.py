@@ -146,18 +146,25 @@ if PEOPLE_RUN:
     else:
         sys.path.insert(0, os.path.expanduser("~/sam3d/pipeline"))
         import body_into_scene as BIS
-        _ppl, _faces, _kept = BIS.load_body(PEOPLE_RUN)
+        import people_identity as _PID
+        # ★ 这一步在摆人之前: 身份还没核对, 读的是出网格那步的原始目录(编号 = 出网格时重排的 1..N)。
+        #   以前借 load_body 把所有网格读一遍只为了知道"每人有哪些帧", 而且它读的是"核对过身份的目录(如果有)"、
+        #   根平移和抠图又读原始目录 —— 重跑时两边的编号对不上。现在明说只读原始目录, 帧号直接数文件名。
+        _mrun = _PID.raw_run(PEOPLE_RUN)
+        _kept = json.load(open(f"{PEOPLE_RUN}/00_frames/frames.json"))["kept_indices"]
         _da3, _cams, _UPb, _GHb, _v2k = BIS.load_scene(R1)
-        _mrun = next((f"{PEOPLE_RUN}/{d}" for d in ("04_mesh_occ1", "04_mesh_occ0")
-                      if os.path.isdir(f"{PEOPLE_RUN}/{d}/mesh_4d_individual")), None)
         _roots = BIS.load_roots(_mrun)
+        # ★ 报告里的人按**跟踪编号**记(挑人卡片上的数字), 不按出网格时重排的: 闸口上点掉一个人会重出网格、重排编号,
+        #   但尺度不重定(已经乘进深度了) —— 记重排后的编号的话, 网页"尺度"那张表的截图就对到别人头上
+        _tid = _PID.track_ids(_mrun)
         _per = {}
-        for _pid, _frs in sorted(_ppl.items(), key=lambda x: int(x[0])):
+        for _pid in sorted(_PID._frame_counts(_mrun), key=int):
+            _frs = [int(f[:-4]) for f in os.listdir(f"{_mrun}/mesh_4d_individual/{_pid}") if f.endswith(".ply")]
             _bis = sorted(b for b in _frs if b < len(_kept) and _kept[b] in _v2k
                           and _v2k[_kept[b]] in _cams and b in _roots.get(_pid, {}))
             _r = BIS.depth_ratio(_pid, _bis, _roots[_pid], _mrun, _da3, _v2k, _kept) if _bis else {}
             if len(_r) >= PEOPLE_MIN_FR:
-                _per[_pid] = (float(np.median(list(_r.values()))), len(_r))
+                _per[str(_tid[_pid])] = (float(np.median(list(_r.values()))), len(_r))
         if _per:
             _rr = np.array([v[0] for v in _per.values()])
             k_people = float(1.0 / np.median(_rr))

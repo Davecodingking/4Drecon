@@ -365,9 +365,9 @@ for k, cm in cams.items():
 camlist.sort()
 camc = [c[2][0] for c in camlist]
 
-# ---- 人: SAM 3D Body 的逐帧人体, 按 body_into_scene 同一套校正摆进来 ----
-# ★ 不自己摆: 直接调 body_into_scene 的 load_body / apply_corr, 读 10_people.json 的校正表
-#   (远近比例 + 逐帧平移), 和进 glb 的那份人是同一个位置。
+# ---- 人: SAM 3D Body 的逐帧人体, 读摆人那步存下来的那份 ----
+# ★ 不自己摆, 也不重放: 读 people_store.load_world(摆人那步修好的关节参数生成的网格, 带上椅子被物理挪了的位移),
+#   和验收视频、FBX 里的人是同一份。
 # ★ 03_masks 里的 person / pedestrian 实例(量盒子那步当静态物体量的)有人体时就不画了:
 #   走动的人被合成一个沿路线拉长的盒子, 那正是要被 SAM 3D Body 换掉的东西。
 people = []; body_note = ""
@@ -376,17 +376,25 @@ if bdir is None and os.path.exists(f"{R1}/09_body4d_report.json"):
     bdir = json.load(open(f"{R1}/09_body4d_report.json")).get("人体")
     if bdir and not os.path.isabs(bdir): bdir = os.path.expanduser(f"~/sam3d/{bdir}")
 pj = f"{R1}/10_people.json"
+world = None
 if bdir and bdir != "off":
     if not os.path.isdir(bdir) or not os.path.exists(pj):
-        print(f"[人] 跳过: {'没有 ' + bdir if not os.path.isdir(bdir) else '没有 10_people.json(body_into_scene --mode place 还没跑)'}")
+        print(f"[人] 跳过: {'没有 ' + bdir if not os.path.isdir(bdir) else '没有 10_people.json(摆人那步还没跑)'}")
     else:
         import body_into_scene as bis
-        with contextlib.redirect_stdout(io.StringIO()):
-            bpeople, _faces, kept = bis.load_body(bdir)
-            _, _, _, _, vid2key = bis.load_scene(R1)
-            roots = bis.load_roots(bis.mesh_run_of(bdir))
-        PJ = json.load(open(pj)); corr = PJ["people"]; rep = PJ.get("报告", {})
-        world = bis.apply_corr(bpeople, corr, cams, vid2key, kept, roots)
+        import people_identity, people_store
+        try:
+            # 摆人的结果过期了(人体网格重出过)、是 10-09 之前的老写法、或者合成还没跑: 不画人, 页面照出
+            PJ = people_store.check_fresh(R1, people_identity.source_of(bdir))
+            world, _faces = people_store.load_world(R1)
+        except SystemExit as e:
+            world = None
+            why = str(e).replace("[失败] ", "")
+            print(f"[人] 不画: {why}")
+            notice += ('      <p class="lede notice"><b>People not shown.</b> '
+                       + why.replace("&", "&amp;").replace("<", "&lt;") + '</p>\n')
+    if world:
+        corr = PJ["people"]; rep = PJ.get("报告", {})
         nv = len(next(iter(next(iter(world.values())).values())))
         vsel = np.sort(rng.choice(nv, min(nv, a.body_pts), replace=False))   # 每帧同一批顶点, 动起来才连贯
         # ★ 走过的线按骨盆中心画, 不按全身外接框中心: 手臂一甩框中心就跟着摆, 线上全是小锯齿

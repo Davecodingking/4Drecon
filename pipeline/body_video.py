@@ -2,8 +2,8 @@
 """人放进场景之后的验收视频: 原视频 | 同一个相机看到的重建场景+人 | 两者叠加, 逐帧拼成 mp4。
 
 为什么要它: 4 张静帧看不出人在走动时对不对得上 —— 脚有没有滑、人有没有忽大忽小、
-坐着的人是不是一直坐在椅子上。人的顶点按 body_into_scene.py 的 10_people.json 重放,
-和合成那步(--mode compose)是同一份数据, 看到的就是会进 glb 的样子。
+坐着的人是不是一直坐在椅子上。人的顶点读摆人那步存下来的 10_people_world.npz(people_store.load_world):
+它就是修好的关节参数生成的网格, 交付的 FBX 用的是同一份参数 —— 这里看到的人就是 FBX 里的人。
 
 用法:
   python body_video.py --r1 <场景结果目录> --body <body4d轮次目录> --scene <静态场景 glb> \
@@ -16,28 +16,20 @@ import numpy as np, trimesh, cv2, pyrender
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.expanduser("~/sam3d/data/outdoor/scripts"))
 import body_into_scene as B
+import people_identity, people_store
 from world_frame import inverse_T
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--r1", required=True); ap.add_argument("--body", required=True)
 ap.add_argument("--scene", required=True, help="静态场景 glb (相对 r1), 如 07_scene_phy.glb")
 ap.add_argument("--fr", required=True, help="场景那套帧的目录 (文件名和 cameras.json 的键一致)")
-ap.add_argument("--people", default="10_people.json")
 ap.add_argument("--out", default="09_people_check.mp4")
 ap.add_argument("--tile", type=int, default=640, help="每一栏的宽")
-ap.add_argument("--world-npz", default="", help="人的顶点直接从这个 npz 读(p<人>_V (T,N,3) DA3 世界系 + p<人>_vf 视频帧号), "
-                "不按 10_people.json 重放 —— 一手数据版 body_motion.py 的 people_world.npz")
 a = ap.parse_args()
 
-people, faces, kept = B.load_body(a.body)
 da3, cams, UP, GH, vid2key = B.load_scene(a.r1)
-if a.world_npz:
-    _z = np.load(a.world_npz)
-    world = {k[1:-2]: dict(zip(_z[k[:-2] + "_vf"].tolist(), _z[k])) for k in _z.files if k.endswith("_V")}
-else:
-    roots = B.load_roots(B.mesh_run_of(a.body))
-    corr = json.load(open(f"{a.r1}/{a.people}"))["people"]
-    world = B.apply_corr(people, corr, cams, vid2key, kept, roots)    # DA3 世界系, 和相机同一个系
+people_store.check_fresh(a.r1, people_identity.source_of(a.body))
+world, faces = people_store.load_world(a.r1)                          # DA3 世界系, 和相机同一个系
 key2vid = {k: v for v, k in vid2key.items()}
 
 # 静态场景: glb 是 glTF 系(天 +y), 乘 inverse_T 回到 DA3 世界系, 和 render_back 同一套
@@ -72,7 +64,7 @@ for key in sorted(cams):
     for i, (pid, fr) in enumerate(sorted(world.items(), key=lambda x: int(x[0]))):
         if vf in fr:
             pm = trimesh.Trimesh(vertices=fr[vf], faces=faces, process=False)
-            pm.visual.vertex_colors = np.array(list(COL[i % len(COL)]) + [255], np.uint8)
+            pm.visual.vertex_colors = np.array(list(COL[(int(pid) - 1) % len(COL)]) + [255], np.uint8)   # 颜色跟人号走: 点掉一个人, 别人的颜色不变
             added.append(scene.add(pyrender.Mesh.from_trimesh(pm, smooth=True)))
     col, _ = r.render(scene)
     for nd in added:

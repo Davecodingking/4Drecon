@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 DATA_NAME = "10_box_fit_view.json"
 # 这些产物比数据新, 数据就过时了。顺序无所谓, 报第一个撞上的。
 INPUTS = ["06_all_boxes.json", "06_all_boxes_merged.json", "07_scene_phy.glb",
-          "07_scene_skipped.json", "10_people.json", "09_body4d_report.json"]
+          "07_scene_skipped.json", "10_people.json", "10_people_shift.json", "09_body4d_report.json"]
 _GZ = {}          # (路径, mtime) -> gzip 字节。7 MB 压一次 0.3 s, 别每次刷新都压
 
 

@@ -1,17 +1,25 @@
 # 人体动作导出(骨骼动画 FBX / glb)
 
-**正式的路(2026-10-08 起): 用模型的一手数据, 不从网格反推。** 设计和验证见 `docs/superpowers/specs/2026-10-08-people-firsthand-motion-design.md`。
+**正式的路(2026-10-08 起): 用模型的一手数据(关节参数), 不从网格反推。** 设计和验证见 `docs/superpowers/specs/2026-10-08-people-firsthand-motion-design.md`。
 
 ```
-出网格(存 mhr_4d_individual)  ->  pipeline/body_motion.py(在参数上修)  ->  from_motion.py(参数 -> glb)  ->  to_blender.py(FBX + .blend)
+出网格(存 mhr_4d_individual)
+  -> 摆人 pipeline/body_motion.py(people 步: 在关节数据上修, 只修这一遍, 存 10_people_params.npz / 10_people_world.npz)
+  -> 物理 -> 合成(people_glb 步: 椅子挪了人跟着挪, 出 09_scene_nopeople.glb)
+  -> 导出 pipeline/motion_export.py(motion 步: 读修好的参数, 不再修) -> from_motion.py(参数 -> glb) -> to_blender.py(FBX + .blend)
 ```
 
-**平时不用手敲**: 流水线的 `motion` 步(验收那一段, 合成后面)调 `pipeline/motion_export.py --r1 <R1> --body <人体目录>`, 把这三段串起来,
+**平时不用手敲**: 流水线的 `motion` 步(验收那一段, 合成后面)调 `pipeline/motion_export.py --r1 <R1> --body <人体目录>`,
 产物在 `<R1>/12_motion/`。单独重出一轮: `outdoor_pipeline.py --scene <场景> --run <轮次> --only motion`(室内用 indoor_pipeline.py)。
+人要重修(改了修复的代码): `--only people,phys,people_glb,motion`。
+
+**网页上看到的人 = FBX 里的人**(2026-10-09 起): 验收视频、3D 页读的网格就是导出用的那份参数生成的(`pipeline/people_store.py`)。
+差别只剩姿势修正项(关节附近的细微形变, glTF / FBX 放不了): 平均 0.2~0.4 cm, 个别顶点 2~5 cm。
 
 | 脚本 | 环境 | 做什么 |
 |---|---|---|
-| ../../pipeline/body_motion.py `--r1 <R1> --mesh-run <出网格目录> --out <目录>` | sam3d, GPU | 修复做在关节数据上 -> motion.npz(世界系参数) + people_world.npz(网格, 给验收视频) |
+| ../../pipeline/body_motion.py `--r1 <R1> --body <人体目录>` | sam3d, GPU | 摆人: 核对身份 + 在关节数据上修 -> `<R1>/10_people*.{json,npz}`(格式见 people_store.py) |
+| ../../pipeline/motion_export.py `--r1 <R1> --body <人体目录> [--video]` | sam3d | 读修好的参数, 换到 glTF 世界系 + 带上相机 -> motion.npz, 再调下面两个 |
 | from_motion.py `<motion.npz> <输出目录> <名字>` | sam3d, GPU | 每人一个带骨骼的 glb + 原始参数 npz。几秒钟, 没有拟合 |
 | to_blender.py `<glb,glb,...> <场景glb> <目标网格npz> <输出目录> <名字> [fps]` | ~/venvs/bpy | `_scene_people.fbx`(场景 + 人 + 相机) + `_scene.fbx`(只有场景) + 每人一个 FBX + 一份给人看的 .blend + 预览图; 自检不过就失败 |
 | render_video.py `<.blend> <输出.mp4> [--jobs 4]` | sam3d(它自己起 bpy 进程) | 用 .blend 里的相机, 从原视频的视角把"场景 + 人"渲成视频, 和原视频一帧对一帧。`motion_export.py --video` 会调它 |
@@ -26,7 +34,10 @@
 - 渲视频用 EEVEE。它用哪张卡不归 CUDA_VISIBLE_DEVICES 管(这台机器上总是 3 号卡)。实测: office 432 帧 118 秒, nfl1 114 帧 11 秒, soccer 205 帧 14 秒。
 
 **骨头长度(2026-10-09 起)**: 每人全程一个值(`body_motion.py` 的 `fix_bone_lengths`), FBX 里骨头不再每帧伸缩。
-网页上的验收视频走的是网格那条路, 那上面没有锁。
+网页上的验收视频里也是锁好的(同一份数据)。
+
+**人的名字**: FBX / .blend 里的 `P<号>`、`<名字>_motion_params.npz` 里的 `p<号>_*`, 号 = 跟踪编号(挑人卡片上的数字), 不连续是正常的
+(闸口上点掉的、被并进别人的编号不会出现)。
 
 FBX 和 .blend 动作一样, 差在骨头怎么画:
 - FBX: 关节朝向是 MHR 原样的。Blender 沿关节的 Y 轴画骨头, MHR 的 Y 轴垂直于肢体, 所以每个关节是一根横着的短棍;
@@ -38,14 +49,14 @@ FBX 和 .blend 动作一样, 差在骨头怎么画:
 
 ## 老的路: 从网格反推(留作对照, 不进正式流程)
 
-把 body_into_scene 修正好的人(和验收视频里的一样; 当时还有一个顶点动画的 09_scene_4d.glb, 2026-10-08 起不出了)转成**带骨骼的动作文件**, Blender 能直接打开、能套到别的角色上。
+把修好的人的**网格**(和验收视频里的一样; 当时还有一个顶点动画的 09_scene_4d.glb, 2026-10-08 起不出了)转成**带骨骼的动作文件**, Blender 能直接打开、能套到别的角色上。
 09_scene_4d.glb 里的人是逐帧顶点动画(morph target), 没有骨骼; 这里用 MHR 模型本身拟合每一帧网格, 反推出 127 个关节的旋转。
 
 四步, 各用各的环境:
 
 | 步 | 脚本 | 环境 | 做什么 |
 |---|---|---|---|
-| 1 | dump_people.py `<R1> <out.npz> [人id,...]` | sam3d | 修正好的网格按 glTF 世界系(天 +y, 米)存下来 |
+| 1 | dump_people.py `<R1> <out.npz> [人id,...]` | sam3d | 修好的网格(读 `10_people_world.npz`)按 glTF 世界系(天 +y, 米)存下来 |
 | 2 | fit_mhr.py `<people.npz> <拟合目录> [人id]` | body4d, GPU | 拟合: 体型/骨骼缩放每人一份, 姿势逐帧。一人 114 帧约 7 分钟, 按人分卡并行 |
 | 3 | export_glb.py `<拟合目录> <out.glb> [人id,...]` | sam3d | 骨架 + 蒙皮网格 + 关节动画 -> glb |
 | 4 | to_blender.py `<glb> <场景glb> <people.npz> <输出目录> <名字> <fps>` | ~/venvs/bpy (bpy 4.2) | glb -> FBX(全体 + 每人) + .blend(场景 + 人); 自检 + 预览图 |

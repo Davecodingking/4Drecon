@@ -60,23 +60,6 @@ def test_outlier_person_untrusted_frames_also_skip_model_distance():
     assert np.allclose(d, 10.0), d[18:42]
 
 
-def test_apply_corr_replays_per_frame_ratio_and_old_files_still_work():
-    I = np.eye(4).tolist()
-    cams = {"0000.jpg": {"extrinsic_w2c_4x4": I}, "0001.jpg": {"extrinsic_w2c_4x4": I}}
-    vid2key, kept = {0: "0000.jpg", 1: "0001.jpg"}, [0, 1]
-    V = np.zeros((1, 3))                                            # 一个顶点, 就在根上
-    people = {"1": {0: V, 1: V}}
-    roots = {"1": {0: np.array([0, 0, 10.0]), 1: np.array([0, 0, 10.0])}}
-    zero = {"0": [0, 0, 0], "1": [0, 0, 0]}
-    new = {"1": dict(ratio=1.0, ratio_frame={"0": 2.0, "1": 1.5}, frames=[0, 1], delta=zero)}
-    w = B.apply_corr(people, new, cams, vid2key, kept, roots)["1"]
-    # GL2CV 把 z 翻成 -z 再加 (r-1)*root: 顶点落在相机前方 (r-1)*10 m 处
-    assert np.allclose(w[0][0], [0, 0, 10.0]) and np.allclose(w[1][0], [0, 0, 5.0]), w
-    old = {"1": dict(ratio=1.5, frames=[0, 1], delta=zero)}         # 老的 10_people.json 没有 ratio_frame
-    w = B.apply_corr(people, old, cams, vid2key, kept, roots)["1"]
-    assert np.allclose(w[0][0], [0, 0, 5.0]) and np.allclose(w[1][0], [0, 0, 5.0]), w
-
-
 def test_far_depth_noise_is_smoothed_along_ray():
     """远处(20 m)VGGT 深度有 ±1 m 的噪声, 9 帧中位数会把它变成台阶: soccer r2 守门员 139->140 帧
     画面里只挪了 3 px, 距离却从 21.1 跳到 22.3 m。前后方向按秒平滑之后, 逐帧变化要收到 0.1 m 以内。"""

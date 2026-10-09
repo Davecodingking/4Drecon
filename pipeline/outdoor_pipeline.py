@@ -54,6 +54,7 @@ from _common import (GpuSlot, wait_gpu, sh, envcmd, stamp_path,
                      timing as _timing, resolve_cfg as _resolve_cfg,
                      write_frame_map, load_frame_map)
 import people_decisions           # 挑人闸的决策文件 + BODY_RUN 自动指向, 室内外共用
+import people_store               # 摆人那步的结果存在哪(没有人时清掉上一次的)
 
 HOME   = os.path.expanduser("~")
 SAM3D  = f"{HOME}/sam3d"
@@ -851,41 +852,61 @@ def _body(c, dry):
     return body
 
 
+def _no_people(c, dry, step):
+    """这一步因为没有人跳过: 把它上一次的产物清掉(在闸口上把人全点掉之后, 不留上一次的人给物理和网页)。"""
+    print("    这个场景没配 BODY_RUN(没有人), 跳过")
+    if not dry:
+        gone = people_store.clear_step(c.R1, step)
+        if gone:
+            print(f"    上一次有人时出的产物清掉了: {', '.join(gone)}")
+
+
+def _with_card(what, cmd, log, dry):
+    """这条命令要显卡。进了步骤、确认真的有人要算才领 —— 写进 GPU_STEPS 的话是进步骤之前就领,
+    没有人的轮次也要先排队等一张卡, 就为了打一句"跳过"。"""
+    if dry:
+        return sh(cmd, log, dry)
+    with GpuSlot(what, 3000):
+        return sh(cmd, log, dry)
+
+
 def s_people(c, dry):
-    """摆人(物理之前): 每人每帧的远近、脚着地、走过的路线 -> 10_people.json。
+    """摆人(物理之前): 先核对身份, 再在模型的关节数据上修每个人(每人每帧的远近、脚着地、走过的路线) -> 10_people.json +
+    10_people_params.npz(修好的关节参数) + 10_people_world.npz(它生成的网格) + 10_people_body.npz(物理用的空气墙)。
+    ★ 人只在这里修一遍(body_motion.py): 物理、网页验收视频、3D 页、FBX 读的都是这一步存下来的, 见 people_store.py。
     ★ 排在物理之前 —— 物理拿人走过的路当路障 (scene_phys 的 PEOPLE)。
     远近按场景深度量。尺度那步已经拿人当尺子校准过, 这里每个人的比例都该在 1 附近。"""
     body = _body(c, dry)
     if not body:
-        print("    这个场景没配 BODY_RUN(没有人), 跳过"); return
-    sh(envcmd(PY["sam3d"], f"{PIPE}/body_into_scene.py", None,
-              ["--r1", c.R1, "--body", body, "--mode", "place", "--scene-in", "07_scene.glb"]),
-       f"{c.LOG}/10_people.log", dry)
+        return _no_people(c, dry, "people")
+    _with_card("people", envcmd(PY["sam3d"], f"{PIPE}/body_motion.py", None,
+                                ["--r1", c.R1, "--body", body, "--scene-in", "07_scene.glb"]),
+               f"{c.LOG}/10_people.log", dry)
 
 
 def s_people_glb(c, dry):
-    """合成(物理之后): 07_scene_phy.glb 摘掉静态人形 -> 09_scene_nopeople.glb, 按 10_people.json 出几帧验收图,
-    再出验收视频 09_people_check.mp4 (原视频 | 同一个相机看到的重建+人 | 两者叠加)。
+    """合成(物理之后): 07_scene_phy.glb 摘掉静态人形 -> 09_scene_nopeople.glb, 出几帧验收图,
+    再出验收视频 09_people_check.mp4 (原视频 | 同一个相机看到的重建+人 | 两者叠加)。人读摆人那步存下来的网格。
     (会动的人的交付物是 motion 那步的 FBX; 顶点动画的 09_scene_4d.glb 2026-10-08 起不出了。)"""
     body = _body(c, dry)
     if not body:
-        print("    这个场景没配 BODY_RUN(没有人), 跳过"); return
+        return _no_people(c, dry, "people_glb")
     sh(envcmd(PY["sam3d"], f"{PIPE}/body_into_scene.py", None,
-              ["--r1", c.R1, "--body", body, "--mode", "compose", "--scene-glb", "07_scene_phy.glb",
+              ["--r1", c.R1, "--body", body, "--scene-glb", "07_scene_phy.glb",
                "--render", "--fr", c.FR]), f"{c.LOG}/10_people_glb.log", dry)
     sh(envcmd(PY["sam3d"], f"{PIPE}/body_video.py", None,
               ["--r1", c.R1, "--body", body, "--scene", "07_scene_phy.glb", "--fr", c.FR]),
        f"{c.LOG}/10_people_glb.log", dry)
 
+
 def s_motion(c, dry):
-    """导出动作文件(合成之后): 在模型的一手数据(关节参数)上做修复 -> 12_motion/:
-    场景 + 人的 FBX(人带骨骼)、只有场景的 FBX、.blend、每人每帧的原始参数。三段脚本和自检见 motion_export.py。
-    出网格那一轮没存一手数据(2026-10-08 之前跑的)会直接失败, 不悄悄跳过。"""
+    """导出动作文件(合成之后): 摆人那步修好的关节参数 + 合成那步出的场景 -> 12_motion/:
+    场景 + 人的 FBX(人带骨骼)、只有场景的 FBX、.blend、每人每帧的参数。这一步不修人, 只导出; 三段脚本和自检见 motion_export.py。"""
     body = _body(c, dry)
     if not body:
-        print("    这个场景没配 BODY_RUN(没有人), 跳过"); return
-    sh(envcmd(PY["sam3d"], f"{PIPE}/motion_export.py", None, ["--r1", c.R1, "--body", body]),
-       f"{c.LOG}/12_motion.log", dry)
+        return _no_people(c, dry, "motion")
+    _with_card("motion", envcmd(PY["sam3d"], f"{PIPE}/motion_export.py", None, ["--r1", c.R1, "--body", body]),
+               f"{c.LOG}/12_motion.log", dry)
 
 def s_render(c, dry):
     """从原视频的机位渲染重建结果, 和实拍并排比对。护栏和路灯杆应当重合。"""
@@ -1148,7 +1169,7 @@ DEPS = {
     "vlm_sizes": ["vlm"],       "scale": ["boxes", "vlm_sizes", "people_mesh"],
     "solo": ["scale"],          "assemble": ["scale", "solo", "verify", "recall_merge", "boxes"],
     "people": ["assemble", "people_mesh"],     "people_glb": ["phys", "people"],
-    "motion": ["people_glb"],                  # 场景用合成那步出的 09_scene_nopeople.glb
+    "motion": ["people_glb", "people"],                  # 场景用合成那步出的 09_scene_nopeople.glb
     "phys": ["assemble", "people"],  "render": ["phys"],
     "building_scene": ["assemble"],
     # 召回不依赖盒子 —— 二维比对读的是 03_masks 的 mask。写成依赖 boxes 会把它
@@ -1166,8 +1187,10 @@ DEPS = {
 
 # 吃显存的步骤: 开始之前先领一张空卡(_common.GpuSlot)。
 # ★ people_track / people_mesh 故意不在这里: body4d_pipeline.py 自己在 track/mesh 上领卡, 外面再领一张就多占一张不用
+# ★ people / motion 也不在这里: 它们进了步骤、确认这一轮真的有人才领(_with_card) —— 写在这里的话,
+#   没有人的轮次也要先排队等一张卡, 就为了打一句"跳过"
 GPU_STEPS = {"vlm", "vlm_sizes", "da3", "track", "verify", "gen", "solo", "detect",
-             "recall_mask", "recall_gen", "motion"}
+             "recall_mask", "recall_gen"}
 # 内部拆分的步骤: 它起的每一份各领一张卡, 主循环不替它领(领了就多占一张不用)
 FANOUT_STEPS = {"track", "gen", "solo", "recall_gen"}
 

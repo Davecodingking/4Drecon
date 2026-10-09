@@ -1,12 +1,16 @@
 #!/usr/bin/env python
-"""把 SAM 3D Body 出的逐帧人体网格放进重建好的场景里: 每人每帧摆在哪(10_people.json) + 没有人的场景 + 验收图。
-(会动的人的交付物是骨骼动画的 FBX, 见 motion_export.py; 以前这里出的顶点动画 09_scene_4d.glb 2026-10-08 起不出了。)
+"""人进场景的两件事:
+  1. 修人要用的**判据**(一组函数): 远近按场景深度、哪几帧算认错人、位置怎么整理和贴地、谁算坐着、坐哪把椅子、
+     坐着的人怎么摆、物理用的人体空气墙。摆人那步(body_motion.py)调它们, 在模型的关节数据上修。
+  2. **合成**(流水线的 people_glb 步, 物理之后, 就是这个文件的 main): 椅子被物理挪了就让坐着的人跟着挪、
+     身高自检、场景里摘掉静态人形(-> 09_scene_nopeople.glb)、出几帧验收图。人读摆人那步存下来的(people_store.py)。
+(会动的人的交付物是骨骼动画的 FBX, 见 motion_export.py。)
 
-  SAM 3 跟踪 + SAM 3D Body  ->  每人每帧一个网格(相机系, 真米)
-  重建流水线                ->  每帧相机在世界里的位置和朝向
-  这个脚本                  ->  把前者摆进后者的世界
+★ 2026-10-09 以前这里还有一整套"在网格上修人"(solve_people / apply_corr: 算一张校正表, 每个读者拿它在网格上重放一遍),
+  给网页验收视频、物理、3D 页用; FBX 走 body_motion.py 在关节数据上另修一遍。同一个人修了两遍, 后加的修复只有一边有。
+  网格那一套删了: 判据留在这里, 修只在 body_motion.py 做一遍。
 
-★ 为什么需要它: SAM 3D Body 只会说"这个人在**我镜头前方**偏右 3.8 米、远 10.8 米",
+★ 为什么要把人"摆进场景": SAM 3D Body 只会说"这个人在**我镜头前方**偏右 3.8 米、远 10.8 米",
   它不知道镜头本身在哪、朝哪、这一帧和下一帧镜头动了多少。所以它的产物只能贴回原片,
   拿不到"这个人在这条街上的哪个位置"。缺的那块正是重建流水线有的。
 
@@ -17,23 +21,19 @@
 ★ 被挡住的人: SAM 3D Body 会把挡在前面的人当成他重建(位置跳到别人那儿、动作换成别人的)。
   套得稳(跟着邻居走)的不动; 在两个人之间来回认、身体朝向一帧翻 30° 以上的段换掉 —— 见"翻转补帧"那节。
 
-用法(不碰流水线, 独立跑):
-  python body_into_scene.py --r1 <场景结果目录> --body <body4d轮次目录> [--out <输出目录>]
-  python body_into_scene.py --r1 ~/sam3d/data/outdoor/result/pedestrian/r2sim_vggt \
-                            --body ~/sam3d/sam-body4d/outputs/pedestrian/b1 --render
+用法(合成; 流水线的 people_glb 步就是这一条):
+  python body_into_scene.py --r1 <场景结果目录> --body <body4d轮次目录> [--render --fr <场景帧目录>]
 
 坐标系(每一步都踩过坑, 别凭印象改):
-  SAM 3D Body 的 ply   x右 y上 z朝后(OpenGL/pyrender 那套, 实测帧中心 z 是负的)
-  cameras.json         OpenCV: x右 y下 z朝前
-  07_scene_phy.glb     assemble_scene 末尾乘过 export_T(UP), 真实的天在 +y
-  -> 人要落到同一个系里, 就得走 (x,-y,-z) -> c2w -> export_T(UP), 一步都不能少。
+  cameras.json         OpenCV: x右 y下 z朝前; 模型给的根平移(focal_4d_individual 的 camera)也是这个系
+  摆人的结果           DA3 世界系(= 相机位姿所在的系), 米
+  07_scene_phy.glb     assemble_scene 末尾乘过 export_T(UP), 真实的天在 +y -> 人要和它放一起得再乘 export_T(UP)
 
 sam3d 环境(trimesh + pygltflib + cv2 + numpy)。纯 CPU。
 """
-import argparse, json, os, subprocess, sys
+import argparse, glob, json, os, subprocess, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import people_identity
-from people_identity import mesh_run_of
+import people_identity, people_store
 import numpy as np
 import trimesh
 
@@ -48,35 +48,6 @@ H_MIN, H_MAX = 1.40, 2.00
 
 
 # ------------------------------------------------------------------ 读
-def load_body(body_dir):
-    """读 body4d 一轮的产物(核对过身份的, 见 people_identity.py)。返回 (每人每帧的顶点, faces, body帧号->原视频帧号)。
-
-    ★ 帧号映射读 00_frames/frames.json 的 kept_indices, **不自己算公式**。
-      算公式在另一条链上必错(室内抽帧步长是 3.6, 不是整数), 而且错得很隐蔽。"""
-    meta = json.load(open(f"{body_dir}/00_frames/frames.json"))
-    kept = meta["kept_indices"]
-    mesh_root = f"{mesh_run_of(body_dir)}/mesh_4d_individual"
-    people, faces = {}, None
-    for pid in sorted(os.listdir(mesh_root), key=lambda x: int(x) if x.isdigit() else 1 << 30):
-        d = f"{mesh_root}/{pid}"
-        if not os.path.isdir(d):
-            continue
-        fr = {}
-        for f in sorted(os.listdir(d)):
-            if not f.endswith(".ply"):
-                continue
-            m = trimesh.load(f"{d}/{f}", process=False)
-            bi = int(os.path.splitext(f)[0])
-            fr[bi] = np.asarray(m.vertices, np.float32)
-            if faces is None:
-                faces = np.asarray(m.faces, np.uint32)
-        if fr:
-            people[pid] = fr
-    if not people:
-        raise SystemExit(f"[失败] {mesh_root} 底下一个 ply 都没有")
-    return people, faces, kept
-
-
 def load_scene(r1):
     """读场景这一半: 相机、天、帧号映射。"""
     da3 = f"{r1}/02_da3" if os.path.isdir(f"{r1}/02_da3") else f"{r1}/02_DA3点云"
@@ -87,33 +58,7 @@ def load_scene(r1):
     return da3, cams, np.asarray(UP, float), float(GH), vid2key
 
 
-# ------------------------------------------------------------------ 摆
-# SAM 3D Body 的 ply 是 y朝上 z朝后, cameras.json 是 OpenCV 的 y朝下 z朝前
-GL2CV = np.diag([1.0, -1.0, -1.0])
-
-
-def place(people, cams, vid2key, kept):
-    """每人每帧: 相机系 -> 场景世界系。返回 {pid: {视频帧号: 世界坐标顶点}}。
-
-    没有对应相机的帧直接丢 —— body4d 的时间范围和 da3 用的帧不一定重合
-    (pedestrian: body4d 覆盖视频前 176 帧, da3 用了 0~268 里的 180 帧)。"""
-    out, miss = {}, 0
-    for pid, frames in people.items():
-        got = {}
-        for bi, V in frames.items():
-            if bi >= len(kept):
-                miss += 1; continue
-            vf = kept[bi]
-            key = vid2key.get(vf)
-            if key is None or key not in cams:
-                miss += 1; continue
-            c2w = np.linalg.inv(np.array(cams[key]["extrinsic_w2c_4x4"], float))
-            got[vf] = (V @ GL2CV) @ c2w[:3, :3].T + c2w[:3, 3]
-        if got:
-            out[pid] = got
-    return out, miss
-
-
+# ------------------------------------------------------------------ 体检
 def measure(world, UP, GH):
     """每个人的体检: 身高、脚离地、帧间位移。这是唯一能判断"摆对了没有"的自查。"""
     rows = {}
@@ -134,26 +79,11 @@ def measure(world, UP, GH):
     return rows
 
 
-def snap_ground(world, rows, UP):
-    """落地: 每人减掉自己那个**固定**的脚离地偏移。
-
-    ★ 为什么是减一个常数而不是逐帧贴地: 实测每个人的偏移在几帧之内只抖几厘米
-      (pedestrian 人3: +0.28~+0.52m), 是一个系统性的常数, 不是噪声。
-      逐帧贴地会把"走路时脚本来就离地"这件事也抹掉, 人会变成滑行。"""
-    for pid, fr in world.items():
-        d = rows[pid]["脚离地"] * UP
-        for v in fr:
-            fr[v] = fr[v] - d
-    return world
-
-
-# ------------------------------------------------------------------ 校正(摆人)
-# 物理那步之前跑。SAM 3D Body 自己估人离镜头多远(看人在画面里多大, 按人的体型反推),
-# 不看我们的深度图。pedestrian 实测 5 个人里 3 个被放近 11~22%, 脚飘 15~40cm;
-# 远近换成场景深度之后 4/5 的人脚自己落到 ±10cm 内。所以顺序是:
-#   远近按场景深度 -> 位置轨迹平滑 -> 逐帧脚着地 -> 判断坐着的人坐哪把椅子 -> 记下走过的路线
-# 体型/身高不用再锁: body4d 已经把每个 id 的 shape/scale 锁成第一帧的值
-# (sam3d_body.py 的 mhr_shape_scale_dict), 身体朝向也做过 EMA 平滑, 只有位置没平滑。
+# ------------------------------------------------------------------ 远近
+# SAM 3D Body 自己估人离镜头多远(看人在画面里多大, 按人的体型反推), 不看我们的深度图。
+# pedestrian 实测 5 个人里 3 个被放近 11~22%, 脚飘 15~40cm; 远近换成场景深度之后 4/5 的人脚自己落到 ±10cm 内。
+# 修人的顺序(body_motion.solve): 远近按场景深度 -> 翻转补帧 -> 锁骨头长度 -> 肢体跳变 -> 姿势平滑
+#   -> 位置整理 / 贴地 -> 判断谁坐着、坐哪把椅子、记下走过的路线 -> 坐着的人换一种摆法
 HALF_BODY = 0.12     # 深度图量的是身体正面, 人体网格的根在身体中间, 差半个身体厚
 SEAT_EXTENT = 1.45   # 一帧的竖直跨度小于这个 = 坐着 (站着的成年人 >= 1.55m, 坐着 1.2~1.35m)
 FOOT_BAND = 0.6      # 走过的路线只取离地这么高以内的点: 脚和小腿占的地方才是"路",
@@ -328,8 +258,8 @@ def load_focals(mesh_run):
 
 
 def occ_plan(bis, segs, t, rootW, mask_root):
-    """每个不可信帧怎么补: {str(bi): [A, B, w, 根的世界坐标]}, 存进 10_people.json, apply_corr 按它重放。
-    动作 = A、B 两个好帧之间按 w 过渡(见 blend_pose); 根的位置:
+    """每个不可信帧怎么补: {str(bi): [A, B, w, 根的世界坐标]}。照着它改参数的是 body_motion.fill_flips。
+    动作 = A、B 两个好帧之间按 w 过渡; 根的位置:
       两头都有好帧 -> 按时间线性插值(1~2 秒里人基本走直线, 比被挡时的任何观测都可靠);
       只有一头(片头/片尾) -> 动作定在那个好帧(A = B), 位置跟着自己的 mask 走:
         mask_root[bi] = 沿 mask 质心那条视线、按场景深度量的距离; 减去锚点那帧"mask 质心 vs 真根"的差,
@@ -394,27 +324,6 @@ def _fix_report(occ, flips, kept):
                  最大一翻=round(max(flips.get(b, 0.0) for b in x))) for x in segs]
 
 
-def blend_pose(LA, LB, w):
-    """两帧人体(各自减掉根)按 w 过渡: 先把 B 转回 A 的朝向逐顶点插值, 再整体转过去 w 那么多。
-    ★ 直接逐顶点插值, 转身 90° 时中间帧会被压扁; 分开转和形变就不会。"""
-    from scipy.spatial.transform import Rotation
-    cA, cB = LA.mean(0), LB.mean(0)
-    R = _kabsch(LA - cA, LB)                                        # (LB - cB) ≈ (LA - cA) @ R.T
-    M = (1 - w) * (LA - cA) + w * ((LB - cB) @ R)
-    Rw = Rotation.from_rotvec(Rotation.from_matrix(R).as_rotvec() * w).as_matrix()
-    return M @ Rw.T + (1 - w) * cA + w * cB
-
-
-def fill_occluded(W, rootW, occ):
-    """W, rootW: {bi: 世界系顶点 / 根}; occ: occ_plan 的结果。返回新的 W, 只换不可信帧。"""
-    out = dict(W)
-    for k, (A, B, w, r) in occ.items():
-        b = int(k)
-        if b in W:
-            out[b] = blend_pose(W[A] - rootW[A], W[B] - rootW[B], w) + np.asarray(r)
-    return out
-
-
 def _smooth(P, w_med=5, w_avg=3):
     """逐帧位置 (N,3): 先滑动中位数压掉单帧跳变, 再滑动平均去抖。两端用可用的邻居。"""
     n = len(P)
@@ -427,11 +336,11 @@ def _smooth(P, w_med=5, w_avg=3):
 # ------------------------------------------------------------------ 姿势平滑
 # ★ SAM 3D Body 是单帧模型, 每帧从零估: 四肢和身体朝向一帧一晃。骨盆系里的高频抖动(09-28 实测)
 #   soccer 1.4~2.1 cm/顶点, nfl1 抱摔那堆人 4~6.5 cm, 手脚 11~13 cm。SAM-Body4D 自带的平滑只在 8 帧一批里
-#   往前看, 批和批不连; 这里以前只平滑"人在哪"(位置/远近), 姿势本身对站着走着的人没人管。
-#   做法: 拆成 骨盆中心(不动, 归位置平滑管) + 骨盆朝向(四元数) + 骨盆系里的四肢(逐顶点), 各算两版:
-#   强平滑(σ=POSE_SIGMA) 和 几乎不平滑(σ=POSE_SIGMA_MIN), 按**各自**动得多快混合 —— 慢的用强平滑版,
-#   快的用原样(One Euro Filter 的思路, Casiez CHI 2012)。逐顶点混合: 甩出去的那条腿保持原样, 身体别处照样去抖;
-#   只按整个人的平均速度调, 一条腿甩得再快平均下来也不快, 会被抹软(测试里只留住 66%)。
+#   往前看, 批和批不连。
+#   做法(现在做在关节参数上, 见 body_motion.smooth_joints / smooth_rots; 这里只留两边共用的强度和按时间加权的平均):
+#   各算两版 —— 强平滑(σ=POSE_SIGMA) 和 几乎不平滑(σ=POSE_SIGMA_MIN), 按**各自**动得多快混合: 慢的用强平滑版,
+#   快的用原样(One Euro Filter 的思路, Casiez CHI 2012)。甩出去的那条腿保持原样, 身体别处照样去抖;
+#   只按整个人的平均速度调, 一条腿甩得再快平均下来也不快, 会被抹软。
 POSE_SIGMA = 0.08       # 秒: 慢的部分的平滑强度(24 fps 约 2 帧)
 POSE_SIGMA_MIN = 0.02   # 秒: 快的部分基本不平滑(约半帧)
 POSE_V0 = 1.5           # m/s: 骨盆系里一个顶点动到这么快, 两版各一半
@@ -446,52 +355,6 @@ def _gauss_t(Y, t, sig):
         w = np.exp(-0.5 * ((t[m] - t[i]) / sig[i]) ** 2)
         out[i] = np.tensordot(w / w.sum(), Y[m], axes=1)
     return out
-
-
-def _pose_split(Ws):
-    """(T,NV,3) 世界系 -> 骨盆中心 (T,1,3)、骨盆朝向 (T,3,3)、骨盆系里的四肢 (T,NV,3)。"""
-    X = np.stack(Ws)
-    C = X[:, load_parts()["pelvis"]].mean(1, keepdims=True)
-    R = np.stack(pelvis_rots(list(X)))
-    return C, R, np.einsum("tvi,tij->tvj", X - C, R)
-
-
-def smooth_pose(Ws, t, sigma=POSE_SIGMA, sigma_min=POSE_SIGMA_MIN, v0=POSE_V0, w0=POSE_W0):
-    """Ws: 按时间排的 (NV,3) 世界系顶点; t: 秒。返回同样的列表: 骨盆中心不动, 朝向和四肢按时间平滑,
-    动得快的顶点/转得快的帧少平滑。不到 5 帧的不动。"""
-    from scipy.spatial.transform import Rotation
-    if len(Ws) < 5:
-        return list(Ws)
-    t = np.asarray(t, float); T = len(t)
-    dt = np.maximum(np.diff(t), 1e-6)
-    def near(x):
-        """这一帧的快慢 = 前后 2σ 里最快的那一段: 甩到最远那一刻速度是 0, 只看自己会被当成慢的, 峰被削平。"""
-        x = np.maximum(np.r_[x[:1], x], np.r_[x, x[-1:]])
-        return np.stack([x[np.abs(t - ti) <= 2 * sigma].max(0) for ti in t])
-    C, R, L = _pose_split(Ws)
-    Ls = _gauss_t(L, t, np.full(T, sigma))                         # 速度按强平滑版求, 不然抖动本身就被当成"快"
-    a = v0 / (v0 + near(np.linalg.norm(np.diff(Ls, axis=0), axis=2) / dt[:, None]))[..., None]
-    L = a * Ls + (1 - a) * _gauss_t(L, t, np.full(T, sigma_min))
-    q = Rotation.from_matrix(R).as_quat()
-    for i in range(1, T):                                          # q 和 -q 是同一个朝向, 先接成连续的再平均
-        if q[i] @ q[i - 1] < 0:
-            q[i] = -q[i]
-    qs = _gauss_t(q, t, np.full(T, sigma))
-    qs /= np.linalg.norm(qs, axis=1, keepdims=True)
-    w = near(2 * np.arccos(np.clip(np.abs((qs[1:] * qs[:-1]).sum(1)), 0, 1)) / dt)
-    b = (w0 / (w0 + w))[:, None]
-    q = b * qs + (1 - b) * _gauss_t(q, t, np.full(T, sigma_min))
-    Rs = Rotation.from_quat(q / np.linalg.norm(q, axis=1, keepdims=True)).as_matrix()
-    return list(np.einsum("tvj,tij->tvi", L, Rs) + C)
-
-
-def pose_jitter(Ws, t):
-    """姿势的高频抖动(米/顶点): 去掉骨盆中心后, 和 1.5 帧(24 fps)高斯平滑版的平均差。报告和测试用。"""
-    if len(Ws) < 5:
-        return 0.0
-    t = np.asarray(t, float)
-    X = np.stack(Ws); X = X - X[:, load_parts()["pelvis"]].mean(1, keepdims=True)
-    return float(np.linalg.norm(X - _gauss_t(X, t, np.full(len(t), 1.5 / 24)), axis=2).mean())
 
 
 # ------------------------------------------------------------------ 轨迹整理(位置 + 贴地 + 腾空)
@@ -613,12 +476,13 @@ def tidy_track(W, bis, t, conf, UP, GH):
 
 
 # ------------------------------------------------------------------ 坐着的人
-# ★ 为什么单独摆: 坐着的人腿被桌子挡住, SAM 3D Body 每帧重猜一次腿。solve_people 里的贴地
-#   (以前是逐帧最低点贴地, 现在见 tidy_track)会把腿的变化放大成整个人上下跳 —— office 1 号: 头顶高度跳了 0.46m,
-#   屁股陷进椅面 15cm; 可她的头顶相对骨盆一直很稳(全程只差 6cm)。所以坐着的人换一种摆法:
+# ★ 为什么单独摆: 坐着的人腿被桌子挡住, SAM 3D Body 每帧重猜一次腿。贴地(tidy_track)会把腿的变化放大成
+#   整个人上下跳 —— office 1 号: 头顶高度跳了 0.46m, 屁股陷进椅面 15cm; 可她的头顶相对骨盆一直很稳(全程只差 6cm)。
+#   所以坐着的人换一种摆法:
 #     下半身(骨盆+腿)整段用同一帧的姿势, 只像转椅子那样绕竖轴转; 屁股放在椅面上(没椅子就脚着地);
-#     上身保留每帧的动作, 跟着骨盆走, 再做一次时间平滑。两半按蒙皮权重在腰部软拼。
+#     上身保留每帧的动作, 跟着骨盆走, 再做一次时间平滑。
 #   看不见的腿"这一帧猜成什么样"一概不信, 只信整段里最像样的那一次。
+#   这里的 seat_fix 只做**决定**(用哪一帧的腿、每帧转多少、放多高); 照着改关节参数的是 body_motion.seat_fix_params。
 PARTS_NPZ = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mhr_parts.npz")
 SEAT_BAND = (0.30, 0.80)   # 椅面: 离地这个范围里面积最大的那层朝上的面
 SEAT_XY_TOL = 0.35         # 骨盆离椅面中心超过这个 = 不在这把椅子上方, 改成脚着地
@@ -697,7 +561,7 @@ def _pelvis_track(X, P, UP):
 
 def seat_fix(X, bis, UP, GH, FLIP, seat=None, seat_h_default=0.45):
     """坐着的人: 算整段的摆法, 返回 (可 JSON 化的 fix, 诊断)。
-    X: (T,NV,3) 按场景深度校正过远近、还没做位置平滑和贴地的世界坐标(solve_people 里的 W)。
+    X: (T,NV,3) 姿势整理完(骨头锁好、平滑过)、还没做位置整理和贴地的世界系顶点(body_motion.solve 里的 W)。
     seat: (椅子名, 椅面离地高, 椅面中心 xz[glTF]) 或 None。"""
     P = load_parts()
     T = len(X)
@@ -741,27 +605,6 @@ def seat_fix(X, bis, UP, GH, FLIP, seat=None, seat_h_default=0.45):
     return fix, diag
 
 
-def apply_seat_fix(X, bis, fix):
-    """按 seat_fix 重算一个坐着的人的逐帧顶点。X 同 seat_fix 的输入。返回 (T,NV,3)。"""
-    P = load_parts()
-    UP = np.asarray(fix["up"], float)
-    r = [int(b) for b in bis].index(fix["ref"])
-    ref = X[r] - X[r][P["pelvis"]].mean(0)           # 参考帧的整个人, 去掉骨盆位置
-    Pbar = np.array([fix["pos"][str(int(b))] for b in bis]) + np.asarray(fix.get("shift", [0, 0, 0]), float)
-    if fix["freeze"]:
-        return ref[None] + Pbar[:, None, :]
-    U = X - X[:, P["pelvis"]].mean(1)[:, None, :]
-    b = np.asarray(bis, float)
-    wt = np.exp(-0.5 * ((b[:, None] - b[None, :]) / fix["sigma"]) ** 2)
-    wt[np.abs(b[:, None] - b[None, :]) > 3 * fix["sigma"]] = 0.0
-    U = np.tensordot(wt / wt.sum(1, keepdims=True), U, axes=(1, 0))   # 上身: 每帧动作保留, 时间高斯平滑
-    w = P["lower_w"]
-    out = np.empty_like(U)
-    for t, bb in enumerate(bis):
-        out[t] = (1 - w) * U[t] + w * (ref @ _rot_up(UP, fix["yaw"][str(int(bb))]).T) + Pbar[t]
-    return out
-
-
 def _seat_report(old, new, UP, GH, fix):
     """坐着的人改前改后的体检。"""
     P = load_parts()
@@ -781,81 +624,20 @@ def _seat_report(old, new, UP, GH, fix):
     return out
 
 
-def solve_people(people, roots, cams, vid2key, kept, UP, GH, mesh_run, da3, FLIP, chairs,
-                 seats=None, seat_h_default=0.45, fps=24.0, focals=None, pose_smooth=False):
-    """算每个人的校正, 不动顶点。返回 (校正表, 报告)。校正表可 JSON 化, 合成那步按它重放。
-    focals: 给了就做翻转补帧(见 flip_segments / occ_plan); None = 老行为。
-    pose_smooth: True = 姿势平滑(见 smooth_pose), 在翻转补帧之后、位置平滑和贴地之前。
-    chairs: {节点名: (矩形中心 xz, 两个轴, 半长)}, 取自物理之前的 07_scene.glb (glTF 系)。
-    seats: chair_seats() 的结果; 给了就对坐着的人做坐姿修正(见 seat_fix), None = 老行为。"""
+def sit_and_route(Ws, delta, vfs, UP, GH, FLIP, chairs):
+    """一个人整段: 哪几帧算坐着、坐的是哪把椅子、站/走着的帧踩过哪些地方。物理那步拿后两样钉椅子、当路障。
+    Ws: 按帧排的世界系顶点(姿势整理完的); delta (T,3): 位置整理给的整体平移; vfs: 每帧的原视频帧号;
+    chairs: load_chairs() 的结果(没有椅子给 {})。返回 (每帧坐没坐 (T,) bool, 椅子名或 None, 脚印列表)。
+      坐着 = 这一帧的竖直跨度小于 SEAT_EXTENT; 椅子 = 坐着的帧里, 臀部那一层(离地 0.3~0.8 m)落在哪把椅子的
+      水平矩形 0.4 m 以内, 票多的那把(而且过半的帧坐着);
+      脚印 = 站/走着的帧, 离地 FOOT_BAND 以内的点的水平最小外接矩形(glTF 系 xz)。"""
     R3 = FLIP[:3, :3]
-    corr, rep = {}, {}
-    # ★ 先量全部人, 再逐人定比例。场景尺度的偏差对所有人都一样, 各人的比例本该扎堆;
-    #   离群的那个多半是深度被前面的遮挡物带偏了(office 5 号: 别人 1.3~1.66, 他 0.68,
-    #   结果被配到一把别人走路会穿过的椅子上)。离全体中位数超过 RATIO_TOL 的人不信自己, 用全体的。
-    RATIO_TOL = 0.25
-    todo, all_r = {}, []
-    for pid, frames in sorted(people.items(), key=lambda x: int(x[0])):
-        bis = sorted(b for b in frames if b < len(kept) and kept[b] in vid2key
-                     and vid2key[kept[b]] in cams and b in roots.get(pid, {}))
-        if not bis:
-            continue
-        ratios = depth_ratio(pid, bis, roots[pid], mesh_run, da3, vid2key, kept)
-        todo[pid] = (bis, ratios); all_r += list(ratios.values())
-    R_all = float(np.median(all_r)) if all_r else 1.0
-    for pid, (bis, ratios) in todo.items():
-        frames, rt = people[pid], roots[pid]
-        R_own = float(np.median(list(ratios.values()))) if ratios else R_all
-        R = R_own if abs(R_own / R_all - 1.0) <= RATIO_TOL else R_all
-        tt = [kept[b] / fps for b in bis]
-        c2w = {bi: np.linalg.inv(np.array(cams[vid2key[kept[bi]]]["extrinsic_w2c_4x4"], float)) for bi in bis}
-        # 0) 先找翻转段(见 flip_segments): 骨盆朝向一帧翻 30° 以上、稳不住 10 帧的段。只看朝向, 和远近无关。
-        #    这些帧模型在两个人之间来回认: 动作和位置在 1b 换掉, 远近也不能退回它估的距离(见 frame_ratios 的 trust)
-        segs, flips = [], {}
-        if focals is not None:
-            rots = pelvis_rots([frames[bi] @ GL2CV @ c2w[bi][:3, :3].T for bi in bis])
-            flips = {b: (_rot_deg(rots[i - 1], rots[i]) if i else 0.0) for i, b in enumerate(bis)}
-            segs = flip_segments(rots, tt)
-        bad = {bis[i] for i0, i1 in segs for i in range(i0, i1 + 1)}
-        # 1) 远近按**每一帧**的场景深度(见 frame_ratios): 沿视线平移 (根平移乘 r), 人体不缩放。
-        #    整个人离群(R != R_own)说明他自己的深度测量不可信, 那就不用逐帧的(ratios 传空), 整段用全体的 R;
-        #    翻转段照样不用模型的距离
-        rf = frame_ratios(bis, ratios if R == R_own else {}, {b: float(rt[b][2]) for b in bis}, R,
-                          t={b: kept[b] / fps for b in bis}, trust=set(bis) - bad)
-        W, root = {}, []
-        for bi in bis:
-            Vc = frames[bi] @ GL2CV + (rf[bi] - 1.0) * rt[bi]
-            W[bi] = Vc @ c2w[bi][:3, :3].T + c2w[bi][:3, 3]
-            root.append(rf[bi] * rt[bi] @ c2w[bi][:3, :3].T + c2w[bi][:3, 3])
-        # 1b) 翻转补帧: 翻转段的位置和动作都换掉(见 occ_plan)。后面的平滑/贴地/路线都吃补过的
-        occ = {}
-        if segs:
-            rootW = dict(zip(bis, root))
-            mroot = mask_roots(pid, bis, rt, rf, focals[pid], mesh_run, cams, vid2key, kept)
-            occ = occ_plan(bis, segs, {b: kept[b] / fps for b in bis}, rootW, mroot)
-            W = fill_occluded(W, rootW, occ)
-            root = [np.asarray(occ[str(b)][3]) if str(b) in occ else rootW[b] for b in bis]
-        # 1c) 姿势平滑: 朝向和四肢按时间平滑, 快动作少平滑(见 smooth_pose)
-        ps, jit = None, None
-        if pose_smooth and len(bis) >= 5:
-            ps = dict(fps=fps, sigma=POSE_SIGMA, sigma_min=POSE_SIGMA_MIN, v0=POSE_V0, w0=POSE_W0)
-            j0 = pose_jitter([W[b] for b in bis], tt)
-            W = dict(zip(bis, smooth_pose([W[b] for b in bis], tt)))
-            jit = [round(100 * j0, 1), round(100 * pose_jitter([W[b] for b in bis], tt), 1)]
-        root = np.array(root)
-        # 2) 轨迹整理(整帧平移, 不动姿势): 骨盆中心三个方向一起平滑 + 贴地 + 腾空, 翻转补帧换掉的帧少算、
-        #    不能判腾空(见 tidy_track)
-        conf = np.array([CONF_SUB if str(b) in occ else 1.0 for b in bis])
-        delta = tidy_track(W, bis, tt, conf, UP, GH)
-        # 3) 坐着的判断 + 坐的是哪把椅子
-        ext = np.array([float(np.ptp(W[bi] @ UP)) for bi in bis])
-        seated = ext < SEAT_EXTENT
-        chair, votes = None, {}
-        for bi, d, s_ in zip(bis, delta, seated):
-            if not s_:
-                continue
-            V = (W[bi] + d) @ R3.T
-            h = V[:, 1] - GH
+    seated = np.array([float(np.ptp(W @ UP)) for W in Ws]) < SEAT_EXTENT
+    chair, votes, prints = None, {}, []
+    for W, d, s_, vf in zip(Ws, delta, seated, vfs):
+        V = (W + d) @ R3.T
+        h = V[:, 1] - GH
+        if s_:
             hip = V[(h > 0.3) & (h < 0.8)][:, [0, 2]]
             if len(hip) < 20:
                 continue
@@ -868,87 +650,27 @@ def solve_people(people, roots, cams, vid2key, kept, UP, GH, mesh_run, da3, FLIP
                     best = (gap, name)
             if best:
                 votes[best[1]] = votes.get(best[1], 0) + 1
-        if votes and seated.mean() > 0.5:
-            chair = max(votes, key=votes.get)
-        # 4) 走过的路线: 站/走着的帧, 离地 FOOT_BAND 以内的点的水平最小外接矩形 (glTF 系)
-        prints = []
-        for bi, d, s_ in zip(bis, delta, seated):
-            if s_:
-                continue
-            V = (W[bi] + d) @ R3.T
-            low = V[V[:, 1] - GH < FOOT_BAND][:, [0, 2]]
-            if len(low) < 20:
-                continue
-            T2, e2 = trimesh.bounds.oriented_bounds_2D(low)
-            Rr = T2[:2, :2]
-            prints.append(dict(vf=int(kept[bi]), c=(-Rr.T @ T2[:2, 2]).round(4).tolist(),
-                               ax=Rr.round(5).tolist(), h=(np.asarray(e2) / 2).round(4).tolist()))
-        feet_after = [float(((W[bi] + d) @ UP).min() - GH) for bi, d in zip(bis, delta)]
-        step = np.linalg.norm(np.diff(root + delta, axis=0), axis=1) if len(bis) > 1 else np.zeros(1)
-        step0 = np.linalg.norm(np.diff(root, axis=0), axis=1) if len(bis) > 1 else np.zeros(1)
-        corr[pid] = dict(ratio=R, ratio_frame={str(int(b)): round(rf[b], 5) for b in bis}, occ=occ, pose_smooth=ps,
-                         frames=[int(b) for b in bis],
-                         delta={str(int(b)): np.round(d, 4).tolist() for b, d in zip(bis, delta)},
-                         seated=bool(chair is not None or seated.mean() > 0.5), chair=chair,
-                         footprints=prints)
-        rv = np.array(list(ratios.values())) if ratios else np.array([1.0])
-        rep[pid] = dict(帧数=len(bis), 远近比例=round(R, 3), 自己量的比例=round(R_own, 3),
-                        用全体中位=bool(R != R_own), 全体中位=round(R_all, 3),
-                        比例10_90=[round(float(np.percentile(rv, 10)), 3), round(float(np.percentile(rv, 90)), 3)],
-                        量到深度的帧=len(ratios),
-                        校正前脚离地中位=round(float(np.median([float((W[b] @ UP).min() - GH) for b in bis])), 3),
-                        校正后脚离地中位=round(float(np.median(feet_after)), 3),
-                        校正后脚离地范围=[round(min(feet_after), 3), round(max(feet_after), 3)],
-                        帧间位移最大_前=round(float(step0.max()), 3), 帧间位移最大_后=round(float(step.max()), 3),
-                        坐着的帧=int(seated.sum()), 椅子=chair, 路线脚印=len(prints),
-                        翻转补帧=_fix_report(occ, flips, kept), 姿势抖动_cm=jit,
-                        可信帧比例=round(float((conf >= 1.0).mean()), 2))
-        # 可疑的人: 数据从头到尾就不对, 整理只能遮丑(nfl1 人 4: 画面里 54 px, 深度离群, 位置跳 28 m) —— 报告里点名,
-        # 建议在挑人那一步去掉。不自动删: 删不删人是闸口上人拍板的事
-        why = ([f"自己量的深度离群(比例 {R_own:.2f}, 全体 {R_all:.2f})"] if R != R_own else []) \
-            + ([f"只有 {rep[pid]['可信帧比例']:.0%} 的帧模型可信"] if rep[pid]["可信帧比例"] < 0.5 else []) \
-            + ([f"模型原始位置一帧跳 {step0.max():.1f} m"] if step0.max() > 2.0 else [])
-        rep[pid]["可疑"] = why
-        # 5) 坐着的人换一种摆法。delta / footprints / 椅子 都不动 —— 物理的输入逐位不变
-        # ★ 场景里一把椅子都没有就不做(09-28 nfl1): 飞扑/被撞倒的人竖直跨度也小于 SEAT_EXTENT, 会被当成坐着,
-        #   腿换成整段里站着跑的那一帧、骨盆掰直 —— 横着飞的人被折成反着的蹲姿。office 有椅子, 照旧(人 3 没对上椅子也照旧)
-        if seats and corr[pid]["seated"]:
-            X = np.stack([W[b] for b in bis])
-            st = seats.get(chair) if chair else None
-            fix, diag = seat_fix(X, bis, UP, GH, FLIP, (chair, st[0], st[1]) if st else None, seat_h_default)
-            corr[pid]["seat_fix"] = fix
-            old = np.stack([W[b] + d for b, d in zip(bis, delta)])
-            rep[pid]["坐姿修正"] = dict(diag, **_seat_report(old, apply_seat_fix(X, bis, fix), UP, GH, fix))
-    return corr, rep
+            continue
+        low = V[h < FOOT_BAND][:, [0, 2]]
+        if len(low) < 20:
+            continue
+        T2, e2 = trimesh.bounds.oriented_bounds_2D(low)
+        Rr = T2[:2, :2]
+        prints.append(dict(vf=int(vf), c=(-Rr.T @ T2[:2, 2]).round(4).tolist(),
+                           ax=Rr.round(5).tolist(), h=(np.asarray(e2) / 2).round(4).tolist()))
+    if votes and seated.mean() > 0.5:
+        chair = max(votes, key=votes.get)
+    return seated, chair, prints
 
 
-def apply_corr(people, corr, cams, vid2key, kept, roots):
-    """按校正表重放: 返回 {pid: {视频帧号: DA3 世界系顶点}}, 和 place() 的输出同一种格式。"""
-    world = {}
-    for pid, c in corr.items():
-        R, fr, raw = c["ratio"], {}, []
-        rf = c.get("ratio_frame") or {}          # 老的 10_people.json 没有逐帧比例, 整段用 ratio
-        rootW = {}
-        for bi in c["frames"]:
-            c2w = np.linalg.inv(np.array(cams[vid2key[kept[bi]]]["extrinsic_w2c_4x4"], float))
-            r = rf.get(str(bi), R)
-            Vc = people[pid][bi] @ GL2CV + (r - 1.0) * roots[pid][bi]
-            raw.append(Vc @ c2w[:3, :3].T + c2w[:3, 3])
-            rootW[bi] = r * roots[pid][bi] @ c2w[:3, :3].T + c2w[:3, 3]
-        if c.get("occ"):                             # 翻转补帧(见 flip_segments / occ_plan), 老文件没有这项
-            Wd = fill_occluded(dict(zip(c["frames"], raw)), rootW, c["occ"])
-            raw = [Wd[bi] for bi in c["frames"]]
-        ps = c.get("pose_smooth")                    # 姿势平滑(见 smooth_pose), 老文件没有这项
-        if ps:
-            raw = smooth_pose(raw, [kept[bi] / ps["fps"] for bi in c["frames"]],
-                              ps["sigma"], ps["sigma_min"], ps["v0"], ps["w0"])
-        for bi, V in zip(c["frames"], raw):
-            fr[kept[bi]] = V + np.asarray(c["delta"][str(bi)])
-        if c.get("seat_fix"):                        # 坐着的人: delta 不用, 按坐姿修正重算
-            Y = apply_seat_fix(np.stack(raw), c["frames"], c["seat_fix"])
-            fr = {kept[bi]: Y[t] for t, bi in enumerate(c["frames"])}
-        world[pid] = fr
-    return world
+def suspicious(R_own, R_all, R, conf_ok, jump):
+    """可疑的人: 数据从头到尾就不对, 整理只能遮丑(nfl1 人 4: 画面里 54 px, 深度离群, 位置跳 28 m)。返回原因列表(空 = 不可疑)。
+    只点名, 不自动删: office 那件搭在椅背上的外套(深度比例 0.49)和 nfl1 远处 20x60 像素的真人(0.73)都是"深度离群",
+    分不开 —— 删不删是闸口上人看着截图拍板的事。
+    R_own / R_all / R: 自己量的远近比例、全体中位、最后用的; conf_ok: 模型可信的帧占比; jump: 模型原始位置一帧最多跳多少米。"""
+    return ([f"自己量的深度离群(比例 {R_own:.2f}, 全体 {R_all:.2f})"] if R != R_own else []) \
+        + ([f"只有 {conf_ok:.0%} 的帧模型可信"] if conf_ok < 0.5 else []) \
+        + ([f"模型原始位置一帧跳 {jump:.1f} m"] if jump > 2.0 else [])
 
 
 def load_chairs(scene_glb):
@@ -1080,157 +802,80 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--r1", required=True, help="场景结果目录(底下有 02_da3/ 和 07_scene*.glb)")
     ap.add_argument("--body", required=True, help="body4d 的一轮, 如 sam-body4d/outputs/office/b1")
-    ap.add_argument("--mode", choices=["place", "compose", "all"], default="all",
-                    help="place = 物理之前: 算校正、写 10_people.json (物理拿它当路障/钉椅子); "
-                         "compose = 物理之后: 按 10_people.json 把人放进 07_scene_phy.glb; all = 两步连着跑")
-    ap.add_argument("--scene-in", default="07_scene.glb", help="place 用: 找椅子的场景(物理之前的)")
-    ap.add_argument("--scene-glb", default="07_scene_phy.glb", help="compose 用: 往里放人的场景")
-    ap.add_argument("--people", default="10_people.json")
-    ap.add_argument("--out", default="09_scene_nopeople.glb", help="compose 出的: 摘掉静态人形之后的场景")
+    ap.add_argument("--scene-in", default="07_scene.glb", help="物理之前的场景: 坐着的人是按它里面的椅子摆的")
+    ap.add_argument("--scene-glb", default="07_scene_phy.glb", help="物理之后的场景: 摘掉静态人形、渲验收图用它")
+    ap.add_argument("--out", default="09_scene_nopeople.glb", help="摘掉静态人形之后的场景")
     ap.add_argument("--render", action="store_true", help="顺便出渲染回图(调 render_back.py)")
     ap.add_argument("--render-frames", type=int, default=4)
     ap.add_argument("--fr", default=None, help="原始帧目录, --render 时要")
-    ap.add_argument("--seat-fix", choices=["on", "off"], default="on",
-                    help="place 用: 坐着的人按椅面定高度、腿取整段稳定姿势、上身整段平滑; off = 老行为(逐帧脚着地)")
-    ap.add_argument("--pose-smooth", choices=["on", "off"], default="on",
-                    help="place 用: 朝向和四肢按时间平滑、快动作少平滑(SAM 3D Body 逐帧估, 一帧一晃), 见 smooth_pose; off = 老行为")
-    ap.add_argument("--flip-fix", choices=["on", "off"], default="on",
-                    help="place 用: 身体朝向一帧翻 30° 以上、稳不住 10 帧的段(被挡时模型在两个人之间来回认)"
-                         "换掉位置和动作, 见 flip_segments; off = 老行为")
     a = ap.parse_args()
 
     da3, cams, UP, GH, vid2key = load_scene(a.r1)
-    fj = json.load(open(f"{a.body}/00_frames/frames.json"))
-    fps = fj["src_fps"]
-    if a.mode in ("place", "all"):
-        # 跟踪给的编号不等于人: 先按房间里的位置核对一遍(并掉同一个人的几个编号, 去掉不是人的), 后面所有步骤都读核对过的那份
-        print("== 核对身份 (见 people_identity.py) ==")
-        raw = people_identity.raw_run(a.body)
-        who, id_log = people_identity.resolve(identity_tracks(raw, da3, cams, vid2key, fj["kept_indices"], fps), UP)
-        people_identity.write(a.body, raw, who, id_log)
-        for x in id_log:
-            vf = [fj["kept_indices"][b] for b in x["帧"]]
-            print(f"  编号 {x['编号']} 的 {len(vf)} 帧(视频第 {vf[0]}~{vf[-1]} 帧): "
-                  + (f"并进人 {x['并进']}" if x["事"] == "并进别人" else "不算人") + f" —— {x['原因']}")
-        print(f"  跟踪给了 {len(people_identity._frame_counts(raw))} 个编号 -> 核对后 {len(who)} 个人: {list(who)}")
-    print("== 读 ==")
-    people, faces, kept = load_body(a.body)
-    mesh_run = mesh_run_of(a.body)
-    roots = load_roots(mesh_run)
+    fps = json.load(open(f"{a.body}/00_frames/frames.json"))["src_fps"]
     FLIP = export_T(UP)
-    nv = len(next(iter(next(iter(people.values())).values())))
-    print(f"  人体 {len(people)} 人, 每人 {[len(v) for v in people.values()]} 帧, 每帧 {nv} 顶点")
-    print(f"  场景 {len(cams)} 个相机, 天 {np.round(UP,3)}, 地面高 {GH:.2f}m, 视频 {fps:.2f}fps")
-    pj = f"{a.r1}/{a.people}"
+    print("== 合成 (物理之后) ==")
+    meta = people_store.check_fresh(a.r1, people_identity.source_of(a.body))
+    corr = meta["people"]
+    # ★ 坐着的人是按物理之前那把椅子的椅面摆的。钉住的椅子物理不会推, 这里再核一遍: 同名椅子物理前后挪了超过 1 cm,
+    #   人跟着椅子挪。位移每次都从两份场景重新量、单独存(people_store.save_shift): 不改摆人的结果, 重跑合成也不会加两遍;
+    #   网页上的人(网格)和 FBX 里的人(参数)读的时候加的是同一个位移
+    shifts = {}
+    sat = {p: c["seat_fix"]["seat"]["chair"] for p, c in corr.items() if (c.get("seat_fix") or {}).get("seat")}
+    if sat:
+        s0, s1 = chair_seats(f"{a.r1}/{a.scene_in}", GH), chair_seats(f"{a.r1}/{a.scene_glb}", GH)
+        for p, ch in sat.items():
+            if ch in s0 and ch in s1:
+                d = (s1[ch][2] - s0[ch][2]) @ FLIP[:3, :3]          # glTF 系位移 -> DA3 世界系
+                if np.linalg.norm(d) > 0.01:
+                    shifts[p] = d
+                    print(f"  人 {p}: 椅子 {ch} 物理之后挪了 {np.linalg.norm(d):.3f}m, 人跟着挪")
+    people_store.save_shift(a.r1, meta["solve_id"], shifts)
+    world, faces = people_store.load_world(a.r1)
+    rows = measure(world, UP, GH)
+    tall = np.array([r["身高"] for r in rows.values()])
+    bad = [(p, r["身高"]) for p, r in rows.items() if not H_MIN <= r["身高"] <= H_MAX
+           and not corr[p]["seated"]]
+    if bad:
+        k = 1.70 / float(np.median(tall))
+        raise SystemExit(
+            f"[失败] 尺度自检没过: 站着的人身高 {[f'{h:.2f}' for _, h in bad]}m 落在 {H_MIN}~{H_MAX} 之外。\n"
+            f"        人是绝对米制的, 所以错的是场景 —— 它大约差 {k:.2f} 倍(按 1.70m 反推)。")
+    for pid, r in rows.items():
+        print(f"  人 {pid}: 身高 {r['身高']:.2f}m  脚离地 {r['脚离地']:+.2f}m {r['脚离地范围']}  "
+              f"最大一步 {r['帧间位移最大']:.2f}m" + ("  (坐着)" if corr[pid]["seated"] else ""))
+    drop, unmatched = dedup_static(a.r1, world, UP)
+    static_glb = f"{a.r1}/{a.out}"
+    dropped = static_scene(f"{a.r1}/{a.scene_glb}", static_glb, drop)
+    print(f"  {static_glb}  (没有人的场景)" + (f"; 摘掉静态 person {dropped}" if dropped else ""))
+    rep = dict(场景=a.r1, 人体=a.body, 视频fps=fps, 人=rows, 摆人=meta["报告"],
+               摘掉的静态person=drop, 没对上4D的=unmatched, 静态场景=os.path.basename(static_glb))
+    json.dump(rep, open(f"{a.r1}/09_body4d_report.json", "w"), ensure_ascii=False, indent=1)
 
-    if a.mode in ("place", "all"):
-        print("== 摆人 (物理之前) ==")
-        chairs = load_chairs(f"{a.r1}/{a.scene_in}")
-        seats = chair_seats(f"{a.r1}/{a.scene_in}", GH) if a.seat_fix == "on" else None
-        # 没坐在椅子正上方的人按"脚着地", 选腿时的目标落差用场景里椅面高度的中位数
-        seat_h0 = float(np.median([s[0] for s in seats.values()])) if seats else 0.45
-        corr, rep = solve_people(people, roots, cams, vid2key, kept, UP, GH, mesh_run, da3, FLIP, chairs,
-                                 seats=seats, seat_h_default=seat_h0, fps=fps,
-                                 focals=load_focals(mesh_run) if a.flip_fix == "on" else None,
-                                 pose_smooth=a.pose_smooth == "on")
-        if not corr:
-            raise SystemExit("[失败] 人体的帧和场景的相机一帧都对不上 —— 检查是不是同一段素材")
-        for pid, r in rep.items():
-            print(f"  人 {pid}: {r['帧数']:3d} 帧  远近 x{r['远近比例']:.3f} "
-                  + (f"(自己量的 {r['自己量的比例']} 离群, 改用全体中位) " if r['用全体中位'] else
-                     f"({r['比例10_90'][0]}~{r['比例10_90'][1]}, {r['量到深度的帧']} 帧量到) ")
-                  + f" 脚离地 {r['校正前脚离地中位']:+.2f} -> {r['校正后脚离地中位']:+.2f}m  "
-                  f"最大一步 {r['帧间位移最大_前']:.2f} -> {r['帧间位移最大_后']:.2f}m  "
-                  + (f"坐在 {r['椅子']} ({r['坐着的帧']} 帧)" if r["椅子"] else
-                     (f"坐着 {r['坐着的帧']} 帧但没找到椅子" if r["坐着的帧"] > r["帧数"] / 2 else f"路线 {r['路线脚印']} 个脚印")))
-            if r.get("姿势抖动_cm"):
-                print(f"         姿势平滑: 抖动 {r['姿势抖动_cm'][0]} -> {r['姿势抖动_cm'][1]} cm/顶点")
-            if r.get("可疑"):
-                print(f"         ★可疑: {'; '.join(r['可疑'])} —— 建议在挑人那一步去掉")
-            for g in r.get("翻转补帧") or []:
-                print(f"         翻转补帧: 第 {g['帧'][0]}~{g['帧'][1]} 帧({g['帧数']} 帧, 段里最大一翻 {g['最大一翻']}°) {g['补法']}")
-            q = r.get("坐姿修正")
-            if q:
-                print(f"         坐姿修正: 高度按 {q['高度来源']}" + ("" if q["离椅面中心"] is None else f"(骨盆离椅面中心 {q['离椅面中心']}m)")
-                      + f"  腿取第 {q['参考帧']} 帧({q['候选帧']} 帧候选, 落差 {q['落差']}/{q['目标落差']}m)"
-                      + ("  ★朝向每帧乱翻(中位 %.0f°), 整段定住" % q["骨盆转角中位_度"] if q["定住"] else "")
-                      + f"\n         骨盆离地 {q['骨盆离地_前']} -> {q['骨盆离地_后']}  头顶最大一跳 {q['头顶最大一跳_前']} -> {q['头顶最大一跳_后']}m"
-                      + (f"  屁股到椅面 {q['屁股到椅面_前']:+.3f} -> {q['屁股到椅面_后']:+.3f}m" if "屁股到椅面_前" in q else "")
-                      + f"  脚离地 {q['脚离地_后']}")
-        pinned = sorted({c["chair"] for c in corr.values() if c["chair"]})
-        json.dump(dict(floor_y=GH, pinned_chairs=pinned, people=corr, 报告=rep,
-                       说明="delta 是 DA3 世界系里每帧的整体平移; footprints 是 glTF 系 xz 的矩形, 物理那步当路障; "
-                            "有 seat_fix 的(坐着的人)顶点按 seat_fix 重算, 不用 delta"),
-                  open(pj, "w"), ensure_ascii=False)
-        print(f"  -> {pj}  (钉住的椅子 {pinned}, 路线脚印共 {sum(len(c['footprints']) for c in corr.values())} 个)")
-        body = people_body(apply_corr(people, corr, cams, vid2key, kept, roots), FLIP)
-        bj = pj[:-5] + "_body.npz" if pj.endswith(".json") else pj + "_body.npz"
-        np.savez_compressed(bj, pitch=np.float32(BODY_PITCH), **{f"p_{k}": v for k, v in body.items()})
-        print(f"  -> {bj}  (人体空气墙: 每人整段扫过的身体内芯(表面往里收 {BODY_PITCH*100:.0f}cm), {BODY_PITCH*100:.0f}cm 格子, 不含手; "
-              + ", ".join(f"{k}: {len(v)}" for k, v in sorted(body.items(), key=lambda x: int(x[0]))) + ")")
-
-    if a.mode in ("compose", "all"):
-        print("== 合成 (物理之后) ==")
-        pjs = json.load(open(pj)); corr = pjs["people"]
-        # ★ 坐着的人是按物理之前那把椅子的椅面摆的。钉住的椅子物理不会推, 这里再核一遍:
-        #   同名椅子物理前后挪了超过 1cm, 人跟着椅子挪, 并把位移记回 10_people.json(验收视频也读它)
-        sat = {p: c["seat_fix"]["seat"]["chair"] for p, c in corr.items() if (c.get("seat_fix") or {}).get("seat")}
-        if sat:
-            s0, s1 = chair_seats(f"{a.r1}/{a.scene_in}", GH), chair_seats(f"{a.r1}/{a.scene_glb}", GH)
-            dirty = False
-            for p, ch in sat.items():
-                if ch in s0 and ch in s1:
-                    d = (s1[ch][2] - s0[ch][2]) @ FLIP[:3, :3]          # glTF 系位移 -> DA3 世界系
-                    old = np.asarray(corr[p]["seat_fix"].get("shift", [0, 0, 0]), float)
-                    if np.linalg.norm(d - old) > 0.01:
-                        corr[p]["seat_fix"]["shift"] = np.round(d, 5).tolist(); dirty = True
-                        print(f"  人 {p}: 椅子 {ch} 物理之后挪了 {np.linalg.norm(d):.3f}m, 人跟着挪")
-            if dirty:
-                json.dump(pjs, open(pj, "w"), ensure_ascii=False)
-        world = apply_corr(people, corr, cams, vid2key, kept, roots)
-        rows = measure(world, UP, GH)
-        tall = np.array([r["身高"] for r in rows.values()])
-        bad = [(p, r["身高"]) for p, r in rows.items() if not H_MIN <= r["身高"] <= H_MAX
-               and not corr[p]["seated"]]
-        if bad:
-            k = 1.70 / float(np.median(tall))
-            raise SystemExit(
-                f"[失败] 尺度自检没过: 站着的人身高 {[f'{h:.2f}' for _, h in bad]}m 落在 {H_MIN}~{H_MAX} 之外。\n"
-                f"        人是绝对米制的, 所以错的是场景 —— 它大约差 {k:.2f} 倍(按 1.70m 反推)。")
-        for pid, r in rows.items():
-            print(f"  人 {pid}: 身高 {r['身高']:.2f}m  脚离地 {r['脚离地']:+.2f}m {r['脚离地范围']}  "
-                  f"最大一步 {r['帧间位移最大']:.2f}m" + ("  (坐着)" if corr[pid]["seated"] else ""))
-        drop, unmatched = dedup_static(a.r1, world, UP)
-        static_glb = f"{a.r1}/{a.out}"
-        dropped = static_scene(f"{a.r1}/{a.scene_glb}", static_glb, drop)
-        print(f"  {static_glb}  (没有人的场景)" + (f"; 摘掉静态 person {dropped}" if dropped else ""))
-        rep = dict(场景=a.r1, 人体=a.body, 视频fps=fps, 人=rows, 摆人=json.load(open(pj))["报告"],
-                   摘掉的静态person=drop, 没对上4D的=unmatched, 静态场景=os.path.basename(static_glb))
-        json.dump(rep, open(f"{a.r1}/09_body4d_report.json", "w"), ensure_ascii=False, indent=1)
-
-        if a.render:
-            if not a.fr:
-                raise SystemExit("[失败] --render 要给 --fr 原始帧目录")
-            print("== 渲染回图 ==")
-            allvf = sorted({v for fr in world.values() for v in fr})
-            pick = [allvf[int(round(i * (len(allvf) - 1) / max(1, a.render_frames - 1)))]
-                    for i in range(a.render_frames)]
-            for vf in sorted(set(pick)):
-                gp = f"{a.r1}/09_people_f{vf:04d}.glb"
-                if not dump_frame_glb(world, faces, FLIP, vf, gp):
-                    continue
-                # ★ 渲 09_scene_nopeople.glb, **不是** 07_scene_phy.glb, 理由见 static_scene。
-                # ★ render_back 的 FRAMES 是**场景相机的编号**(cameras.json 的键 0037.jpg -> 37),
-                #   不是原视频帧号。pedestrian 两者恰好一样, office 不一样(场景帧是隔 3.6 帧抽的)。
-                ki = int(vid2key[vf].rsplit(".", 1)[0])
-                env = dict(os.environ, R1=a.r1, FR=a.fr,
-                           SCENE=f"{os.path.basename(static_glb)},{os.path.basename(gp)}",
-                           RBOUT=f"09_render_4d_f{vf:04d}.jpg", FRAMES=str(ki))
-                r = subprocess.run([sys.executable,
-                                    os.path.expanduser("~/sam3d/data/outdoor/scripts/render_back.py")],
-                                   env=env, capture_output=True, text=True)
-                print(f"  帧 {vf:04d} -> 09_render_4d_f{vf:04d}.jpg"
-                      + ("" if r.returncode == 0 else f"   ★失败: {r.stderr.strip().splitlines()[-1:]}"))
+    if a.render:
+        if not a.fr:
+            raise SystemExit("[失败] --render 要给 --fr 原始帧目录")
+        print("== 渲染回图 ==")
+        for f in glob.glob(f"{a.r1}/09_people_f*.glb") + glob.glob(f"{a.r1}/09_render_4d_f*.jpg"):
+            os.remove(f)                             # 上一次的: 人变了, 抽到的帧号不一样, 旧的会留在目录里冒充这一次的
+        allvf = sorted({v for fr in world.values() for v in fr})
+        pick = [allvf[int(round(i * (len(allvf) - 1) / max(1, a.render_frames - 1)))]
+                for i in range(a.render_frames)]
+        for vf in sorted(set(pick)):
+            gp = f"{a.r1}/09_people_f{vf:04d}.glb"
+            if not dump_frame_glb(world, faces, FLIP, vf, gp):
+                continue
+            # ★ 渲 09_scene_nopeople.glb, **不是** 07_scene_phy.glb, 理由见 static_scene。
+            # ★ render_back 的 FRAMES 是**场景相机的编号**(cameras.json 的键 0037.jpg -> 37),
+            #   不是原视频帧号。pedestrian 两者恰好一样, office 不一样(场景帧是隔 3.6 帧抽的)。
+            ki = int(vid2key[vf].rsplit(".", 1)[0])
+            env = dict(os.environ, R1=a.r1, FR=a.fr,
+                       SCENE=f"{os.path.basename(static_glb)},{os.path.basename(gp)}",
+                       RBOUT=f"09_render_4d_f{vf:04d}.jpg", FRAMES=str(ki))
+            r = subprocess.run([sys.executable,
+                                os.path.expanduser("~/sam3d/data/outdoor/scripts/render_back.py")],
+                               env=env, capture_output=True, text=True)
+            print(f"  帧 {vf:04d} -> 09_render_4d_f{vf:04d}.jpg"
+                  + ("" if r.returncode == 0 else f"   ★失败: {r.stderr.strip().splitlines()[-1:]}"))
 
 
 if __name__ == "__main__":
