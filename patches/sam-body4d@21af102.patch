@@ -1,9 +1,9 @@
 diff --git a/NOTES_5090.md b/NOTES_5090.md
 new file mode 100644
-index 0000000..a7f11b2
+index 0000000..9f9de06
 --- /dev/null
 +++ b/NOTES_5090.md
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,159 @@
 +# SAM-Body4D 在 RTX 5090 上的部署记录（2026-09-09）
 +
 +装在**独立的 `body4d` 环境**里：`source ~/sam3d/env_body4d.sh`。
@@ -87,6 +87,7 @@ index 0000000..a7f11b2
 +| 6 | `scripts/offline_app.py` 取每帧结果 | 2026-10-08: `mask_outputs[frame_id-num_empth_ids]` 错，列表本来就是每帧一项；一批里有"一个人都没有"的帧时后面的网格错位。改成 `[frame_id]` |
 +| 7 | `models/sam_3d_body/notebook/utils.py` 两处 `process_frames(...)` + `meta_arch/sam3d_body.py` 体型锁定 | 2026-10-08: **所有人共用第一个人第一帧的体型**。模型按 `hid in range(num_human)` 记体型, 带遮罩这条路一次只送一个人, 每个人都是 hid=0。修法: 字典按 `obj_id` 分格(`setdefault(obj_id, {})`); 锁定时取这一批里有效帧的中位, 没有有效帧就先不锁(人不在的帧全是 NaN, 取 t=0 会把中途进画面的人锁成 NaN -> 整段空网格)。实测 nfl1: 修前 8 人身高全是 1.664 m, 修后 1.64~1.72 m |
 +| 8 | `body4d_mesh_5090.py` 热身 | 2026-10-08: 进程里**第一次**调模型的结果和后面的不一样（office 人 4: 排第一算 vs 排第二算, 每帧顶点差 2 mm, 个别帧 3 cm; 参数和 buffer 都没变, 是 GPU 库第一次跑的路径不同）。正式算之前先用第一批帧算一遍扔掉, 这样不拆、按人拆、排第几都走同一条路 |
++| 9 | `notebook/utils.py` `process_image_with_mask` | 2026-10-09: 人不在画面里的帧不再送进模型。以前空帧按全零框照算(出 NaN 再丢), office 1200 次里 868 次白算; 而且批内姿势平滑见到 NaN 整批不做, 含空帧的批都没平滑过(office 23% 的帧)。只改了不遮挡那条路(补全那条路这台机器跑不了, 没动) |
 +
 +**2 和 3 是同一个根源，也是最危险的一个：用位置序号冒充身份 ID。**
 +他们的流程里 id 永远是连续的 1..N 且从不中途消失，所以两者恰好等价。
@@ -756,10 +757,10 @@ index 0000000..bea34e4
 +    print(f"[注意] {warn} 个人有帧被跳过, 是分辨率问题不是错误, 详见上表")
 diff --git a/body4d_track_5090.py b/body4d_track_5090.py
 new file mode 100644
-index 0000000..ba513f6
+index 0000000..ab79a85
 --- /dev/null
 +++ b/body4d_track_5090.py
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,181 @@
 +#!/usr/bin/env python
 +"""SAM 3 文字提示跟踪 -> 产出 SAM-Body4D 后半段要吃的 images/ + masks/。
 +
@@ -779,7 +780,7 @@ index 0000000..ba513f6
 +输出目录结构和 on_mask_generation() 写出来的一模一样, 所以后半段能直接接:
 +    <out>/images/00000000.jpg      八位补零 —— ★ 这是他们的约定, 不是我们的四位
 +    <out>/masks/00000000.png       调色板 PNG, 像素值 = obj_id (0 是背景)
-+    <out>/track_report.json        每个 id 每帧的面积/质心/包围盒 + 跳变告警
++    <out>/track_report.json        每个 id 每帧的面积/质心/包围盒 + 跳变告警 + 摘掉的零星帧
 +
 +用法:
 +  python body4d_track_5090.py --frames 帧目录 --out 输出目录 [--prompt person]
@@ -794,6 +795,8 @@ index 0000000..ba513f6
 +sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 +from sam3.model_builder import build_sam3_video_predictor
 +from utils import DAVIS_PALETTE
++sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pipeline"))   # 放最后: 不挡这个目录自己的模块
++import track_clean
 +
 +ap = argparse.ArgumentParser()
 +ap.add_argument("--frames", required=True, help="四位补零的 jpg 帧目录")
@@ -843,6 +846,25 @@ index 0000000..ba513f6
 +    pred.model.new_det_thresh = old
 +    pred.handle_request(request=dict(type="close_session", session_id=sid))
 +
++# ---------- 摘掉"只剩零星小点、又接不上这个编号完整的帧"的那些帧 ----------
++# SAM 3 偶尔给已经跟着的人再开一个编号, mask 只是散在那个人轮廓边上的几百个像素; 出网格那步不看像素数,
++# 照样重建出一个完整的人(office 人 6: 画面里多一个人, 闪一下)。规则和实测见 pipeline/track_clean.py。
++# 真人被挡住只露几条边的帧(nfl1 人 3)接在他完整的帧后面, 不摘。
++def _stat(m):
++    ys, xs = np.nonzero(m)
++    return dict(area=int(m.sum()), cx=float(xs.mean()), cy=float(ys.mean()),
++                bbox=[int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())])
++raw_stat = {}
++for fi, d in per_frame.items():
++    for oid, m in d.items():
++        raw_stat.setdefault(oid, {})[fi] = _stat(m)
++stray = {oid: fs for oid, fr in sorted(raw_stat.items()) if (fs := track_clean.stray_frames(fr, W))}
++for oid, fs in stray.items():
++    for fi in fs:
++        del per_frame[fi][oid]
++print(f"[清理] 摘掉 {sum(map(len, stray.values()))} 帧零星像素(不到包围盒的 {track_clean.THIN_FILL:.0%}, 又接不上这个编号完整的帧)"
++      + "".join(f"\n   原始编号 {oid}: {len(fs)} 帧 {fs}" for oid, fs in stray.items()))
++
 +# ---------- 按总面积筛掉太小的实例 ----------
 +# 逐帧筛会让一个人忽有忽无; 按"他出现过的最大面积"整条决定, 要么全留要么全丢。
 +area_max = {}
@@ -868,10 +890,7 @@ index 0000000..ba513f6
 +            continue
 +        nid = remap[oid]
 +        msk[m] = nid
-+        ys, xs = np.nonzero(m)
-+        stat[nid][fi] = dict(area=int(m.sum()),
-+                             cx=float(xs.mean()), cy=float(ys.mean()),
-+                             bbox=[int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())])
++        stat[nid][fi] = raw_stat[oid][fi]
 +    cv2.imwrite(f"{IMG_DIR}/{fi:08d}.jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
 +    p = Image.fromarray(msk).convert("P"); p.putpalette(DAVIS_PALETTE)
 +    p.save(f"{MSK_DIR}/{fi:08d}.png")
@@ -908,6 +927,7 @@ index 0000000..ba513f6
 +rep = dict(frames=len(FILES), wh=[W, H], prompt=a.prompt, conf=a.conf,
 +           n_instances_raw=len(area_max), kept_ids=list(remap.values()),
 +           dropped_raw_ids=drop, remap={str(k): v for k, v in remap.items()},
++           stray_frames={str(k): v for k, v in stray.items()},      # 摘掉的零星帧, 键是原始编号(见 track_clean.py)
 +           coverage={str(k): len(v) for k, v in stat.items()},
 +           alarms=alarms,
 +           per_frame={str(k): {str(f): v for f, v in d.items()} for k, d in stat.items()})
@@ -963,7 +983,7 @@ index e61969f..908bde6 100644
  
              # only 1 frames should be propagated
 diff --git a/models/sam_3d_body/notebook/utils.py b/models/sam_3d_body/notebook/utils.py
-index a552bea..c15cd51 100644
+index a552bea..7c2a6d8 100644
 --- a/models/sam_3d_body/notebook/utils.py
 +++ b/models/sam_3d_body/notebook/utils.py
 @@ -233,13 +233,36 @@ def save_mesh_results(
@@ -1005,13 +1025,39 @@ index a552bea..c15cd51 100644
  
  def display_results_grid(
      images: List[np.ndarray], titles: List[str], figsize_per_image: tuple = (6, 6)
-@@ -431,10 +454,13 @@ def process_image_with_mask(estimator, image_path: str, mask_path: str, idx_path
+@@ -318,6 +341,7 @@ def process_image_with_mask(estimator, image_path: str, mask_path: str, idx_path
+         _occ_image_batch_ori = []
+         _occ_id_batch = []
+         _occ_empty_frame_list = []
++        no_occ_skipped = []     # ★ 5090 patch: 这个人不在画面里的帧(空遮罩 / 整个遮罩在 5% 边缘内), 不送进模型
+ 
+         occ_idx = occ_dict[obj_id]
+         # for each frame:
+@@ -401,6 +425,16 @@ def process_image_with_mask(estimator, image_path: str, mask_path: str, idx_path
+                 if batch_kps is not None:
+                     no_occ_kp_list.append(batch_kps[obj_id-1][i])  # N x 3
+ 
++                # ★ 5090 patch (2026-10-09): 上游把人不在画面里的帧也当成有人送进模型(框是全零), 算出来整行 NaN,
++                #   最后靠 bbox 全零的哨兵丢掉。两个后果: (1) 白算 —— office 10 人 x 120 帧 = 1200 次里 868 次是空帧;
++                #   (2) 批内的姿势平滑(kalman_smooth_mhr_params_per_obj_id_adaptive)见到 NaN 就整批不写回, 于是
++                #   含空帧的批都没平滑过(office 23% 的帧, 主要是只露面几帧的人)。他们自己的流程人从第一帧跟到底,
++                #   很少中途进出, 所以没踩到。这里直接不送, 结果列表里放一个全零框的占位, 哨兵照旧把它丢掉。
++                #   批里剩下的帧可能不连续(中间缺一两帧), 平滑把它们当连续的, 可接受。
++                if mask_binary.max() == 0:
++                    no_occ_skipped.append(i)
++                    continue
++
+                 if len(no_occ_bbox_list) == 0:
+                     no_occ_empty_frame_list.append(i)
+                 else:
+@@ -431,15 +465,22 @@ def process_image_with_mask(estimator, image_path: str, mask_path: str, idx_path
              no_occ_kps_batch = None
              _occ_kps_batch = None
  
 +        # ★ 5090 patch (2026-10-08): 体型字典按人分格。模型里是按"这次调用里排第几个人"(hid)记的, 而这条路
 +        #   一次只送一个人, 每个人都排第 0 —— 于是全部人共用第一个人第一帧的体型和骨骼缩放(nfl1 8 个人身高全是 1.664)。
 +        #   他们自己的 bbox 路一次送所有人, hid 能区分人, 所以没踩到。这里给每个人一个自己的子字典。
++        no_occ_outputs = []
          if len(no_occ_image_batch) > 0:
 -            no_occ_outputs = estimator.process_frames(no_occ_image_batch, bboxes=no_occ_bbox_batch, masks=no_occ_mask_batch, id_batch=[[1] for idb in range(len(no_occ_image_batch))], idx_path={}, idx_dict={}, mhr_shape_scale_dict=mhr_shape_scale_dict, kps_batch=no_occ_kps_batch, occ_dict=None, use_mask=True, kps_id=kps_id, cam_int=cam_int)
 +            no_occ_outputs = estimator.process_frames(no_occ_image_batch, bboxes=no_occ_bbox_batch, masks=no_occ_mask_batch, id_batch=[[1] for idb in range(len(no_occ_image_batch))], idx_path={}, idx_dict={}, mhr_shape_scale_dict=mhr_shape_scale_dict.setdefault(obj_id, {}), kps_batch=no_occ_kps_batch, occ_dict=None, use_mask=True, kps_id=kps_id, cam_int=cam_int)
@@ -1021,6 +1067,15 @@ index a552bea..c15cd51 100644
          
          oid_outputs = []
          ia, ib = 0, 0
+-        for oi in occ_idx:
++        for i, oi in enumerate(occ_idx):
+             if oi == 1:
++                if i in no_occ_skipped:      # ★ 5090 patch: 没送进模型的帧, 放个全零框, 下面的哨兵会丢掉
++                    oid_outputs.append([{"bbox": np.zeros(4, dtype=np.float32)}])
++                    continue
+                 oid_outputs.append(no_occ_outputs[ia])
+                 ia += 1
+             else:
 diff --git a/models/sam_3d_body/sam_3d_body/models/meta_arch/sam3d_body.py b/models/sam_3d_body/sam_3d_body/models/meta_arch/sam3d_body.py
 index d11e8d7..0d7ba15 100644
 --- a/models/sam_3d_body/sam_3d_body/models/meta_arch/sam3d_body.py
