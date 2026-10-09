@@ -99,6 +99,8 @@ CFG = dict(
     PICK = "",              # 逗号分隔的 id; 空 = 自动挑: MIN_AREA_PCT 过滤后、帧数够的全部。
                             # 看完 03_check.jpg 再填, 或者直接改 SCENES
     MIN_PICK_FRAMES = "5",  # 自动挑人时, 出现不到这么多帧的 id 不要(一闪而过的多半是误检/路过的半个人)
+    PICK_BY = "",           # 这批 PICK 是谁定的, 原样记进 picked.json 的 decided_by。主流程拉起时由它给(闸口上有人改过 = human,
+                            # 没人动过 = auto); 空 = 单跑: 给了 PICK 算 human, 没给算 auto
 
     # ---- 出网格 ----
     OCC         = "0",      # 1 开 Diffusion-VAS 补全。★ 32G 上开了会 OOM, 见文件头。
@@ -256,7 +258,7 @@ pick = [int(x) for x in {pick!r}.split(",") if x.strip()] or sorted(i for i in c
 miss = [i for i in pick if i not in cov]
 if miss:
     raise SystemExit(f"[失败] PICK 里的 id {{miss}} 跟踪结果里没有。有的是 {{sorted(cov)}}")
-json.dump(dict(keep_ids=pick, decided_by=("human" if {pick!r} else "auto(帧数>={c.cfg['MIN_PICK_FRAMES']})"),
+json.dump(dict(keep_ids=pick, decided_by={c.cfg["PICK_BY"]!r} or ("human" if {pick!r} else "auto(帧数>={c.cfg['MIN_PICK_FRAMES']})"),
                scene={c.scene!r}, run={c.run!r},
                coverage={{str(i): cov[i] for i in pick}},
                dropped={{str(i): cov[i] for i in cov if i not in pick}}),
@@ -294,6 +296,11 @@ def s_mesh(c, dry):
         if dry:
             return sh(envcmd(PY["body4d"], script, GPUENV, args + ["--out", c.MESH]), log, dry, cwd=B4D)
         with GpuSlot("mesh", need):
+            # ★ 不拆时模型直接往 c.MESH 里写, 它自己不清旧文件: 闸口上点掉一个人再重出(8 个人 -> 7 个), 第 8 个人的目录还在,
+            #   新的 5 号目录里混着上一次 5 号(另一个人)的帧 —— 2026-10-09 nfl1 r8 对账报"3 个人身份被写串"。
+            #   拆开跑的那条路合并时本来就清(mesh_merge.merge), 所以以前只在"重出时正好没有空卡"才撞上
+            import mesh_merge
+            mesh_merge.clear_outputs(c.MESH)
             return sh(envcmd(PY["body4d"], script, GPUENV, args + ["--out", c.MESH]), log, dry, cwd=B4D)
     cover = picked.get("coverage", {})
     groups = fanout.split(ids, [cover.get(str(i), 1) for i in ids], k)

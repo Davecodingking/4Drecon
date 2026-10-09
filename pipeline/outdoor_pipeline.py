@@ -778,10 +778,14 @@ def s_people_mesh(c, dry):
         print("    这一轮没有人(PEOPLE=0), 或 BODY_RUN 是手工指定的, 跳过"); return
     keep = people_decisions.keep_ids(c.R1)
     if keep == []:
-        print("    挑人闸一个都没勾, 当这一轮没有人, 跳过"); return
+        print("    挑人闸一个都没勾, 当这一轮没有人, 跳过")
+        if not dry and people_decisions.note_none_picked(c.R1):
+            print("    (上次出网格用的那批人记成空了: 以后再勾上谁, 点继续会重出)")
+        return
     if keep is None and not dry:
         raise SystemExit(f"[失败] 没有 {people_decisions.path(c.R1)} —— 先跑 people_track")
-    sh(_people_cmd(c, "pick,mesh,report", dict(PICK=",".join(map(str, keep or [])))),
+    # PICK_BY: 这批人是谁定的, 如实记进 picked.json(以前只要走主流程就写 human, 没人碰过闸口的也是)
+    sh(_people_cmd(c, "pick,mesh,report", dict(PICK=",".join(map(str, keep or [])), PICK_BY=people_decisions.decided_by(c.R1))),
        f"{c.LOG}/05_people_mesh.log", dry)
 
 def s_scale(c, dry):

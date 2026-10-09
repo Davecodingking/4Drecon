@@ -175,6 +175,7 @@ def state(kind, scene, run):
             "下一步": None if busy else next_action(kind, seg, stop, recall),
             "能继续": not busy and seg < total and os.path.isdir(R1),
             "人": people_decisions.load(R1),
+            "人表": people_decisions.table(R1),       # 摆人之后才有: 每个编号的去向和可疑原因(挑人卡片上也显示)
             "图": {"地基": os.path.exists(f"{R1}/02_ground_check.jpg"),
                    "体检": os.path.exists(f"{body}/03_check.jpg"),
                    "跟踪视频": os.path.exists(f"{body}/03_track.mp4")}}
@@ -310,8 +311,15 @@ def _gate_extra(check, kind, scene, run):
             sk = json.load(open(f"{R1}/07_scene_skipped.json")).get("skipped", [])
         except (OSError, ValueError):
             sk = []
-        return {"跳过的物体": [{"词": x.get("word"), "实例": x.get("obj_id"), "原因": x.get("why"),
-                                "尺寸": x.get("ext")} for x in sk]}
+        out = {"跳过的物体": [{"词": x.get("word"), "实例": x.get("obj_id"), "原因": x.get("why"),
+                               "尺寸": x.get("ext")} for x in sk]}
+        # ★ "人"那张表: 每个跟踪编号最后算谁(并进了谁 / 不算人)、谁可疑。以前只打在摆人那步的日志里,
+        #   闸口上看不到(office 人 7 是搭在椅背上的一件外套, 流水线标了"深度离群", 没人看见)。
+        #   按**现在盘上**的两个文件算(05_people.json + 10_people.json), 不是到闸时的快照: 勾的人改了它会标"过期"
+        t = people_decisions.table(R1)
+        if t:
+            out["人表"] = t
+        return out
     return {}
 
 

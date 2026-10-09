@@ -365,6 +365,7 @@ function segHTML(g){
   if (g.报告 && g.报告.length) h += '<h3>闸口报告' + (g.候选决定 ? '(到这道闸时的快照, 之后改的决定不在里面)' : '') +
     '</h3><div class=rep>' + esc(g.报告.join('\\n')) + '</div>';
   if (g.尺度) h += scaleHTML(g.尺度);
+  if (g.人表) h += peopleHTML(g.人表);
   if (g.跳过的物体 && g.跳过的物体.length) h += '<h3>没摆进场景的物体</h3><table class=kv>' + g.跳过的物体.map(x =>
     '<tr><td>' + esc(x.词) + ' #' + x.实例 + '</td><td>' + esc(x.原因) + '</td><td class=dim>' +
     (x.尺寸 ? x.尺寸.map(v => v.toFixed(1)).join(' × ') + ' m' : '') + '</td></tr>').join('') + '</table>';
@@ -388,6 +389,37 @@ function scaleHTML(sc){
     r + '</td></tr>').join('') + '</table><p class=note>每个人给一个比例, 取中位数当尺子。离得远、人小的那个最不准。</p>' : '');
 }
 
+// 一个跟踪编号最后算谁(和 people_decisions.fate_text 是同一句)
+function fateText(r){
+  if (!r.去向.length) return r.决定 !== 'keep' ? '没出网格(闸口上没勾)' : '摆人那一次还没勾上';
+  return r.去向.map(f => {
+    const span = f.视频帧 ? '视频第 ' + f.视频帧[0] + '~' + f.视频帧[1] + ' 帧' : '';
+    if (f.事 === '人') return '人 ' + f.人 + (f.帧数 ? '(' + f.帧数 + ' 帧)' : '') + (r.坐着 ? ', 坐着' : '');
+    if (f.事 === '并进别人') return span + '(' + f.帧数 + ' 帧)并进人 ' + f.人;
+    return span + '(' + f.帧数 + ' 帧)不算人';
+  }).join('; ');
+}
+
+function peopleHTML(t){
+  const sus = t.行.filter(r => r.可疑.length && r.决定 === 'keep').length;
+  return '<h3>人(摆进场景 ' + t.人数 + ' 个)</h3>' +
+    (t.重跑没完 ? '<p class=warn>上一次按新挑的人重跑没跑完(失败了, 看日志)。下面还是之前的结果; 点继续会接着重跑。</p>' :
+     t.过期 ? '<p class=warn>下面是按上一次勾的人算的。点继续会按现在勾的重出网格、重摆、重导出。</p>' : '') +
+    '<table class=kv>' + t.行.map(r =>
+      '<tr' + (r.决定 === 'drop' ? ' class=dim' : '') + '><td style="width:112px">' +
+      (r.新号 ? '' : '<img class=thumb src="' + U('/run/img', {what:'person', id:r.id}) + '">') + '</td><td>#' + r.id + '</td><td>' +
+      (r.决定 === 'drop' ? '不要' : r.决定 === 'keep' ? '留下' : '') + '</td><td>' + esc(fateText(r)) +
+      (r.可疑.length ? '<br><span class=warn>可疑: ' + esc(r.可疑.join('; ')) + '</span>' : '') + '</td></tr>').join('') +
+    '</table><p class=note>编号 = 挑人卡片上的数字, 验收视频和 FBX 里的人(P&lt;号&gt;)也是这个号。' +
+    (sus ? '<b>有 ' + sus + ' 个可疑的</b>: 看截图, 不是人(衣服、手、别人身上的一块)就去' : '要去掉谁, 去') +
+    '<a href="#people" onclick="openPeople()">第 2 段的"人"</a>把他点成不要、保存, 再点继续 —— 会重出网格、重摆、重导出 FBX。</p>';
+}
+
+function openPeople(){
+  const d = document.querySelector('details.seg[data-seg="2"]');
+  if (d){ d.open = true; setTimeout(() => d.scrollIntoView(), 50); }
+}
+
 function decideHTML(g){
   const waiting = g.状态 === 'waiting';
   if (g.段 === 1){
@@ -407,6 +439,14 @@ function decideHTML(g){
   if (g.段 === 3 && waiting) return '<div class=decide><h3>你要决定</h3><p>看上面的尺度和人体网格视频, 也可以点顶上 3D 看盒子。没问题就点继续。</p></div>';
   if (g.状态 === 'waiting') return '<div class=decide><h3>你要决定</h3><p>看上面的图和视频, 没问题就点继续。</p></div>';
   return '';
+}
+
+// 挑人卡片上多一行: 摆人之后才知道的事(这个编号最后算谁、可不可疑)。摆人还没跑过就没有这一行
+function cardFate(id){
+  const r = S.人表 && S.人表.行.find(x => x.id === id && !x.新号);
+  if (!r || !r.去向.length) return '';
+  return '<br><span class=dim>→ ' + esc(fateText(r)) + '</span>' +
+    (r.可疑.length ? '<br><span class=warn>可疑: ' + esc(r.可疑.join('; ')) + '</span>' : '');
 }
 
 function wire(){
@@ -435,7 +475,7 @@ function wire(){
       '<img src="' + U('/run/img', {what:'person', id:r.id}) + '" alt="' + r.id + '">' +
       '<div class=cap><span class=id>#' + r.id + '</span> · ' + (dec[r.id] === 'keep' ? '留下' : '<b>不要</b>') +
       '<br>' + r.帧数 + ' 帧 · 最大 ' + r['最大面积%'] + '%' + (r.告警 ? '<br><span class=warn>' + r.告警 + ' 处串号告警</span>' : '') +
-      '</div></div>').join('');
+      cardFate(r.id) + '</div></div>').join('');
     cards.querySelectorAll('.card').forEach(el => el.onclick = () => {
       const id = +el.dataset.id; dec[id] = dec[id] === 'keep' ? 'drop' : 'keep'; peopleDirty = true; wire();
     });

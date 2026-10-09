@@ -249,6 +249,29 @@ def test_s_mesh_does_not_split_by_default():
         undo()
 
 
+def test_remeshing_without_split_does_not_keep_the_previous_people():
+    """闸口上点掉一个人再出网格、而且这次没拆(没有空卡 / FANOUT=0): 上一次的产物要先清掉。
+    2026-10-09 nfl1 r8: 8 个人重出成 7 个, 新的 5 号(跟踪 6 号, 66 帧)目录里还留着上一次 5 号的 48 帧 —— 别人的网格
+    混进了这个人; 第 8 个人的目录也还在。对账那步报"身份被写串"拦住了, 但整个"点掉人再继续"就走不通。
+    (拆开跑的那条路合并时本来就清, 见 test_old_outputs_are_cleared_first。)"""
+    B, c, undo = _mesh_setup(FANOUT="0")
+    try:
+        B.s_mesh(c, False)                                          # 第一次: 5 个人
+        for d, ext in (("mesh_4d_individual", "ply"), ("focal_4d_individual", "json"), ("mhr_4d_individual", "npz")):
+            os.makedirs(f"{c.MESH}/{d}/2", exist_ok=True)
+            open(f"{c.MESH}/{d}/2/00000007.{ext}", "w").write("上一次 2 号多出来的一帧")
+        open(f"{c.MESH}/masks/00000007.png", "w").write("上一次的抠图")
+        json.dump({"keep_ids": [1, 4, 9], "coverage": {"1": 114, "4": 100, "9": 12}}, open(f"{c.TRK}/picked.json", "w"))
+        B.s_mesh(c, False)                                          # 点掉 2 号和 7 号, 重出: 3 个人
+        assert {g: o for g, (o, _) in _who(c).items()} == {1: 1, 2: 4, 3: 9}, _who(c)
+        for d in ("mesh_4d_individual", "focal_4d_individual"):
+            assert sorted(os.listdir(f"{c.MESH}/{d}")) == ["1", "2", "3"], (d, os.listdir(f"{c.MESH}/{d}"))
+            assert len(os.listdir(f"{c.MESH}/{d}/2")) == 1          # 新的 2 号(跟踪 4 号)只有自己这一次的帧
+        assert not os.path.exists(f"{c.MESH}/mhr_4d_individual") and os.listdir(f"{c.MESH}/masks") == ["00000000.png"]
+    finally:
+        undo()
+
+
 def test_merge_refuses_empty_meshes():
     """2026-09-29 nfl1 r3: 拆开后人 2/6/7 的网格全是空的(292 字节的 ply) —— 这几个人有"模型拒绝出网格"的帧,
     那一帧里没有别人时上游从此全出空网格。以前合并照收, 到 scale 那步才炸, 报的还是看不懂的错。"""

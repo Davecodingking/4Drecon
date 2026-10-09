@@ -182,6 +182,30 @@ def test_scene_gate_offers_the_fbx_downloads():
         assert len(v) == 1 and v[0]["视频"] and not v[0]["下载"], v                   # 出了就当视频放, 不是下载链接
 
 
+def test_scene_gate_shows_the_people_table_from_the_files_on_disk():
+    """验收那道闸多一张"人"的表(每个跟踪编号最后算谁、谁可疑): 读的是盘上现在的两个文件, 挑人一改它就标"过期"。
+    挑人卡片(第 2 段)用的是同一份。摆人还没跑过 / 老轮次: 没有这张表, 别的照常。"""
+    with tempfile.TemporaryDirectory() as T:
+        _sandbox(T)
+        R1 = run_ctl.new_run("outdoor", "soccer", "r1", people="1", recall="0")
+        _state(R1, 4, True)
+        st = lambda: run_ctl.state("outdoor", "soccer", "r1")
+        assert "人表" not in st()["段列表"][-1] and st()["人表"] is None
+        json.dump({"人": [{"id": i, "决定": "keep", "帧数": 9, "最大面积%": 1.0, "告警": 0} for i in (1, 7)]},
+                  open(f"{R1}/05_people.json", "w"))
+        json.dump(dict(people={"1": dict(seated=False), "7": dict(seated=True)},
+                       报告={"1": {"可疑": []}, "7": {"可疑": ["自己量的深度离群(比例 0.49, 全体 0.97)"]}},
+                       身份=dict(勾的人=[1, 7], 去向={"1": [dict(事="人", 人="1", 帧数=9, 视频帧=[0, 30])],
+                                                   "7": [dict(事="人", 人="7", 帧数=9, 视频帧=[380, 430])]})),
+                  open(f"{R1}/10_people.json", "w"))
+        t = st()["段列表"][-1]["人表"]
+        assert t["过期"] is False and [(r["id"], r["决定"], bool(r["可疑"])) for r in t["行"]] == [(1, "keep", False), (7, "keep", True)]
+        assert st()["人表"] == t and "人表" not in st()["段列表"][1]         # 卡片读顶层那份; 别的闸不摆这张表
+        run_ctl.set_people("outdoor", "soccer", "r1", {"7": "drop"})         # 在网页上把那件"外套"点掉
+        t = st()["段列表"][-1]["人表"]
+        assert t["过期"] is True and t["行"][1]["决定"] == "drop"
+
+
 def test_new_run_from_loose_video():
     """选数据集根目录下散放的 mp4: 建 <场景>/video.mp4(硬链接, 不复制不移动原文件)再开跑。"""
     with tempfile.TemporaryDirectory() as T:

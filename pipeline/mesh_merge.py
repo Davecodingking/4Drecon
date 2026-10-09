@@ -22,6 +22,14 @@ WHITE = 235          # 叠加图是白底: 三个通道都不低于这个数的�
                      # 接近白的振铃, 当成前景贴过去会在别人身上留白边
 
 
+def clear_outputs(run):
+    """上一次出网格留在 <出网格目录> 里的东西(每人的网格 / 相机 / 关节数据 / 单人图、叠加图、抠图): 重出之前清掉。
+    上一次挑的人可能更多, 同一个编号上一次也可能是另一个人 —— 不清的话旧文件混在新的里面。拆不拆都走这里:
+    拆开跑的在合并时清(merge), 不拆的在起模型之前清(body4d_pipeline.s_mesh)。"""
+    for d in PER_PERSON + ("rendered_frames", "masks"):
+        shutil.rmtree(f"{run}/{d}", ignore_errors=True)
+
+
 def merge(run, trk, ids, parts, seconds=None):
     G = {o: i + 1 for i, o in enumerate(ids)}
     got = []
@@ -46,8 +54,7 @@ def merge(run, trk, ids, parts, seconds=None):
         raise SystemExit(f"[失败] 拆开跑之后这些人出了空网格 {{人: 空的帧数}} = {empty}。"
                          f"这几个人不能单独拆出去, 用 FANOUT=0 重跑这一步(不拆)")
     # 先清掉上一次留下的(上次挑的人可能更多), 再把各份的搬进来
-    for d in PER_PERSON + ("rendered_frames", "masks"):
-        shutil.rmtree(f"{run}/{d}", ignore_errors=True)
+    clear_outputs(run)
     # ★ 搬之前先把各份的"已算好"标记撕掉: 搬到一半崩了, 标记还在的话下次会把搬空了的份当成算好的直接用
     for p, _, _ in got:
         if os.path.exists(f"{p}/part.json"):

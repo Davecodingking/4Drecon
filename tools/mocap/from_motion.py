@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""一手数据版的动作导出: body_motion.py 的 motion.npz(修好的世界系参数) -> 每人一个带骨骼的 glb。**没有拟合这一步**:
+"""一手数据版的动作导出: motion.npz(摆人那步修好的参数, motion_export.py 换到 glTF 世界系写的) -> 每人一个带骨骼的 glb。**没有拟合这一步**:
 参数喂给 MHR, 骨架每一帧的状态直接就有。之后照旧用 to_blender.py 转 FBX / .blend。
 (对照: fit_mhr.py 是从网格反推, 每人 7 分钟, 关节角度不保证和模型一样 —— 留作对照, 不进正式流程。)
 

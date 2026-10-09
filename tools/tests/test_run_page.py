@@ -64,6 +64,16 @@ def test_run_state_config_people_go():
         assert _h("GET", "/api/run/state", {"s": "../x", "r": "r1"}).code == 400
 
 
+def test_run_page_draws_the_people_table_and_card_fates():
+    """本轮页: 验收那道闸画"人"那张表(截图按跟踪编号要), 可疑的标出来并指到第 2 段去点掉; 挑人卡片上也带去向。"""
+    with tempfile.TemporaryDirectory() as T:
+        _sandbox(T)
+        html = _h("GET", "/run").body().decode()
+        assert "if (g.人表) h += peopleHTML(g.人表);" in html and "function peopleHTML(t)" in html
+        assert "U('/run/img', {what:'person', id:r.id})" in html and "cardFate(r.id)" in html
+        assert "function fateText(r)" in html and "openPeople()" in html and "t.过期" in html
+
+
 def test_images():
     with tempfile.TemporaryDirectory() as T:
         _sandbox(T)

@@ -358,6 +358,23 @@ def people_lines(R1):
                    + (f"  串号/跳变告警 {r['告警']}" if r["告警"] else ""))
     return out
 
+def placed_people_lines(R1):
+    """验收那道闸的"人"(文字版; 网页那张表是同一份数据, 见 people_decisions.table): 每个跟踪编号最后算谁、谁可疑。
+    ★ 以前这些只打在摆人那步的日志里(office 人 7 是搭在椅背上的一件外套, 流水线标了"深度离群", 没人看见)。
+      核对身份要用人在房间里的位置, 出了人体网格才有 —— 所以摆在这道闸, 不在挑人那道。"""
+    t = people_decisions.table(R1)
+    if t is None:
+        return []
+    out = [f"人: 摆进场景 {t['人数']} 个 {t['人号']}"
+           + ("  ★过期: 上一次按新挑的人重跑没跑完, 点继续会接着重跑" if t["重跑没完"] else
+              "  ★过期: 这是按上一次勾的人算的, 点继续会重出网格、重摆、重导出" if t["过期"] else "")]
+    for r in t["行"]:
+        out.append(f"  #{r['id']:<3} {r['决定'] or '':4s}  {people_decisions.fate_text(r)}"
+                   + ("  ★可疑: " + "; ".join(r["可疑"]) if r["可疑"] else ""))
+    if any(r["可疑"] for r in t["行"]):
+        out.append("  ★可疑的人看网页这道闸\"人\"那张表里的截图: 不是人(衣服、手、别人的一部分)就点成不要, 再点继续")
+    return out
+
 def check_scale(R1, tag, scene, kind="outdoor", run="r1"):
     lines = []
     # 施加了写 world_scale.json, 没施加(SCALE_APPLY=0 或一致率不达标)写 world_scale_estimate.json。
@@ -402,6 +419,7 @@ def check_scene(R1, tag, scene, kind="outdoor", run="r1"):
                 lines.append("  " + l.strip())
             elif l.strip():
                 续 = False
+    lines += placed_people_lines(R1)
     return lines, [f"{R1}/08_render_back_phy.jpg"]
 
 def check_recall(R1, tag, scene, kind="outdoor", run="r1"):
@@ -580,24 +598,41 @@ def init_run_config(R1, kind, people, recall, done):
         sys.exit(f"[失败] {e}")
 
 def people_changed(R1, body):
-    """过了第 2 道闸又改了挑人: 决策文件里勾的人 != body4d 上次出网格用的 picked.json。"""
+    """过了第 2 道闸又改了挑人, 后面的结果还没跟上 —— 要重跑。三种情况:
+      - 决策文件里勾的人 != body4d 上次出网格用的 picked.json;
+      - 上一次按新挑的人重跑没跑完(失败了 / 被杀了): 留着记号(people_decisions.RERUN_MARK);
+      - 摆进场景的那批人 != 现在勾的(10_people.json 记着它是按谁算的)。
+    ★ 只看第一条不够(2026-10-09 nfl1 r8): 重跑的头一小步就把 picked.json 改成新的了, 后面出网格 / 对账 / 摆人任何一步失败,
+      下次点继续时"勾的人 == picked.json", 被当成没改过直接放行 —— 算作跑完, FBX 里还是点掉之前的那批人。"""
     keep = people_decisions.keep_ids(R1)
     try:
         used = sorted(json.load(open(f"{body}/02_body4d/picked.json"))["keep_ids"])
     except (OSError, ValueError, KeyError):
         return False          # 还没出过网格, 第 3 段自己会按现在的决定出
-    return keep is not None and keep != used
+    if keep is None:
+        return False
+    t = people_decisions.table(R1)
+    return keep != used or os.path.exists(f"{R1}/{people_decisions.RERUN_MARK}") or bool(t and t["过期"])
+
+PEOPLE_LOOP = ["people_mesh", "people", "phys", "people_glb", "motion", "render"]
 
 def rerun_people(R1, kind, scene, run, dry):
-    """挑人改了 -> 出网格和摆人那几步重来(只重跑跑过的)。尺度不重定: 它已经乘进深度, 幂等守卫拒绝再乘。"""
+    """挑人改了 -> 出网格、摆人、物理、合成、导出那几步重来(只重跑跑过的)。尺度不重定: 它已经乘进深度, 幂等守卫拒绝再乘。
+    返回重跑了哪些步骤(没改 = [])。
+    ★ 10-09 之前这里漏了 motion: 闸口上点掉一个人再点继续, 验收视频里他没了, 交付的 FBX 里还在。"""
     if not people_changed(R1, people_decisions.auto_dir(R1)):
-        return
-    LOOP = ["people_mesh", "people", "phys", "people_glb", "render"]
+        return []
     have = _pipeline_steps(kind)
-    todo = [x for x in LOOP if x in have and os.path.exists(f"{R1}/logs/.stamp_{x}")]
-    print(f"\n[挑人] 勾的人和上次出网格的不一样了, 重跑 {' -> '.join(todo)}(尺度不动)")
+    todo = [x for x in PEOPLE_LOOP if x in have and os.path.exists(f"{R1}/logs/.stamp_{x}")]
+    print(f"\n[挑人] 勾的人和后面的结果对不上了, 重跑 {' -> '.join(todo)}(尺度不动)")
+    mark = f"{R1}/{people_decisions.RERUN_MARK}"
+    if todo and not dry:
+        open(mark, "w").write(time.strftime("%F %T"))      # 没跑完就一直留着: 下次点继续接着重跑, 不会被当成"没改过"放行
     if todo and run_steps(kind, scene, run, todo, dry) != 0:
-        sys.exit("\n★ 重跑失败, 挑人的决定没能落到实处。就地停。")
+        sys.exit("\n★ 重跑失败, 挑人的决定没能落到实处。就地停(修好之后再点继续, 会接着重跑这几步)。")
+    if os.path.exists(mark) and not dry:
+        os.remove(mark)
+    return todo
 
 def main():
     ap = argparse.ArgumentParser()
@@ -660,7 +695,12 @@ def main():
             gate_report(s["段"], R1, tag, a.scene, kind, a.run,
                         last=(s["段"] == len(segs)-1)); return
         apply_decisions(R1, tag, a.scene, kind, a.run, s["段"], a.dry_run)
-        rerun_people(R1, kind, a.scene, a.run, a.dry_run)
+        redone = rerun_people(R1, kind, a.scene, a.run, a.dry_run)
+        if redone and s["段"] == len(segs) - 1 and not a.dry_run:
+            # 最后一道闸上改了挑人: 验收视频和 FBX 是刚按新的挑人重出的, 还没人看过。前面的闸改了, 后面还有闸能看到;
+            # 这一道后面没有了 —— 留在这道闸, 把新的报告再摆一遍, 看过再点继续才算跑完
+            print(f"\n[挑人] 这道闸要看的东西按新的挑人重出了({' -> '.join(redone)}), 留在这道闸: 看一遍新的再继续")
+            gate_report(s["段"], R1, tag, a.scene, kind, a.run, last=True); return
         s["段"] += 1; s["停在闸口"] = False; save_state(R1, s)
 
     while s["段"] < len(segs):
