@@ -27,3 +27,6 @@ data/*
 data/outdoor/*
 !data/outdoor/scripts/
 !data/outdoor/ISSUES.md
+# 运行时产物: 网页服务的日志、"上一次跑的是哪一轮"的记号
+tools/.last_run
+tools/*.log
