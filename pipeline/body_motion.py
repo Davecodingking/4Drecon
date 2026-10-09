@@ -268,7 +268,7 @@ def solve(par, shape, cams, vid2key, kept, UP, GH, mesh_run, da3, fps, focals, d
     顺序: 远近 -> 翻转补帧 -> 锁骨头长度 -> 肢体跳变 -> 姿势平滑 -> 位置整理/贴地 -> 坐没坐/椅子/脚印 -> 坐姿修正。
     判据全是 body_into_scene 里那一套(flip_segments / frame_ratios / occ_plan / tidy_track / sit_and_route / seat_fix),
     它们吃世界系的网格 —— 网格由当时的参数生成。"""
-    RATIO_TOL = 0.25
+    RATIO_TOL = B.RATIO_TOL        # 和算尺度时踢离群的人(ruler_people)是同一条线
     FLIP = export_T(UP)
     todo, all_r = {}, []
     for pid, fr in par.items():

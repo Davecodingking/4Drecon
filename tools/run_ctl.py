@@ -305,7 +305,9 @@ def _gate_extra(check, kind, scene, run):
             return {}
         per = (w.get("人") or {}).get("每人") or {}
         return {"尺度": {"k": w.get("k"), "来源": w.get("来源") or "家具",
-                         "每人": {i: v.get("场景深度比模型") for i, v in per.items()}}}
+                         "每人": {i: v.get("场景深度比模型") for i, v in per.items()},
+                         # 离群、没当尺子的人和原因(world_scale.py 踢的, 见 body_into_scene.ruler_people): 网页上要标出来
+                         "踢掉": (w.get("人") or {}).get("踢掉") or {}}}
     if check == "check_scene":
         try:
             sk = json.load(open(f"{R1}/07_scene_skipped.json")).get("skipped", [])

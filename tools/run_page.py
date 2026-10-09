@@ -382,11 +382,12 @@ function segHTML(g){
 }
 
 function scaleHTML(sc){
-  const rows = Object.entries(sc.每人 || {});
+  const rows = Object.entries(sc.每人 || {}), out = sc.踢掉 || {};
   return '<h3>尺度</h3><table class=kv><tr><td>倍数 k</td><td><b>' + sc.k + '</b></td></tr><tr><td>尺子</td><td>' +
     esc(sc.来源) + '</td></tr></table>' + (rows.length ? '<table class=kv style="margin-top:6px">' + rows.map(([i, r]) =>
-    '<tr><td><img class=thumb src="' + U('/run/img', {what:'person', id:i}) + '">#' + esc(i) + '</td><td>场景深度 / 人体模型 = ' +
-    r + '</td></tr>').join('') + '</table><p class=note>每个人给一个比例, 取中位数当尺子。离得远、人小的那个最不准。</p>' : '');
+    '<tr' + (out[i] ? ' style="opacity:.55"' : '') + '><td><img class=thumb src="' + U('/run/img', {what:'person', id:i}) + '">#' + esc(i) +
+    '</td><td>场景深度 / 人体模型 = ' + r + (out[i] ? ' <b class=warn>没当尺子</b>: ' + esc(out[i]) + ' —— 多半不是人或深度被挡, 看截图; 不是人就在挑人那栏点掉' : '') +
+    '</td></tr>').join('') + '</table><p class=note>每个人给一个比例, 取中位数当尺子。离得远、人小的那个最不准; 离群的(和别人差 25% 以上)不算。</p>' : '');
 }
 
 // 一个跟踪编号最后算谁(和 people_decisions.fate_text 是同一句)

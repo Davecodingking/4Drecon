@@ -395,6 +395,14 @@ def check_scale(R1, tag, scene, kind="outdoor", run="r1"):
         for r in sorted(w["逐类"], key=lambda x: -x["倍数"])[:6]:
             lines.append(f"    {r['词']:14s} {r['实例数']:3d}个  量到 {r['量到']:.2f} m  真实 {r['真实']:.2f} m  倍数 {r['倍数']:.2f}"
                          + ("" if r.get("采用") else "  <- 离群不用"))
+        if w.get("人"):
+            # 人当尺子: 每人一个比例; 离群的没算进去(world_scale.py 踢的, 见 body_into_scene.ruler_people), 要点名 ——
+            # 多半不是人(office r12 的外套)或深度被挡。以前闸口上只看得到 k, 它混在尺子里没人知道。
+            per, out = w["人"].get("每人") or {}, w["人"].get("踢掉") or {}
+            lines.append(f"  人当尺子 {w['人'].get('人数')} 个, 比例中位 {w['人'].get('比例中位')}: "
+                         + "  ".join(f"#{p} {v['场景深度比模型']}" + ("<-踢掉" if p in out else "") for p, v in per.items()))
+            for p, why in out.items():
+                lines.append(f"    ★ #{p} 没当尺子: {why} —— 多半不是人或深度被挡, 看他的截图; 不是人就在挑人那栏点掉")
     b = _j(f"{R1}/06_all_boxes.json", {})
     import numpy as np
     for w_ in ("car", "van", "truck", "bench", "chair", "table"):

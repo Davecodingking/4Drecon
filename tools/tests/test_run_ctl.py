@@ -139,7 +139,9 @@ def test_steps_view_for_the_wizard():
             "[3D 页] 数据还没有, 重算\n  标定倍数 k = 0.939, 一致率 None\n  3D: open the gate page\n\n  该看的图:\n"
             "    /x/world_scale.json\n\n★ 停在这里等人。\n")
         os.makedirs(f"{R1}/02_da3")
-        json.dump({"k": 0.939, "来源": "人", "人": {"每人": {"1": {"场景深度比模型": 1.023, "帧": 180}}}},
+        json.dump({"k": 0.939, "来源": "人", "人": {"每人": {"1": {"场景深度比模型": 1.023, "帧": 180},
+                                                        "7": {"场景深度比模型": 0.466, "帧": 14}},
+                                                "踢掉": {"7": "离全体中位 0.945 差 51%, 超过 25%"}}},
                   open(f"{R1}/02_da3/world_scale.json", "w"))
         # 闸 2 的候选决定: 整词作废的词, 哪怕它别的行还写着 keep, 也整词不生成(和 review_gate 落地同一个语义)
         json.dump({"候选": [{"词": "goal post", "实例": 0, "决定": "keep"},
@@ -155,7 +157,8 @@ def test_steps_view_for_the_wizard():
                                                                 "状态": "done", "耗时": None}
         assert [x for x in segs[2]["步骤"] if x["步骤"] == "people_mesh"][0]["耗时"] == 494.3
         assert segs[2]["报告"] == ["标定倍数 k = 0.939, 一致率 None"], segs[2]["报告"]   # 路径/3D 提示不进页面
-        assert segs[2]["尺度"]["k"] == 0.939 and segs[2]["尺度"]["每人"] == {"1": 1.023}
+        assert segs[2]["尺度"]["k"] == 0.939 and segs[2]["尺度"]["每人"] == {"1": 1.023, "7": 0.466}
+        assert segs[2]["尺度"]["踢掉"] == {"7": "离全体中位 0.945 差 51%, 超过 25%"}, segs[2]["尺度"]   # 踢出尺子的人和原因要到网页
         assert segs[3]["闸"] == "跳过"                                                # 召回关, 第 4 道闸不停
         nxt = s["下一步"]
         assert nxt["段"] == 4 and nxt["停在"] == 5, nxt                              # 跑第 4 段, 跳过闸 4, 停在闸 5

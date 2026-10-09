@@ -45,6 +45,9 @@ from world_frame import load_up, export_T
 # 身高的合理区间。落在外面说明场景尺度是坏的 —— 不是把人缩放一下就能糊过去的:
 # 人是绝对米制的, 错的是场景。office 那种相机离地 0.23m 的场景会在这里被挡住。
 H_MIN, H_MAX = 1.40, 2.00
+# 每个人"场景深度 / 人体模型给的距离"的比例本该扎堆(尺度偏差对所有人一样); 离全体中位超过这么多的人, 多半是深度被
+# 遮挡物带偏了, 或者根本不是人(office 搭在椅背上的外套 0.49)。算尺度(world_scale.py)和摆人(body_motion.py)用同一条线。
+RATIO_TOL = 0.25
 
 
 # ------------------------------------------------------------------ 读
@@ -661,6 +664,20 @@ def sit_and_route(Ws, delta, vfs, UP, GH, FLIP, chairs):
     if votes and seated.mean() > 0.5:
         chair = max(votes, key=votes.get)
     return seated, chair, prints
+
+
+def ruler_people(per, tol=RATIO_TOL):
+    """算尺度时谁能当尺子。per: {编号: 这个人的比例中位}。离全体中位超过 tol 的踢掉, 返回 (留下的 {编号: 比例}, 踢掉的 {编号: 原因})。
+    ★ 为什么(office r12, 2026-10-09): 外套被当成人 7, 比例 0.466 混在 8 个人里, 中位 0.978 -> 0.945, 整个场景多放大 3.5%。
+      它要到第 5 段摆人之后才会被人在闸口上点掉, 可尺度第 3 段就乘进深度了, 不重算 —— 所以这一步自己就得把它踢出尺子。
+    踢完一个不剩(两个人各执一词, 中位正好在中间)就一个都不踢: 分不出谁对, 留给闸口上的人看。"""
+    if not per:
+        return {}, {}
+    med = float(np.median(list(per.values())))
+    out = {p: f"离全体中位 {med:.3f} 差 {abs(r / med - 1):.0%}, 超过 {tol:.0%}" for p, r in per.items() if abs(r / med - 1.0) > tol}
+    if len(out) == len(per):
+        return dict(per), {}
+    return {p: r for p, r in per.items() if p not in out}, out
 
 
 def suspicious(R_own, R_all, R, conf_ok, jump):

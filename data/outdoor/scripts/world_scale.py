@@ -166,15 +166,22 @@ if PEOPLE_RUN:
             if len(_r) >= PEOPLE_MIN_FR:
                 _per[str(_tid[_pid])] = (float(np.median(list(_r.values()))), len(_r))
         if _per:
-            _rr = np.array([v[0] for v in _per.values()])
+            # ★ 离群的人不当尺子(2026-10-09 office r12): 搭在椅背上的外套被当成人 7, 比例 0.466 混在 8 个人里,
+            #   中位 0.978 -> 0.945, 整个场景多放大 3.5%。它要到第 5 段摆人之后才会在闸口上被点掉, 而尺度这一步
+            #   已经乘进深度、不重算 —— 所以这里自己踢。线和摆人时判"深度离群"的是同一条(RATIO_TOL)。
+            _ok, _out = BIS.ruler_people({p: v[0] for p, v in _per.items()})
+            _rr = np.array(list(_ok.values()))
             k_people = float(1.0 / np.median(_rr))
-            people_rep = dict(人数=len(_per), 比例中位=round(float(np.median(_rr)), 4),
+            people_rep = dict(人数=len(_ok), 比例中位=round(float(np.median(_rr)), 4),
                               比例10_90=[round(float(np.percentile(_rr, 10)), 3),
                                         round(float(np.percentile(_rr, 90)), 3)],
                               每人={p: dict(场景深度比模型=round(v[0], 3), 帧=v[1]) for p, v in _per.items()},
-                              k=round(k_people, 4))
-            print(f"[人] {len(_per)} 个人当尺子 (场景深度 / 人体模型给的距离, 每人取中位, 至少 {PEOPLE_MIN_FR} 帧):")
-            print("     " + "  ".join(f"{p}: {v[0]:.3f}({v[1]}帧)" for p, v in _per.items()))
+                              踢掉=_out, k=round(k_people, 4))
+            print(f"[人] {len(_ok)} 个人当尺子 (场景深度 / 人体模型给的距离, 每人取中位, 至少 {PEOPLE_MIN_FR} 帧"
+                  + (f"; {len(_out)} 个离群的不算" if _out else "") + "):")
+            print("     " + "  ".join(f"{p}: {v[0]:.3f}({v[1]}帧)" + ("<-踢掉" if p in _out else "") for p, v in _per.items()))
+            for _p, _why in _out.items():
+                print(f"     人 {_p} 不当尺子: {_why} —— 多半不是人或深度被挡; 闸口上看他的截图")
             print(f"     人之间中位 {np.median(_rr):.3f} -> 场景要乘 k = {k_people:.3f}")
         else:
             print(f"[人] 没有一个人量到 {PEOPLE_MIN_FR} 帧以上, 只能用家具")
