@@ -1,9 +1,9 @@
 diff --git a/NOTES_5090.md b/NOTES_5090.md
 new file mode 100644
-index 0000000..66a48e9
+index 0000000..56921ea
 --- /dev/null
 +++ b/NOTES_5090.md
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,175 @@
 +# SAM-Body4D 在 RTX 5090 上的部署记录（2026-09-09）
 +
 +装在**独立的 `body4d` 环境**里：`source ~/sam3d/env_body4d.sh`。
@@ -89,6 +89,7 @@ index 0000000..66a48e9
 +| 8 | `body4d_mesh_5090.py` 热身 | 2026-10-08: 进程里**第一次**调模型的结果和后面的不一样（office 人 4: 排第一算 vs 排第二算, 每帧顶点差 2 mm, 个别帧 3 cm; 参数和 buffer 都没变, 是 GPU 库第一次跑的路径不同）。正式算之前先用第一批帧算一遍扔掉, 这样不拆、按人拆、排第几都走同一条路 |
 +| 9 | `notebook/utils.py` `process_image_with_mask` | 2026-10-09: 人不在画面里的帧不再送进模型。以前空帧按全零框照算(出 NaN 再丢), office 1200 次里 868 次白算; 而且批内姿势平滑见到 NaN 整批不做, 含空帧的批都没平滑过(office 23% 的帧)。只改了不遮挡那条路(补全那条路这台机器跑不了, 没动) |
 +| 10 | `body4d_mesh_5090.py` 不画检查图 | 2026-10-12: 上游每帧画的"所有人合在一张"(`rendered_frames/`)也不画了(给它一张 2x2 白图占位, 结尾拼 mp4 跳过; 要画加 `--renders`)。它每帧新建一个离屏渲染器, 一帧 0.4~0.8 秒, office 人 4 那一份出网格 80 秒里有 45 秒在画图。叠加视频改由 `body4d_report_5090.py` 从存下来的网格现画(`pipeline/mesh_overlay.py`) |
++| 11 | `body4d_mesh_5090.py` 只载用得到的模型 | 2026-10-12: 上游的 `OfflineApp` 构造时把 SAM 3(跟踪, 15 秒 3.4G)、ViTDet(检人, 13 秒 2.6G)、MoGe-2(估焦距, 7 秒 1.2G)、SAM 3D Body(22 秒 3.3G)全载上。出网格这一步跟踪早做完了、给的是抠图、焦距用场景相机的, 前三个都不调用。构造前换掉 `offline_app` 模块里的 `build_sam3_from_config` / `build_sam3_3d_body_config`(不动上游文件), 只载 SAM 3D Body + MHR; 没给 `--cam-json` 时仍载 MoGe-2; 要全载加 `--all-models`。office 9 个人出网格 2 分 10 秒 -> 1 分 30 秒, 每份载模型 42~56 秒 -> 15~17 秒, 显存峰值 10.4G -> 3.9G; 网格和改前比帧数相同、顶点差中位 0.001 mm |
 +
 +**2 和 3 是同一个根源，也是最危险的一个：用位置序号冒充身份 ID。**
 +他们的流程里 id 永远是连续的 1..N 且从不中途消失，所以两者恰好等价。
@@ -298,10 +299,10 @@ index 0000000..5e59671
 +print(f"[覆盖] " + "  ".join(f"id{i}:{cov[i]}/{N}" for i in ids))
 diff --git a/body4d_mesh_5090.py b/body4d_mesh_5090.py
 new file mode 100644
-index 0000000..9eb527f
+index 0000000..9c52876
 --- /dev/null
 +++ b/body4d_mesh_5090.py
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,249 @@
 +#!/usr/bin/env python
 +"""第二段: 拿盘上的 images/ + masks/ 出人体网格 (SAM 3D Body [+ Diffusion-VAS 补全])。
 +
@@ -346,6 +347,8 @@ index 0000000..9eb527f
 +ap.add_argument("--renders", action="store_true",
 +                help="也画上游的检查图(rendered_frames/ 所有人合在一张 + 4d_*.mp4)。默认不画: 叠加视频由\n"
 +                     "body4d_report_5090.py 从存下来的网格现画, 这里画的没人读")
++ap.add_argument("--all-models", action="store_true",
++                help="照上游的样子把模型全载上(SAM 3 / 检人器 / MoGe-2)。默认只载这一步用得到的 SAM 3D Body, 见下面\"只载\"那段")
 +ap.add_argument("--cam-json", default="", help="场景重建的 cameras.json。给了就用它的焦距, 不让 MoGe-2 自己估 ——\n"
 +                "人离镜头多远是 SAM 3D Body 用焦距换算出来的, 焦距跟场景不一致, 人的远近就跟场景不一致")
 +a = ap.parse_args()
@@ -379,8 +382,11 @@ index 0000000..9eb527f
 +    cfg.completion.max_occ_len = a.max_occ_len
 +
 +# ★ 缺权重要在载模型之前报清楚, 不要等 torch.load 抛一个看不懂的 KeyError。
-+need = [("SAM 3", cfg.sam3.ckpt_path), ("SAM 3D Body", cfg.sam_3d_body.ckpt_path),
-+        ("MHR", cfg.sam_3d_body.mhr_path), ("MoGe-2(估焦距)", cfg.sam_3d_body.fov_path)]
++need = [("SAM 3D Body", cfg.sam_3d_body.ckpt_path), ("MHR", cfg.sam_3d_body.mhr_path)]
++if a.all_models:
++    need += [("SAM 3", cfg.sam3.ckpt_path)]
++if a.all_models or not a.cam_json:             # 没给场景相机: 焦距靠 MoGe-2 估
++    need += [("MoGe-2(估焦距)", cfg.sam_3d_body.fov_path)]
 +if cfg.completion.enable:
 +    need += [("Diffusion-VAS mask", cfg.completion.model_path_mask),
 +             ("Diffusion-VAS rgb", cfg.completion.model_path_rgb),
@@ -459,6 +465,29 @@ index 0000000..9eb527f
 +if not a.renders:
 +    _oa.visualize_sample_together = lambda img, *args, **kw: np.full((2, 2, 3), 255, np.uint8)
 +    _oa.jpg_folder_to_mp4 = lambda *args, **kw: None
++
++# ★ 2026-10-12: 只载这一步用得到的模型。上游的 OfflineApp 是"检人 -> 跟踪 -> 出网格"一条龙, 构造时把全家都载上
++#   (单独量的, 一张空卡):
++#     SAM 3(跟踪)         15 秒  3.4G   跟踪在上一步(body4d_track_5090.py)做完了, on_4d_generation 里不碰它
++#     ViTDet(检人)        13 秒  2.6G   我们给的是抠图, 框从抠图算; estimator 里给了框就不走检人器
++#     MoGe-2(估焦距)       7 秒  1.2G   给了 --cam-json 就用场景的焦距(下面的 _SceneK), 用不到
++#     SAM 3D Body + MHR   22 秒  3.3G   只有它在算
++#   每份进程白载 35 秒 / 7G; 按人拆到 8 张卡就是 8 份都白载。闸口上勾回一个人那次: 整步 81 秒, 真正算他 6 秒, 载模型 42 秒。
++#   做法和上面跳过画图一样: 换掉 offline_app 模块里的两个构造函数, 不动上游文件。要回到全载加 --all-models。
++if not a.all_models:
++    _oa.build_sam3_from_config = lambda _cfg: (None, None)
++
++    def _body_only(_cfg):
++        dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
++        model, model_cfg = _oa.load_sam_3d_body(_cfg.sam_3d_body["ckpt_path"], device=dev, mhr_path=_cfg.sam_3d_body["mhr_path"])
++        fov = None
++        if not a.cam_json:                     # 没给场景相机: 人离镜头多远要靠它估的焦距
++            from models.sam_3d_body.tools.build_fov_estimator import FOVEstimator
++            fov = FOVEstimator(name="moge2", device=dev, path=_cfg.sam_3d_body["fov_path"])
++        return _oa.SAM3DBodyEstimator(sam_3d_body_model=model, model_cfg=model_cfg, human_detector=None,
++                                      human_segmentor=None, fov_estimator=fov)
++
++    _oa.build_sam3_3d_body_config = _body_only
 +
 +t0 = time.time()
 +app = OfflineApp(config_path=cfg_path)

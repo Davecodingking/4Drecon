@@ -808,9 +808,12 @@ def s_solo(c, dry):
     """SOLO 里的类逐实例各生成一个 mesh。街上的车型号各不相同, 复用一个 mesh
     会变成满街同款。太小的实例(< SOLO_MIN_PX 像素)不单独生成 —— 那么小生成出来必是垃圾, 继续复用。
     注意: gen_per_instance.py 里的 R1/FR 是写死的, 换场景要改那个文件。"""
+    # ★ 2026-10-12 组装时会被扔的盒子这一步就不生成(box_guards.py)。室外的去重开关 DEDUP_BOX 没进配置, 两个脚本读的是
+    #   同一个环境变量, 不用另传; 只有开着召回时强制关掉(那时组装读的是并进了召回物体的盒子文件, 结论可能不同)。
     sh(envcmd(PY["sam3d"], f"{SCRIPTS}/gen_per_instance.py",
               dict(R1=c.R1, FR=c.FR, TAG=c.tag, EXCLUDE=_gen_excl(c),
-                   SOLO=c.cfg["SOLO"], SOLO_KEEP=c.cfg["SOLO_KEEP"], SOLO_MIN_PX=c.cfg["SOLO_MIN_PX"])),
+                   SOLO=c.cfg["SOLO"], SOLO_KEEP=c.cfg["SOLO_KEEP"], SOLO_MIN_PX=c.cfg["SOLO_MIN_PX"],
+                   **({"DEDUP_BOX": "0"} if c.cfg["RECALL"] == "1" else {}))),
        f"{c.LOG}/06_solo_pick.log", dry)
     jobs = f"{c.LOG}/solo_jobs.txt"
     names = open(jobs).read().split() if os.path.exists(jobs) else []

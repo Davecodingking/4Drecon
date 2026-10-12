@@ -25,6 +25,23 @@ if "*" in SOLO: SOLO=set(d)-KEEP          # "*" = 除白名单外全部逐实例
 SOLO=SOLO-EXCLUDE                         # ★ 必须在 "*" 展开之后减, 否则 "*" 场景漏掉
 print(f"[SOLO] {len(SOLO)} 类逐实例生成, 白名单(共用mesh) {sorted(KEEP)}"
       + (f", EXCLUDE 挡掉 {sorted(EXCLUDE & (set(d)|SOLO))}" if EXCLUDE else ""))
+# ★ 2026-10-12 组装时一定会被扔的盒子, 这里就不生成。规则和门槛都在 box_guards.py, 和组装(assemble_scene.py)用的是同一份:
+#     太矮 / 太大(绝对守卫) —— office r12 的苹果(3 厘米)、鼠标、两个笔筒...共 6 个;
+#     同一件量了两遍(去重, DEDUP_BOX 开着才判) —— office r12 的两张桌子。
+#   以前照样生成(每个约 1 分钟), 到组装才扔。场景不变, 只是不白生成。
+#   去重那条要看"同词的其他盒子": 开着召回时组装读的是并进了召回物体的盒子文件, 和这里读的不是同一份, 结论可能不一样,
+#   所以流水线在召回开着时不把 DEDUP_BOX 传过来(见 o_solo / s_solo) —— 宁可白生成, 不能少生成。
+import box_guards
+_DUPB = {}
+if box_guards.DEDUP_BOX:
+    from world_frame import load_up
+    _DUPB = box_guards.dup_boxes(d, load_up(f"{R1}/02_da3", "逐实例生成")[0], EXCLUDE)
+# "太矮"那条有个例外: 组装会先把"立在地上"的类补到地面再判(腿被挡住只量到桌面的桌子, 0.06 -> 0.74 m)。
+# 补不补由这三个设置决定, 流水线传的和传给组装的是同一份; 这三个条件和 assemble_scene.py 里开那一段的条件一样。
+_rp = os.environ.get("REST", "")
+_REST = json.load(open(_rp)) if (os.environ.get("FLOOR_EXTEND", "0") == "1" and _rp and os.path.exists(_rp)) else None
+_HUNG = box_guards.hung_labels()
+_never = []
 OV_INST=review.overrides_inst(R1)     # {(词, 实例号): 帧号} —— 人在闸口点名换的那张抠图
 # ★ VLM 逐实例校验的否决名单(verify_picks.py 那一段写的)。
 #   以前逐实例这条路上一个机器校验都没有: 共用的词验代表那一张, solo 的词一张都不验,
@@ -46,6 +63,9 @@ for w in SOLO:
         oid=b["obj_id"]
         if oid in VLM_REJ.get(w, ()) and f"{TAG}_{w.replace(' ','_')}_{oid}" not in RELEASE:
             continue                       # VLM 说这不是这个词, 人也没放行 -> 不生成
+        _why = box_guards.never_placed(w, b, _DUPB, may_grow=_REST is not None and box_guards.rests_on_floor(w, _REST, _HUNG))
+        if _why:
+            _never.append((w, oid)); print(f"[不生成] {w}#{oid}: {_why}"); continue
         rows=[(i,int(a),int(f),float(e)) for i,(o,f,a,e) in enumerate(meta) if int(o)==oid and a>0]
         if not rows: continue
         i,a,fi,e = max(rows, key=lambda t: t[1]*(1-min(t[3]*4,0.9)))   # 面积大且不贴边
@@ -73,5 +93,7 @@ for w in SOLO:
         imwrite_stable(f"{dd}/frame.png", cv2.imread(f"{FR}/{fi:04d}.jpg"))
         imwrite_stable(f"{dd}/mask.png", m*255)
         jobs.append(name); print(f"[{w}#{oid}] 第{fi}帧 占{pct:.2f}% ({a}px) -> {name}")
+if _never:
+    print(f"[不生成] 共 {len(_never)} 个: 组装时一定会被扔(太矮 / 太大当成量错了, 或者同一件量了两遍), 不白生成")
 open(f"{R1}/logs/solo_jobs.txt","w").write("\n".join(jobs))
 print(f"\n[done] {len(jobs)} 个待单独生成")

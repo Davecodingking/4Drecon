@@ -223,7 +223,12 @@ def test_fan_gen_splits_objects_over_cards_and_skips_fresh():
     todo = [f"{T}/obj{i}" for i in range(6)]
     open(f"{T}/obj5.glb", "w").write("old")
 
+    # ★ 三份都领到卡了才放行。真的生成一份要几分钟, 三份的卡是同时占着的; 假任务瞬间结束, 一份还了卡下一份
+    #   可能领到同一张, "三张卡都用上了"就成了碰运气(2026-10-12 发现: 这个测试 10 次里挂 4 次)。
+    gate = threading.Barrier(3, timeout=30)
+
     def run(dirs, card):
+        gate.wait()
         for d in dirs:
             open(f"{d}.glb", "w").write(card)
 

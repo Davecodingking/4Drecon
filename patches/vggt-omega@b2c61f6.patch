@@ -1,0 +1,862 @@
+diff --git a/tools/build_conf_ref.py b/tools/build_conf_ref.py
+new file mode 100644
+index 0000000..199f7b0
+--- /dev/null
++++ b/tools/build_conf_ref.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python
++"""从现有各场景的 DA3 输出汇总"DA3 置信度长什么样", 写 da3_conf_ref.json。
++vggt_omega_geom.py 用它把 VGGT-Ω 的置信度换算成 DA3 的刻度。
++
++★ 为什么要换算: 流水线里的置信度门槛全是按 DA3 的数值调的(室外 CONF_MIN=2.0、beach 1.0、
++  室内 OBJ_CONF=1.2 / CONF_MIN=1.5), 下游 boxes_from_masks.py 等脚本直接拿 *_conf.npy 比这个数。
++  VGGT-Ω 的置信度量纲完全不同(ithor312 上中位 10.3, DA3 是 2.9), 原样喂进去门槛就失效。
++★ 怎么换: 按排名对应。VGGT-Ω 某像素的置信度在本场景排第 p 百分位, 就给它 DA3 参考分布里
++  第 p 百分位的值。这样"丢掉最差的百分之几"的效果和 DA3 下大致一样。
++  参考分布 = 下面这些场景各抽相同数量的像素混在一起(每个场景权重相同, 不让帧多的场景占大头)。
++★ 这是近似: DA3 自己在不同场景上分布差很多(beach 30% 分位 1.68, pedestrian r2 是 8.84),
++  所以同一个门槛在 DA3 下每个场景丢的比例本来就不同, 换算后变成"每个场景丢的比例一样"。
++  门槛要是对 VGGT-Ω 不合适, 直接在流水线配置里改门槛, 不用改这张表。
++
++  python build_conf_ref.py      # sam3d 环境, 纯 CPU, 几秒
++"""
++import glob, json, os
++import numpy as np
++
++D = os.path.expanduser("~/sam3d/data")
++# 每个场景只取一份(r2sim / r3 这类是同一份 DA3 结果的拷贝, 不重复算)
++SRC = [
++    f"{D}/outdoor/result/beach/r1/02_da3",
++    f"{D}/outdoor/result/carpark/r1/02_da3",
++    f"{D}/outdoor/result/pedestrian/r2/02_da3",
++    f"{D}/outdoor/result/timesquare/r1/02_da3",
++    f"{D}/indoorOutput/ithor312/r1/02_da3",
++    f"{D}/indoorOutput/cyberpunk/o1/02_da3",
++]
++PER_SCENE = 400_000
++rng = np.random.default_rng(0)
++pools, used = [], []
++for s in SRC:
++    fs = sorted(glob.glob(f"{s}/depth/*_conf.npy"))
++    if not fs:
++        print("[跳过] 没有置信度文件:", s); continue
++    c = np.concatenate([np.load(f).ravel() for f in fs])
++    c = c[np.isfinite(c)]
++    c = c[c > 1.0 + 1e-4]   # DA3 置信度下限就是 1.0, 正好 1.0 的一大坨基本是天空(beach 占 ~30%)。
++                            # VGGT-Ω 那边天空单独置 0, 参考表里留着这坨会让门槛多丢 ~15% 的正常像素
++    pools.append(rng.choice(c, PER_SCENE, replace=len(c) < PER_SCENE)); used.append(s)
++    print(f"{s}: {len(fs)} 帧, 中位 {np.median(c):.2f}")
++q = np.percentile(np.concatenate(pools), np.arange(101)).astype(float)
++out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "da3_conf_ref.json")
++json.dump(dict(说明="DA3 置信度的混合分布, 第 i 项 = 第 i 百分位。用法见 build_conf_ref.py 文件头",
++               来源=used, 每场景像素数=PER_SCENE, 百分位=[round(v, 4) for v in q]),
++          open(out, "w"), ensure_ascii=False, indent=1)
++for t in (1.0, 1.2, 1.5, 2.0):
++    print(f"门槛 {t}: 参考分布里约丢 {np.searchsorted(q, t)}%")
++print("->", out)
+diff --git a/tools/compare_geom.py b/tools/compare_geom.py
+new file mode 100644
+index 0000000..5563fcc
+--- /dev/null
++++ b/tools/compare_geom.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python
++"""两份几何结果(DA3 的 02_da3 和 VGGT-Ω 后端的 02_da3)逐帧对账, 没有真值时用。
++  python compare_geom.py --a DA3目录 --b VGGT目录 [--a-scale 1.336] [--sky b目录/sky]
++输出:
++  深度倍数  b/a 的逐帧中位数(非天空像素), 以及它的整体中位数和帧间浮动
++  位姿      两条轨迹做相似变换对齐后, 相机位置残差 / 逐帧朝向差(度)
++  坏帧      各自 bad_frames.json 里的数量(没有就当场用 pose_check 算)
++--a-scale: a 那份再乘的倍数。室外 DA3 后面还有 world_scale 按物体常识尺寸校过一次,
++  传那个 k 进来, 就是拿"常识尺度"当参照来看 b 准不准。
++sam3d 环境(只用 numpy + cv2)。
++"""
++import argparse, json, os, sys
++import numpy as np, cv2
++sys.path.insert(0, os.path.expanduser("~/sam3d/data/outdoor/scripts"))
++import pose_check
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--a", required=True); ap.add_argument("--b", required=True)
++ap.add_argument("--a-scale", type=float, default=1.0)
++ap.add_argument("--out", default=None)
++g = ap.parse_args()
++
++def load(d):
++    cams = json.load(open(f"{d}/cameras.json"))["cameras"]
++    return cams, sorted(cams)
++
++ca, na = load(g.a); cb, nb = load(g.b)
++names = [n for n in na if n in cb]
++ratios = []
++for n in names:
++    s = os.path.splitext(n)[0]
++    da = np.load(f"{g.a}/depth/{s}_depth.npy") * g.a_scale
++    db = np.load(f"{g.b}/depth/{s}_depth.npy")
++    cf = np.load(f"{g.b}/depth/{s}_conf.npy")               # b 的天空置信度 = 0
++    da = cv2.resize(da, (db.shape[1], db.shape[0]), interpolation=cv2.INTER_LINEAR)
++    m = (cf > 0) & (da > 0) & (db > 0) & np.isfinite(da) & np.isfinite(db)
++    ratios.append(float(np.median(db[m] / da[m])))
++r = np.array(ratios)
++
++def centers(c): return np.array([c[n]["camera_center_world"] for n in names])
++def rots(c): return np.array([np.array(c[n]["extrinsic_w2c_4x4"])[:3, :3] for n in names])
++A, B = centers(ca) * g.a_scale, centers(cb)
++# Umeyama: 找 s,R,t 使 s*R*A+t ≈ B
++mA, mB = A.mean(0), B.mean(0)
++U, S, Vt = np.linalg.svd((B - mB).T @ (A - mA))
++D = np.eye(3); D[2, 2] = np.sign(np.linalg.det(U @ Vt))
++R = U @ D @ Vt
++s = (S * np.diag(D)).sum() / ((A - mA) ** 2).sum()
++resid = np.linalg.norm((s * (R @ (A - mA).T).T + mB) - B, axis=1)
++# 朝向差: 把 a 的相机朝向转到 b 的世界系再比。w2c_b ≈ w2c_a * R^T
++Ra, Rb = rots(ca), rots(cb)
++ang = []
++for i in range(len(names)):
++    dR = Rb[i] @ (Ra[i] @ R.T).T
++    ang.append(float(np.degrees(np.arccos(np.clip((np.trace(dR) - 1) / 2, -1, 1)))))
++ang = np.array(ang)
++
++def bad(d):
++    p = f"{d}/bad_frames.json"
++    return len(json.load(open(p))["坏帧"]) if os.path.exists(p) else len(pose_check.check_dir(d)["坏帧"])
++
++span = np.linalg.norm(B.max(0) - B.min(0))
++res = dict(frames=len(names), a_scale=g.a_scale,
++           depth_ratio_b_over_a=round(float(np.median(r)), 4),
++           depth_ratio_frame_spread_pct=round(float(np.std(r) / np.mean(r) * 100), 1),
++           traj_sim3_scale=round(float(s), 4),
++           traj_resid_median_m=round(float(np.median(resid)), 3), traj_resid_max_m=round(float(resid.max()), 3),
++           traj_span_b_m=round(float(span), 2),
++           rot_diff_median_deg=round(float(np.median(ang)), 2), rot_diff_max_deg=round(float(ang.max()), 2),
++           rot_diff_over5deg=int((ang > 5).sum()),
++           bad_frames_a=bad(g.a), bad_frames_b=bad(g.b))
++print(json.dumps(res, ensure_ascii=False))
++if g.out:
++    json.dump(res, open(g.out, "w"), indent=1)
+diff --git a/tools/da3_conf_ref.json b/tools/da3_conf_ref.json
+new file mode 100644
+index 0000000..ff4e54c
+--- /dev/null
++++ b/tools/da3_conf_ref.json
+@@ -0,0 +1,115 @@
++{
++ "说明": "DA3 置信度的混合分布, 第 i 项 = 第 i 百分位。用法见 build_conf_ref.py 文件头",
++ "来源": [
++  "/home/jincheng/sam3d/data/outdoor/result/beach/r1/02_da3",
++  "/home/jincheng/sam3d/data/outdoor/result/carpark/r1/02_da3",
++  "/home/jincheng/sam3d/data/outdoor/result/pedestrian/r2/02_da3",
++  "/home/jincheng/sam3d/data/outdoor/result/timesquare/r1/02_da3",
++  "/home/jincheng/sam3d/data/indoorOutput/ithor312/r1/02_da3",
++  "/home/jincheng/sam3d/data/indoorOutput/cyberpunk/o1/02_da3"
++ ],
++ "每场景像素数": 400000,
++ "百分位": [
++  1.0001,
++  1.001,
++  1.0072,
++  1.0269,
++  1.0758,
++  1.1825,
++  1.3427,
++  1.454,
++  1.5616,
++  1.6752,
++  1.7778,
++  1.8707,
++  1.9634,
++  2.0699,
++  2.1754,
++  2.29,
++  2.402,
++  2.5075,
++  2.6064,
++  2.6929,
++  2.7731,
++  2.8493,
++  2.9227,
++  2.9943,
++  3.0647,
++  3.1325,
++  3.1983,
++  3.2638,
++  3.3296,
++  3.4,
++  3.4781,
++  3.566,
++  3.6692,
++  3.7876,
++  3.9217,
++  4.0792,
++  4.2483,
++  4.4215,
++  4.5895,
++  4.7471,
++  4.8877,
++  5.0199,
++  5.1551,
++  5.2961,
++  5.4397,
++  5.5825,
++  5.7315,
++  5.8848,
++  6.0411,
++  6.1983,
++  6.3503,
++  6.5035,
++  6.6632,
++  6.8223,
++  6.9803,
++  7.1364,
++  7.2927,
++  7.4458,
++  7.5962,
++  7.7433,
++  7.8895,
++  8.0338,
++  8.1774,
++  8.3204,
++  8.4597,
++  8.5989,
++  8.7392,
++  8.8832,
++  9.0325,
++  9.1867,
++  9.3446,
++  9.514,
++  9.6884,
++  9.8663,
++  10.0525,
++  10.2465,
++  10.4464,
++  10.6545,
++  10.8621,
++  11.0613,
++  11.2474,
++  11.4175,
++  11.5865,
++  11.7637,
++  11.9752,
++  12.2733,
++  12.7064,
++  13.242,
++  13.8802,
++  14.6822,
++  15.7463,
++  17.1146,
++  19.4238,
++  22.9261,
++  25.9646,
++  28.8611,
++  31.7663,
++  35.3541,
++  41.6265,
++  48.3723,
++  68.4933
++ ]
++}
+\ No newline at end of file
+diff --git a/tools/metric3d_scale.py b/tools/metric3d_scale.py
+new file mode 100644
+index 0000000..1a5880d
+--- /dev/null
++++ b/tools/metric3d_scale.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python
++"""给 VGGT-Ω 定米制尺度: 抽几帧跑 Metric3D v2(单图米制深度), 和 VGGT-Ω 的深度逐像素比, 取中位数。
++由 vggt_omega_geom.py 调用, 跑在 metricdepth 环境(/mnt/nvme/jincheng/envs/metricdepth)。
++
++  python metric3d_scale.py <job.json>
++job.json: {"model": "metric3d_l"|"metric3d_g2", "out": 结果json,
++           "frames": [{"image": 原图, "fx": 原图像素焦距, "depth": VGGT深度npy, "valid": 有效像素npy(bool)}, ...]}
++结果: {"scale": 倍数, "per_frame": [...], ...}   VGGT-Ω 深度 × scale = 米
++
++★ 为什么是这个做法(devLog/devlog_9.16.md 第 10 节, ithor312 有真值):
++  - VGGT-Ω 自己不是米制(ithor312 上小了 2.2~2.4 倍), 要外借一把"尺子"。
++  - 6 个米制模型里 Metric3D v2 最准: 整体倍数误差 Large 0.6%、Giant2 2.2%(DA3 Nested 11.4%)。
++  - 但单张图的倍数上下浮动约 20%, 所以只能取多帧的中位数, 不能拿一帧定。
++  - Metric3D 必须给焦距; 用 VGGT-Ω 自己估的(ithor312 上误差 0.6%, 比 DA3 的 1.5% 还准)。
++★ 只比"两边都靠谱"的像素: valid 由调用方给(非天空 + VGGT-Ω 置信度前 70%), 这里再去掉
++  Metric3D 输出 <=0 或超过 200 米的点。
++★ mmcv: Metric3D 的 torch.hub 代码 import 了 mmcv.utils 里几个配置工具, 这里用 shims/ 下的
++  mmengine 顶替, 不编 mmcv。权重在 TORCH_HOME(/mnt/nvme/jincheng/torch_cache), 离线加载。
++"""
++import json, os, sys, time
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "shims"))
++os.environ.setdefault("TORCH_HOME", "/mnt/nvme/jincheng/torch_cache")   # 必须在 import torch 之前
++import numpy as np, torch, cv2
++
++HUB_DIR = "/mnt/nvme/jincheng/torch_cache/hub/yvanyin_metric3d_main"
++HUB_NAME = {"metric3d_l": "metric3d_vit_large", "metric3d_g2": "metric3d_vit_giant2"}
++IN_H, IN_W = 616, 1064   # ViT 版 Metric3D 的固定输入尺寸(官方 hubconf 示例)
++MEAN = [123.675, 116.28, 103.53]
++STD = [58.395, 57.12, 57.375]
++
++
++def infer(model, img, fx):
++    """img: HxWx3 RGB uint8(原图), fx: 原图像素焦距。返回原图大小的米制 z 深度。
++    做法照官方示例: 等比缩放塞进 616x1064, 四周用均值色补齐, 出来的深度是按"焦距 1000"算的,
++    乘 fx*缩放/1000 换回真实焦距。"""
++    H, W = img.shape[:2]
++    sc = min(IN_H / H, IN_W / W)
++    r = cv2.resize(img, (int(W * sc), int(H * sc)), interpolation=cv2.INTER_LINEAR)
++    h, w = r.shape[:2]
++    pt, pl = (IN_H - h) // 2, (IN_W - w) // 2
++    r = cv2.copyMakeBorder(r, pt, IN_H - h - pt, pl, IN_W - w - pl, cv2.BORDER_CONSTANT, value=MEAN)
++    t = torch.from_numpy(r).permute(2, 0, 1).float().cuda()
++    t = (t - torch.tensor(MEAN, device="cuda")[:, None, None]) / torch.tensor(STD, device="cuda")[:, None, None]
++    d, _, _ = model.inference({"input": t[None]})
++    d = d.squeeze()[pt:pt + h, pl:pl + w]
++    d = torch.nn.functional.interpolate(d[None, None], (H, W), mode="bilinear").squeeze()
++    return (d * (fx * sc / 1000.0)).float().cpu().numpy()
++
++
++def main():
++    job = json.load(open(sys.argv[1]))
++    t0 = time.time()
++    model = torch.hub.load(HUB_DIR, HUB_NAME[job["model"]], source="local", pretrain=True).cuda().eval()
++    t_load = time.time() - t0
++    torch.cuda.reset_peak_memory_stats()
++    t1 = time.time()
++    per = []
++    with torch.inference_mode():
++        for f in job["frames"]:
++            img = cv2.cvtColor(cv2.imread(f["image"]), cv2.COLOR_BGR2RGB)
++            vd = np.load(f["depth"])
++            ok = np.load(f["valid"])
++            md = cv2.resize(infer(model, img, f["fx"]), (vd.shape[1], vd.shape[0]), interpolation=cv2.INTER_LINEAR)
++            m = ok & np.isfinite(md) & (md > 0) & (md < 200) & np.isfinite(vd) & (vd > 0)
++            if m.sum() < 1000:          # 几乎全是天空 / 全被筛掉的帧不参与
++                per.append(None); continue
++            per.append(float(np.median(md[m] / vd[m])))
++    t_inf = time.time() - t1
++    good = [p for p in per if p is not None]
++    if not good:
++        raise SystemExit("[尺度] 没有一帧能用来定尺度")
++    s = float(np.median(good))
++    res = dict(model=job["model"], scale=s, frames_used=len(good), frames_total=len(per),
++               per_frame=per, per_frame_spread_pct=round(float(np.std(good) / np.mean(good) * 100), 1),
++               load_s=round(t_load, 1), infer_s=round(t_inf, 1),
++               peak_vram_GB=round(torch.cuda.max_memory_allocated() / 1e9, 2))
++    json.dump(res, open(job["out"], "w"), indent=1)
++    print(f"[尺度] {job['model']}: ×{s:.4f}  ({len(good)}/{len(per)} 帧, 单帧浮动 {res['per_frame_spread_pct']}%)"
++          f"  装载 {t_load:.1f}s 推理 {t_inf:.1f}s 显存 {res['peak_vram_GB']}GB")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/shims/mmcv/__init__.py b/tools/shims/mmcv/__init__.py
+new file mode 100644
+index 0000000..efdfc88
+--- /dev/null
++++ b/tools/shims/mmcv/__init__.py
+@@ -0,0 +1 @@
++# 仅供 Metric3D torch.hub 推理: 它只用到 mmcv.utils 里几个配置工具, 用 mmengine 顶上, 不编 mmcv
+diff --git a/tools/shims/mmcv/utils/__init__.py b/tools/shims/mmcv/utils/__init__.py
+new file mode 100644
+index 0000000..33efb55
+--- /dev/null
++++ b/tools/shims/mmcv/utils/__init__.py
+@@ -0,0 +1,4 @@
++# Metric3D 推理只用到这几个名字, 全部由 mmengine 提供
++from mmengine.config import Config, DictAction
++from mmengine.utils.dl_utils import collect_env
++from mmengine.utils import get_git_hash
+diff --git a/tools/vggt_omega_geom.py b/tools/vggt_omega_geom.py
+new file mode 100644
+index 0000000..e6b6115
+--- /dev/null
++++ b/tools/vggt_omega_geom.py
+@@ -0,0 +1,436 @@
++#!/usr/bin/env python
++"""VGGT-Ω 几何后端: 替换流水线里 DA3 那一步(相机位姿 + 逐帧深度), 输出和 da3_to_ply.py 同格式,
++下游一个字都不用改。流水线里由配置 GEOM 选择(见 outdoor_pipeline.py / indoor_pipeline.py 的 GEOM)。
++
++  /mnt/nvme/jincheng/envs/vggt_omega/bin/python vggt_omega_geom.py \
++      --images 帧目录 --out 输出目录 --scale metric3d_l [--max-frames 180] [--no-sky] [--conf-min 2.0]
++
++为什么换(devLog/devlog_9.16.md 第 9、10 节, ithor312 有真值):
++  - 位姿: DA3 在白墙帧上会错 10–36°, 60 帧要剔 15 帧; VGGT-Ω 最差一帧 3.1°, 基本不用剔。
++  - 焦距: VGGT-Ω 估的误差 0.6%(DA3 1.5%)。
++  - 缺点: VGGT-Ω 不是米制(小 2.2–2.4 倍), 天空也不会自己去掉 —— 下面两步就是补这两个洞。
++
++整个流程:
++  1. 抽帧: 和 da3_to_ply.py 一样, 超过 --max-frames 就均匀抽, 帧名顺序 = 下游"帧号"的含义。
++  2. VGGT-Ω 一次吃下所有帧, 出位姿 / 内参 / 深度 / 置信度(模型自己不是米制)。
++  3. 天空: 用 VGGT 官方 demo 的 skyseg.onnx 逐帧分割(CPU), 天空像素置信度记 0。
++     DA3 是模型自带天空头, 这里是外挂。室内用 --no-sky 关掉(白天花板有被当成天空的风险)。
++  4. 尺度(--scale): 抽 --scale-frames 帧交给 metric3d_scale.py(另一个环境)跑 Metric3D v2,
++     两边深度比出一个倍数, 深度和相机平移一起乘上 -> 米。none = 不乘, 保持 VGGT-Ω 原始尺度。
++     ★ 室外流水线后面还有 world_scale.py 按物体常识尺寸再校一次, 这里给的是它的起点。
++  5. 置信度换算成 DA3 刻度(da3_conf_ref.json, 原理见 build_conf_ref.py), 让现有门槛照用。
++  6. 坏位姿帧筛选(pose_check.py, 和 DA3 同一套), 拼 points.ply, 写 cameras.json / summary.txt。
++
++输出(和 da3_to_ply.py 对齐的部分不再解释):
++  points.ply  cameras.json  depth/*_depth.npy *_conf.npy  bad_frames.json  summary.txt
++  sky/*.png         天空掩码(白 = 天空), 室外排查用; --no-sky 时没有
++  _scale/job.json, result.json   定尺度用了哪几帧、每帧倍数、耗时
++"""
++import argparse, json, os, subprocess, sys, time
++from pathlib import Path
++
++import numpy as np
++import torch
++import cv2
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++WEIGHTS = "/mnt/nvme/jincheng/weights/vggt_omega"
++METRIC_PY = "/mnt/nvme/jincheng/envs/metricdepth/bin/python"
++POSE_CHECK_DIR = os.path.expanduser("~/sam3d/data/outdoor/scripts")
++IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
++
++
++def sky_masks(paths, hw):
++    """逐帧天空掩码, 缩到深度图大小, True = 天空。
++    照抄 vggt-omega/visual_util.py 的 segment_sky/run_skyseg: 320x320 输入, 输出归一化后
++    <32 的是"非天空"(官方 demo 就是这个阈值, 没改)。"""
++    import onnxruntime
++    sess = onnxruntime.InferenceSession(f"{WEIGHTS}/skyseg.onnx", providers=["CPUExecutionProvider"])
++    iname, oname = sess.get_inputs()[0].name, sess.get_outputs()[0].name
++    out = []
++    for p in paths:
++        im = cv2.cvtColor(cv2.resize(cv2.imread(p), (320, 320)), cv2.COLOR_BGR2RGB).astype(np.float32)
++        im = ((im / 255 - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]).transpose(2, 0, 1)[None].astype(np.float32)
++        r = np.array(sess.run([oname], {iname: im})).squeeze()
++        r = (r - r.min()) / (r.max() - r.min()) if r.max() > r.min() else np.zeros_like(r)
++        r = cv2.resize((r * 255).astype(np.uint8), (hw[1], hw[0]))
++        out.append(r >= 32)
++    return np.stack(out)
++
++
++def to_da3_conf(conf, sky):
++    """VGGT-Ω 置信度 -> DA3 刻度, 按全场景排名对应(不是逐帧: 整帧都差的帧应该整帧偏低)。
++    天空 = 0, 低于任何门槛。"""
++    ref = np.array(json.load(open(f"{HERE}/da3_conf_ref.json"))["百分位"])
++    ok = ~sky & np.isfinite(conf)
++    qv = np.percentile(conf[ok], np.arange(101))
++    qv = np.maximum.accumulate(qv) + np.arange(101) * 1e-9     # np.interp 要求严格递增
++    out = np.interp(conf, qv, ref).astype(np.float32)
++    out[~ok] = 0.0
++    return out
++
++
++def write_ply(path, pts, cols):
++    """二进制 ply(xyz float + rgb uchar)。vggt_omega 环境没装 trimesh, 手写一个, 读出来和 trimesh 导出的一样。"""
++    v = np.empty(len(pts), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("red", "u1"), ("green", "u1"), ("blue", "u1")])
++    v["x"], v["y"], v["z"] = pts[:, 0], pts[:, 1], pts[:, 2]
++    v["red"], v["green"], v["blue"] = cols[:, 0], cols[:, 1], cols[:, 2]
++    with open(path, "wb") as f:
++        f.write((f"ply\nformat binary_little_endian 1.0\nelement vertex {len(v)}\n"
++                 "property float x\nproperty float y\nproperty float z\n"
++                 "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n").encode())
++        f.write(v.tobytes())
++
++
++def pose_into(a, names, w2c_v, K_v, depth_v, conf_v, rgb_v, t_load, t_inf, peak):
++    """混合模式(室内默认 GEOM=vggt_da3): 几何全用 VGGT-Ω, DA3 只当"掩码 + 尺子"。
++    --out 是 da3_to_ply.py 刚写好的目录; 这里把它的位姿/深度/内参换成 VGGT-Ω 的, 置信度沿用 DA3 的。
++
++    为什么这样分工(ithor312 对真值, analysis_9.17_vggt_omega/hybrid_vs_gt.py, 点到真值表面的距离):
++      纯 DA3                          中位 6.1 cm / 90 分位 20.3 cm, pose_check 剔 15 帧
++      VGGT-Ω 位姿 + DA3 深度          2.9 / 11.5 cm, 剔 15 帧(DA3 各帧深度尺度不一, 和别人的位姿对不上)
++      VGGT-Ω 位姿+深度, DA3 置信度掩码  1.9 / 4.6 cm, 剔 1 帧   <- 这里的做法
++    为什么还要 DA3: cyberpunk 实测 VGGT-Ω 在黑区给出几十~几百米的假深度且自己的置信度不低;
++      DA3 把这些区域置信度压到下限 1.0。拿 DA3 置信度当掩码, >30 m 的假深度 99.2% 被盖掉。
++      VGGT-Ω 也不是米制, 顺手拿 DA3 深度当尺子(室内只有这一把现成的; ithor312 上 DA3 偏 11%)。
++
++    做法:
++      1. 尺度: 两边深度逐像素比(DA3 置信度 >=2 且 VGGT-Ω 置信度前 70% 的像素), 逐帧中位数再取中位数。
++         VGGT-Ω 深度和相机平移都乘上它。
++      2. 置信度: DA3 的置信度缩到 VGGT-Ω 分辨率(最近邻), 下游门槛(CONF_MIN / OBJ_CONF)含义不变。
++         另外两边深度差 2 倍以上的像素置信度记 0 —— 兜住掩码漏掉的黑区残余(ithor312 上一个像素都不丢)。
++      3. 覆盖 cameras.json(位姿 + 内参 + input_hw)和 depth/*.npy; DA3 原件备份到 _da3_orig/。
++      4. 用新几何重跑坏帧筛选, 重拼 points.ply。
++    ★ DA3 的天空掩码没落盘, 这里拿不到; 室内靠置信度门槛(天空/黑区 = 1.0)兜住, 所以只给室内用。"""
++    import shutil
++    d = a.out
++    bk = f"{d}/_da3_orig"
++    meta = json.load(open(f"{d}/cameras.json"))
++    if meta.get("geom_backend") == "vggt_da3":
++        # 同一目录再跑一次: 当前那份已被换过, 从备份的 DA3 原件重来
++        meta = json.load(open(f"{bk}/cameras.json"))
++    else:
++        # da3_to_ply.py 刚写的原件: 每次都覆盖备份
++        if os.path.exists(bk):
++            shutil.rmtree(bk)
++        os.makedirs(bk)
++        json.dump(meta, open(f"{bk}/cameras.json", "w"), indent=2)
++        shutil.copytree(f"{d}/depth", f"{bk}/depth")
++    cams = meta["cameras"]
++    N, H, W = depth_v.shape
++
++    ratios, dconf, dsz = [], [], []
++    for i, n in enumerate(names):
++        s = Path(n).stem
++        da = np.load(f"{bk}/depth/{s}_depth.npy"); ca = np.load(f"{bk}/depth/{s}_conf.npy")
++        da = cv2.resize(da, (W, H), interpolation=cv2.INTER_LINEAR)
++        ca = cv2.resize(ca, (W, H), interpolation=cv2.INTER_NEAREST)
++        dsz.append(da); dconf.append(ca)
++        vd = depth_v[i]
++        m = (ca >= 2.0) & (conf_v[i] >= np.percentile(conf_v[i], 30)) & (da > 0) & (vd > 0) & np.isfinite(da) & np.isfinite(vd)
++        if m.sum() >= 1000:
++            ratios.append(float(np.median(da[m] / vd[m])))
++    if not ratios:
++        raise SystemExit("[混合] 没有一帧能对上尺度")
++    scale = float(np.median(ratios))
++    spread = float(np.std(ratios) / np.mean(ratios) * 100)
++    depth = depth_v * scale
++    w2c = w2c_v.copy(); w2c[:, :3, 3] *= scale
++    conf = np.stack(dconf).astype(np.float32)
++    r = np.stack(dsz) / np.maximum(depth, 1e-6)
++    disagree = ~((r > 0.5) & (r < 2.0))
++    conf[disagree] = 0.0
++    print(f"[混合] 尺度 ×{scale:.4f}(帧间浮动 {spread:.1f}%), 深度两边差 2 倍以上置 0: {disagree.mean()*100:.2f}% 像素")
++
++    for i, n in enumerate(names):
++        s = Path(n).stem
++        np.save(f"{d}/depth/{s}_depth.npy", depth[i].astype(np.float32))
++        np.save(f"{d}/depth/{s}_conf.npy", conf[i])
++        cams[n].update(extrinsic_w2c_4x4=w2c[i].tolist(), intrinsic_3x3=K_v[i].tolist(),
++                       camera_center_world=np.linalg.inv(w2c[i])[:3, 3].tolist(),
++                       input_hw=[int(H), int(W)], mean_conf=float(conf[i].mean()))
++    meta.update(geom_backend="vggt_da3", process_res=a.res,
++                pose_source="VGGT-Omega", depth_source="VGGT-Omega (scaled to DA3)",
++                conf_source="DA3 conf resized; 0 where DA3/VGGT depth differ >2x",
++                scale_to_da3=scale, scale_frame_spread_pct=round(spread, 1),
++                da3_backup="_da3_orig/ (cameras.json + depth/)")
++    meta["convention"] = "OpenCV; world = camera frame of first image; METRIC via DA3 depth; geometry from VGGT-Omega"
++    json.dump(meta, open(f"{d}/cameras.json", "w"), indent=2)
++
++    per = H * W
++    v, u = np.mgrid[0:H, 0:W]
++    valid = (depth.reshape(-1) > 0) & np.isfinite(depth).reshape(-1)
++    if a.conf_min is not None:
++        valid &= conf.reshape(-1) >= a.conf_min
++    else:
++        valid &= conf.reshape(-1) > 0
++    bad_idx = []
++    if a.no_pose_check:
++        if os.path.exists(f"{d}/bad_frames.json"):
++            os.remove(f"{d}/bad_frames.json")
++    else:
++        sys.path.insert(0, POSE_CHECK_DIR)
++        import pose_check
++        pc = pose_check.find_bad_frames(names, depth, w2c, K_v, **pose_check.PARAMS)
++        pose_check.write(d, pc, "vggt_omega_geom.py --pose-into: VGGT-Ω 几何 + DA3 置信度, 坏帧的点没进 points.ply")
++        bad_idx = [names.index(x) for x in pc["坏帧"]]
++        for i in bad_idx:
++            valid[i * per:(i + 1) * per] = False
++    pts = []
++    for i in range(N):
++        x = (u - K_v[i, 0, 2]) / K_v[i, 0, 0] * depth[i]
++        y = (v - K_v[i, 1, 2]) / K_v[i, 1, 1] * depth[i]
++        Xc = np.stack([x, y, depth[i]], -1).reshape(-1, 3)
++        c2w = np.linalg.inv(w2c[i])
++        pts.append((Xc @ c2w[:3, :3].T + c2w[:3, 3]).astype(np.float32))
++    pts = np.concatenate(pts)[valid]; cols = rgb_v.reshape(-1, 3)[valid]
++    if len(pts) > a.max_points:
++        sel = np.random.choice(len(pts), a.max_points, replace=False)
++        pts, cols = pts[sel], cols[sel]
++    write_ply(f"{d}/points.ply", pts, cols)
++    lo, hi = np.percentile(pts, 1, 0), np.percentile(pts, 99, 0)
++    cen = np.array([cams[n]["camera_center_world"] for n in names])
++    s = (f"\n== --pose-into: geometry replaced by VGGT-Omega (DA3 kept as conf mask + metric ruler) ==\n"
++         f"processed HxW: {H}x{W}\n"
++         f"scale to DA3: x{scale:.4f} (from {len(ratios)} frames, per-frame spread {spread:.1f}%); "
++         f"depth disagree >2x -> conf 0: {disagree.mean()*100:.2f}% px\n"
++         f"points: {len(pts)} (conf min {a.conf_min})\n"
++         f"scene bbox (1-99%) min {lo.round(3).tolist()} max {hi.round(3).tolist()} extent {(hi-lo).round(3).tolist()} m\n"
++         f"camera centers extent {(cen.max(0)-cen.min(0)).round(3).tolist()} m\n"
++         f"time: VGGT-Omega load {t_load:.1f}s, inference {t_inf:.2f}s, peak VRAM {peak:.2f} GB\n"
++         f"bad pose frames (not in points.ply): " + ("check disabled" if a.no_pose_check else f"{len(bad_idx)} {[names[i] for i in bad_idx]}") + "\n")
++    open(f"{d}/summary.txt", "a").write(s)
++    print(s)
++
++
++def save_infer(path, names, w2c, K, depth, conf_raw, rgb, t_load, t_inf, peak):
++    """--infer-only: 推理结果原样存盘(不压缩; 120 帧约 350 MB, 混合完就删)。先写临时文件再改名, 混合那步读不到写了一半的。"""
++    tmp = f"{path}.tmp.npz"
++    np.savez(tmp, names=np.array([str(n) for n in names]), w2c=w2c, K=K, depth=depth, conf_raw=conf_raw, rgb=rgb,
++             t_load=t_load, t_inf=t_inf, peak=peak)
++    os.replace(tmp, path)
++
++
++def load_infer(path, names):
++    """--pose-into --cache: 读提前算好的推理结果。帧列表必须和这次要用的一模一样(顺序也是) —— 多视角模型换一批帧
++    结果就不一样, 位姿又是按顺序对的。对不上、文件不在、读不出来, 一律返回 None, 调用方照老办法现算。"""
++    try:
++        z = np.load(path, allow_pickle=False)
++        if [str(x) for x in z["names"]] != [str(n) for n in names]:
++            return None
++        return dict(w2c=z["w2c"], K=z["K"], depth=z["depth"], conf_raw=z["conf_raw"], rgb=z["rgb"],
++                    t_load=float(z["t_load"]), t_inf=float(z["t_inf"]), peak=float(z["peak"]))
++    except Exception:
++        return None
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--images", required=True, help="帧目录")
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--max-frames", type=int, default=120, help="最多用多少帧(超过则均匀抽), 同 da3_to_ply.py")
++    ap.add_argument("--res", type=int, default=512, help="512 = 官方主权重; 416 = 复现论文用的权重, ithor312 上 512 更准")
++    ap.add_argument("--scale", default="metric3d_l", choices=["metric3d_l", "metric3d_g2", "none"],
++                    help="米制尺度从哪来。metric3d_l 在 ithor312 上误差 0.6%%, g2 是 2.2%%(一个场景的结果, 两个都留着做对照)")
++    ap.add_argument("--scale-frames", type=int, default=20, help="定尺度抽几帧。单帧浮动 ~20%%, 取中位数; 20 帧够稳")
++    ap.add_argument("--fx", type=float, default=None, help="已知焦距(原图像素)。给了就交给 Metric3D 用, 不给用 VGGT-Ω 估的")
++    ap.add_argument("--no-sky", action="store_true", help="不做天空分割(室内用)")
++    ap.add_argument("--conf-min", type=float, default=None, help="拼点云的置信度门槛, DA3 刻度(换算后), 同 da3_to_ply.py")
++    ap.add_argument("--conf-percentile", type=float, default=30.0, help="没给 --conf-min 时, 每帧丢最低的这个百分比")
++    ap.add_argument("--max-points", type=int, default=2_000_000)
++    ap.add_argument("--no-pose-check", action="store_true")
++    ap.add_argument("--seed", type=int, default=42)
++    ap.add_argument("--pose-into", action="store_true",
++                    help="混合模式: --out 是已经跑完的 DA3 目录, 位姿/深度/内参换成 VGGT-Ω 的, 置信度和米制尺度沿用 DA3(见 pose_into)。"
++                         "帧列表从那份 cameras.json 的 images_used 读, --max-frames/--scale/--fx/天空参数不起作用")
++    # ★ 2026-10-12 混合模式拆成两半, 让 VGGT-Ω 的推理能和 DA3 同时跑(各用一张卡):
++    #   推理只要图, 不依赖 DA3; 只有后面的"混合"(pose_into)才要 DA3 的结果。以前是 DA3 跑完才起这个脚本,
++    #   载模型 26 秒 + 推理 25 秒都排在 DA3 后面, office 的几何那一步 1 分 54 秒。流水线见 indoor_pipeline._da3_with_vggt。
++    ap.add_argument("--infer-only", action="store_true",
++                    help="只做 VGGT-Ω 推理, 结果存进 --cache 就退出(不碰 --out)。帧按 --max-frames 的规则取, 和 DA3 取的是同一批")
++    ap.add_argument("--cache", default="",
++                    help="--infer-only 往这里存; --pose-into 从这里读(帧列表和 DA3 用的对不上就不用它, 现算), 混合完删掉")
++    a = ap.parse_args()
++    if a.infer_only and (a.pose_into or not a.cache):
++        raise SystemExit("--infer-only 要配 --cache, 而且不能和 --pose-into 一起用")
++    np.random.seed(a.seed); torch.manual_seed(a.seed)
++    if not a.infer_only:
++        os.makedirs(f"{a.out}/depth", exist_ok=True)
++
++    # 1. 抽帧(和 da3_to_ply.py 同一个规则); 混合模式直接用 DA3 那份的帧列表, 保证一帧对一帧
++    names = sorted(p.name for p in Path(a.images).iterdir() if p.suffix.lower() in IMG_EXT)
++    if a.pose_into:
++        names = json.load(open(f"{a.out}/cameras.json"))["images_used"]
++    elif len(names) > a.max_frames:
++        idx = np.linspace(0, len(names) - 1, a.max_frames).round().astype(int)
++        names = [names[i] for i in idx]
++    if not names:
++        raise SystemExit("没有可用图片")
++    paths = [f"{a.images}/{n}" for n in names]
++    H0, W0 = cv2.imread(paths[0]).shape[:2]
++    # VGGT-Ω 的预处理会把宽高比超出 [0.5, 2] 的图居中裁掉一块, 那样深度图和原图就对不上了,
++    # 下游 "mask 缩放到深度图大小" 的做法会整体错位。正常视频(16:9 / 9:16)不会触发。
++    if not 0.5 <= H0 / W0 <= 2.0:
++        raise SystemExit(f"宽高比 {W0}x{H0} 超出 VGGT-Ω 不裁剪的范围 [0.5, 2], 下游 mask 会错位")
++    print(f"[info] 用 {len(names)} 帧, 原图 {W0}x{H0}")
++
++    # 2. VGGT-Ω 推理(混合模式下, 流水线可能已经让它和 DA3 同时算好存在 --cache 里了)
++    cached = load_infer(a.cache, names) if (a.pose_into and a.cache) else None
++    if cached is not None:
++        w2c, K, depth, conf_raw, rgb = (cached[k] for k in ("w2c", "K", "depth", "conf_raw", "rgb"))
++        t_load, t_inf, peak = cached["t_load"], cached["t_inf"], cached["peak"]
++        print(f"[VGGT-Ω] 推理结果读自 {a.cache}(和 DA3 同时算的), 不再算一遍")
++    else:
++        if a.pose_into and a.cache:
++            print(f"[VGGT-Ω] {a.cache} 用不上(不在, 或者帧列表和 DA3 用的不一样), 现算")
++        sys.path.insert(0, os.path.dirname(HERE))
++        from vggt_omega.models import VGGTOmega
++        from vggt_omega.utils.load_fn import load_and_preprocess_images
++        from vggt_omega.utils.pose_enc import encoding_to_camera
++        ckpt = {512: "vggt_omega_1b_512.pt", 416: "vggt_omega_1b_416_reproduce.pt"}[a.res]
++        t0 = time.time()
++        model = VGGTOmega().to("cuda").eval()
++        model.load_state_dict(torch.load(f"{WEIGHTS}/{ckpt}", map_location="cpu"))
++        t_load = time.time() - t0
++        imgs = load_and_preprocess_images(paths, image_resolution=a.res).to("cuda")
++        torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize(); t1 = time.time()
++        with torch.inference_mode():
++            pred = model(imgs)
++        torch.cuda.synchronize(); t_inf = time.time() - t1
++        peak = torch.cuda.max_memory_allocated() / 1e9
++        ext, K = encoding_to_camera(pred["pose_enc"], pred["images"].shape[-2:])
++        ext = ext[0].double().cpu().numpy()                                   # (N,3,4) w2c
++        K = K[0].double().cpu().numpy()                                       # (N,3,3), 对应处理分辨率
++        depth = pred["depth"][0].float().cpu().numpy().squeeze(-1)            # (N,H,W), 非米制
++        conf_raw = pred["depth_conf"][0].float().cpu().numpy()
++        rgb = (pred["images"][0].permute(0, 2, 3, 1).float().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
++        del model, pred, imgs
++        torch.cuda.empty_cache()                                              # 显存让给下一步的 Metric3D
++        w2c = np.tile(np.eye(4), (len(names), 1, 1)); w2c[:, :3] = ext
++    N, H, W = depth.shape
++    print(f"[VGGT-Ω] {N} 帧 {H}x{W}, 装载 {t_load:.1f}s 推理 {t_inf:.1f}s 显存 {peak:.1f}GB")
++
++    if a.infer_only:
++        save_infer(a.cache, names, w2c, K, depth, conf_raw, rgb, t_load, t_inf, peak)
++        print(f"[done] 推理结果 -> {a.cache}  (等 DA3 跑完, 用 --pose-into --cache 混合)")
++        return
++    if a.pose_into:
++        pose_into(a, names, w2c, K, depth, conf_raw, rgb, t_load, t_inf, peak)
++        if a.cache and os.path.exists(a.cache):
++            os.remove(a.cache)
++        return
++
++    # 3. 天空
++    t2 = time.time()
++    if a.no_sky:
++        sky = np.zeros((N, H, W), bool)
++    else:
++        sky = sky_masks(paths, (H, W))
++        os.makedirs(f"{a.out}/sky", exist_ok=True)
++        for n, s in zip(names, sky):
++            cv2.imwrite(f"{a.out}/sky/{Path(n).stem}.png", s.astype(np.uint8) * 255)
++    t_sky = time.time() - t2
++
++    # 4. 尺度: 先把深度落盘(Metric3D 那边要读), 定完倍数再覆盖
++    scale, scale_info = 1.0, None
++    if a.scale != "none":
++        sd = f"{a.out}/_scale"; os.makedirs(sd, exist_ok=True)
++        pick = np.unique(np.linspace(0, N - 1, min(a.scale_frames, N)).round().astype(int))
++        frames = []
++        for i in pick:
++            ok = ~sky[i] & (conf_raw[i] >= np.percentile(conf_raw[i], 30))   # 只比非天空、置信度前 70% 的像素
++            np.save(f"{sd}/{i:04d}_depth.npy", depth[i]); np.save(f"{sd}/{i:04d}_valid.npy", ok)
++            fx0 = a.fx if a.fx else float(K[i, 0, 0]) * W0 / W              # 换算到原图像素
++            frames.append(dict(image=paths[i], fx=fx0, depth=f"{sd}/{i:04d}_depth.npy", valid=f"{sd}/{i:04d}_valid.npy"))
++        job = dict(model=a.scale, out=f"{sd}/result.json", frames=frames)
++        json.dump(job, open(f"{sd}/job.json", "w"), indent=1)
++        r = subprocess.run([METRIC_PY, f"{HERE}/metric3d_scale.py", f"{sd}/job.json"])
++        if r.returncode:
++            raise SystemExit(f"[尺度] metric3d_scale.py 失败, 退出码 {r.returncode}")
++        for i in pick:                                                    # 临时文件只在定尺度时有用
++            os.remove(f"{sd}/{i:04d}_depth.npy"); os.remove(f"{sd}/{i:04d}_valid.npy")
++        scale_info = json.load(open(f"{sd}/result.json"))
++        scale = scale_info["scale"]
++        depth *= scale
++        w2c[:, :3, 3] *= scale          # 世界整体放大: 旋转不变, 平移同乘
++
++    # 5. 置信度换算
++    conf = to_da3_conf(conf_raw, sky)
++    for i, n in enumerate(names):
++        np.save(f"{a.out}/depth/{Path(n).stem}_depth.npy", depth[i].astype(np.float32))
++        np.save(f"{a.out}/depth/{Path(n).stem}_conf.npy", conf[i])
++
++    # 6. 坏帧 + 点云
++    per = H * W
++    v, u = np.mgrid[0:H, 0:W]
++    valid = np.isfinite(depth).reshape(-1) & (depth.reshape(-1) > 0) & ~sky.reshape(-1)
++    cf = conf.reshape(-1)
++    if a.conf_min is not None:
++        valid &= cf >= a.conf_min
++    elif a.conf_percentile > 0:
++        for i in range(N):
++            sl = slice(i * per, (i + 1) * per)
++            if valid[sl].any():
++                valid[sl] &= cf[sl] >= np.percentile(cf[sl][valid[sl]], a.conf_percentile)
++    bad_path = f"{a.out}/bad_frames.json"
++    bad_idx = []
++    if a.no_pose_check:
++        if os.path.exists(bad_path):
++            os.remove(bad_path)
++    else:
++        sys.path.insert(0, POSE_CHECK_DIR)
++        import pose_check
++        pc = pose_check.find_bad_frames(names, depth, w2c, K, **pose_check.PARAMS)
++        pose_check.write(a.out, pc, "vggt_omega_geom.py 推理后当场筛, 坏帧的点没进 points.ply")
++        bad_idx = [names.index(x) for x in pc["坏帧"]]
++        for i in bad_idx:
++            valid[i * per:(i + 1) * per] = False
++        print(f"[坏位姿] {len(bad_idx)}/{N} 帧: {pc['坏帧']}")
++    pts = []
++    for i in range(N):
++        x = (u - K[i, 0, 2]) / K[i, 0, 0] * depth[i]
++        y = (v - K[i, 1, 2]) / K[i, 1, 1] * depth[i]
++        Xc = np.stack([x, y, depth[i]], -1).reshape(-1, 3)
++        c2w = np.linalg.inv(w2c[i])
++        pts.append((Xc @ c2w[:3, :3].T + c2w[:3, 3]).astype(np.float32))
++    pts = np.concatenate(pts)[valid]
++    cols = rgb.reshape(-1, 3)[valid]
++    if len(pts) > a.max_points:
++        sel = np.random.choice(len(pts), a.max_points, replace=False)
++        pts, cols = pts[sel], cols[sel]
++    write_ply(f"{a.out}/points.ply", pts, cols)
++
++    cams = {}
++    for i, n in enumerate(names):
++        cams[n] = dict(extrinsic_w2c_4x4=w2c[i].tolist(), intrinsic_3x3=K[i].tolist(),
++                       camera_center_world=np.linalg.inv(w2c[i])[:3, 3].tolist(), input_hw=[int(H), int(W)],
++                       mean_conf=float(conf[i].mean()))
++    json.dump(dict(
++        convention="OpenCV (x right, y down, z forward); world = camera frame of first image; "
++                   + ("METRIC via " + a.scale if a.scale != "none" else "NOT metric (raw VGGT-Omega scale)"),
++        geom_backend="vggt_omega", model=ckpt, process_res=a.res,
++        is_metric=int(a.scale != "none"), scale_factor=scale, scale_source=a.scale,
++        given_fx=a.fx, sky_mask=not a.no_sky, conf="VGGT-Omega conf rank-mapped to DA3 scale (da3_conf_ref.json); sky = 0",
++        source=a.images, images_used=names, images_skipped=[], cameras=cams),
++        open(f"{a.out}/cameras.json", "w"), indent=2)
++
++    lo, hi = np.percentile(pts, 1, 0), np.percentile(pts, 99, 0)
++    cen = np.array([cams[n]["camera_center_world"] for n in names])
++    s = (f"frames: {N} (skipped 0)\nprocessed HxW: {H}x{W}\n"
++         f"points: {len(pts)} (conf filter: " + (f"min {a.conf_min}" if a.conf_min is not None else f"percentile {a.conf_percentile} per-frame") + ")\n"
++         f"backend: VGGT-Omega {ckpt}; scale {a.scale} x{scale:.4f}"
++         + (f" (from {scale_info['frames_used']} frames, per-frame spread {scale_info['per_frame_spread_pct']}%)" if scale_info else "") + "\n"
++         f"scene bbox (1-99%) min {lo.round(3).tolist()} max {hi.round(3).tolist()} extent {(hi-lo).round(3).tolist()} m\n"
++         f"camera centers extent {(cen.max(0)-cen.min(0)).round(3).tolist()} m\n"
++         f"time: model load {t_load:.1f}s, inference {t_inf:.2f}s, peak VRAM {peak:.2f} GB; sky {t_sky:.1f}s"
++         + (f"; metric3d load {scale_info['load_s']}s infer {scale_info['infer_s']}s VRAM {scale_info['peak_vram_GB']} GB" if scale_info else "") + "\n"
++         f"bad pose frames (not in points.ply): " + ("check disabled" if a.no_pose_check else f"{len(bad_idx)} {[names[i] for i in bad_idx]}") + "\n")
++    s += "per-frame: name  kept%  sky%  median_depth_m\n" + "".join(
++        f"  {n}  {valid[i*per:(i+1)*per].mean()*100:5.1f}%  {sky[i].mean()*100:5.1f}%  {np.median(depth[i]):5.2f}\n"
++        for i, n in enumerate(names))
++    open(f"{a.out}/summary.txt", "w").write(s)
++    print(s.split("per-frame")[0])
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/vggt_omega_to_da3fmt.py b/tools/vggt_omega_to_da3fmt.py
+new file mode 100644
+index 0000000..46ef5c0
+--- /dev/null
++++ b/tools/vggt_omega_to_da3fmt.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python
++"""VGGT-Ω 推理, 结果按 DA3 的目录格式落盘(cameras.json + depth/*_depth.npy, *_conf.npy),
++让现成的对比脚本和坏帧筛选(pose_check.py)不改就能用。
++  python vggt_omega_to_da3fmt.py --images 帧目录 --out 输出目录 --ckpt 权重 --res 512 [--names 0000.jpg ...]
++"""
++import argparse, glob, json, os, time
++import numpy as np, torch
++from vggt_omega.models import VGGTOmega
++from vggt_omega.utils.load_fn import load_and_preprocess_images
++from vggt_omega.utils.pose_enc import encoding_to_camera
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--images", required=True); ap.add_argument("--out", required=True)
++ap.add_argument("--ckpt", required=True); ap.add_argument("--res", type=int, default=512)
++ap.add_argument("--names", nargs="*", default=None)
++a = ap.parse_args()
++names = a.names or sorted(os.path.basename(p) for p in glob.glob(f"{a.images}/*.jpg"))
++paths = [f"{a.images}/{n}" for n in names]
++os.makedirs(f"{a.out}/depth", exist_ok=True)
++
++t0 = time.time()
++model = VGGTOmega().to("cuda").eval()
++model.load_state_dict(torch.load(a.ckpt, map_location="cpu"))
++t_load = time.time() - t0
++imgs = load_and_preprocess_images(paths, image_resolution=a.res).to("cuda")
++torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize(); t1 = time.time()
++with torch.inference_mode():
++    pred = model(imgs)
++torch.cuda.synchronize(); t_inf = time.time() - t1
++ext, K = encoding_to_camera(pred["pose_enc"], pred["images"].shape[-2:])
++ext, K = ext[0].float().cpu().numpy(), K[0].float().cpu().numpy()
++dep = pred["depth"][0].float().cpu().numpy().squeeze(-1)
++conf = pred["depth_conf"][0].float().cpu().numpy()
++H, W = dep.shape[1:]
++cams = {}
++for i, n in enumerate(names):
++    w2c = np.eye(4); w2c[:3] = ext[i]
++    np.save(f"{a.out}/depth/{n[:-4]}_depth.npy", dep[i].astype(np.float32))
++    np.save(f"{a.out}/depth/{n[:-4]}_conf.npy", conf[i].astype(np.float32))
++    cams[n] = dict(extrinsic_w2c_4x4=w2c.tolist(), intrinsic_3x3=K[i].tolist(),
++                   camera_center_world=np.linalg.inv(w2c)[:3, 3].tolist(), input_hw=[H, W],
++                   mean_conf=float(conf[i].mean()))
++json.dump(dict(convention="OpenCV w2c; world = camera frame of first image; scale NOT guaranteed metric",
++               model=os.path.basename(a.ckpt), process_res=a.res, source=a.images, cameras=cams),
++          open(f"{a.out}/cameras.json", "w"), indent=1)
++open(f"{a.out}/summary.txt", "w").write(
++    f"frames: {len(names)}\nprocessed HxW: {H}x{W}\n"
++    f"time: model load {t_load:.1f}s, inference {t_inf:.2f}s, peak VRAM {torch.cuda.max_memory_allocated()/1e9:.2f} GB\n"
++    f"depth range {dep.min():.3f}..{dep.max():.3f}, median {np.median(dep):.3f}\n")
++print(open(f"{a.out}/summary.txt").read())

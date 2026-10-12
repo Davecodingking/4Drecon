@@ -116,6 +116,17 @@ def gpu_pool():
     return [r[0] for r in _smi("index")]
 
 
+_PINNED_FROM = []       # 主循环替一步领卡(GpuSlot set_env=True)时, 领之前的卡池。只有主循环这么领, 不涉及多线程
+
+
+def outer_pool():
+    """这一步之外的卡池。主循环替一步领卡时会把 CUDA_VISIBLE_DEVICES 钉成那一张, 之后 gpu_pool() 只看得到它自己;
+    步骤内部还想另领一张卡和自己那张同时用(室内几何: DA3 和 VGGT-Ω 同时跑), 要看领卡之前的池。
+    不在这种步骤里 = gpu_pool()。人从外面钉的卡(CUDA_VISIBLE_DEVICES=3 drive_go.sh ...)照样算数: 那时领卡之前的池就只有它。
+    ★ 2026-10-12 office r14: 不知道这一层, "还有没有空卡"永远答没有, 悄悄退回一前一后, 一秒没省。"""
+    return list(_PINNED_FROM[-1]) if _PINNED_FROM else gpu_pool()
+
+
 def card_busy(card, need_mb=0):
     """这张卡现在不能用: 有别人的进程占着显存(超过 FOREIGN_MB), 或者余量不够 need_mb。
     ★ 只看瞬时余量不够, 理由见 wait_gpu: 别人的活有空档期, 骗得过余量检查。"""
@@ -228,6 +239,7 @@ class GpuSlot:
         self.waited = time.time() - t0
         if self.set_env:
             self._old = {k: os.environ.get(k) for k in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER")}
+            _PINNED_FROM.append(list(pool))                     # 钉之前的池留一份, 见 outer_pool
             os.environ["CUDA_VISIBLE_DEVICES"] = str(self.card)
             os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # nvidia-smi 的编号才和 CUDA 一致
         if self.run_dir:
@@ -248,6 +260,7 @@ class GpuSlot:
             except OSError:
                 pass
         if self._old is not None:
+            _PINNED_FROM.pop()
             for k, v in self._old.items():
                 if v is None:
                     os.environ.pop(k, None)

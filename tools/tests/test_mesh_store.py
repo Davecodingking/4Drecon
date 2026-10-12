@@ -321,6 +321,7 @@ ids = [int(x) for x in a.ids.split(",") if x] or json.load(open(f"{a.dir}/picked
 open(f"{a.dir}/calls.txt", "a").write(",".join(map(str, ids)) + "\n")
 if int(os.environ.get("FAIL_ALWAYS", "-1")) in ids:
     sys.exit(1)
+import time; time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))     # 要看"几份同时占着卡"的测试让它慢一点
 card = os.environ.get("CUDA_VISIBLE_DEVICES")
 n = len(open(f"{a.dir}/calls.txt").read().split())
 rel = {o: i + 1 for i, o in enumerate(ids)}
@@ -345,7 +346,7 @@ def _mesh_setup(**env):
     import _common as C, body4d_pipeline as B
     T = tempfile.mkdtemp()
     keep = {k: os.environ.get(k) for k in ("BODY_OUT", "GPU_POOL", "RUN_DIR", "OCC", "PARALLEL", "FAIL_ALWAYS",
-                                           "CUDA_VISIBLE_DEVICES", "SCENE_R1", "MAX_GPUS", "FANOUT")}
+                                           "CUDA_VISIBLE_DEVICES", "SCENE_R1", "MAX_GPUS", "FANOUT", "FAKE_SLEEP")}
     for k in keep:
         os.environ.pop(k, None)
     os.environ.update(dict(BODY_OUT=f"{T}/body4d", GPU_POOL="t71,t72,t73", FANOUT="1"), **env)
@@ -387,7 +388,9 @@ def _calls(c, clear=True):
 
 
 def test_s_mesh_splits_people_over_cards_and_names_dirs_by_tracking_id():
-    B, c, undo = _mesh_setup()
+    # 假脚本每份停 0.4 秒: 三份是同时占着卡的(真的出网格一份要一两分钟)。不停的话一份瞬间还了卡, 下一份可能领到
+    # 同一张, "三张卡都用上了"就成了碰运气 —— test_fanout 里同样写法的断言 10 次里挂过 4 次。
+    B, c, undo = _mesh_setup(FAKE_SLEEP="0.4")
     try:
         B.s_mesh(c, False)
         who = _who(c)

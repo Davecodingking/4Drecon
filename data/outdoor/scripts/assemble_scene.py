@@ -25,8 +25,10 @@ UP, _GH, _FB = load_up(f"{ROOT}/02_da3", "组装")
 #   "太薄"扔掉 —— 上一轮那句"[跳过] 12 个尺寸不合理"大半是这么来的。
 #   反过来校准后世界放大了, MAX_D 才第一次有能力误杀。
 #   守卫本身没错, 错在它不知道自己站在校准过还是没校准的世界里。所以这里先去问一句。
-MIN_H = float(os.environ.get("MIN_H", "0.15"))    # 比这薄就当量错了
-MAX_D = float(os.environ.get("MAX_D", "15"))      # 比这大就当量错了
+# ★ 2026-10-12 这两个数和下面的去重规则搬到 box_guards.py: 逐实例生成那步(gen_per_instance.py)要在生成之前先问一遍
+#   "这个盒子组装时会不会被扔", 两边必须是同一份规则、同一个门槛。以前只写在这里, 47 个物体里 8 个生成完才被扔。
+import box_guards
+MIN_H, MAX_D = box_guards.MIN_H, box_guards.MAX_D     # 比 MIN_H 薄 / 比 MAX_D 大就当量错了
 _cj = f"{ROOT}/02_da3/cameras.json"
 _k = None
 if os.path.exists(_cj):
@@ -214,10 +216,11 @@ if FLOOR_EXTEND and REST_P and os.path.exists(REST_P):
         return c, a, np.cross(UP, a), b["尺寸"][0]/2, b["尺寸"][1]/2
     _all = [(w, b) for w, bs in boxes.items() if not (w in EXCLUDE or base_word(w) in EXCLUDE) for b in bs]
     # 人工改判成"挂着的"(HUNG_LABELS)压过 VLM: 垂到地面的灯管 VLM 会判成落地灯
-    _HUNG = {x.strip().replace("_", " ") for x in os.environ.get("HUNG_LABELS", "").split(",") if x.strip()}
+    _HUNG = box_guards.hung_labels()
     _ext, _no = [], []
     for w, b in _all:
-        if _look(_REST, w) != "floor" or w in _HUNG or base_word(w) in _HUNG: continue
+        # ★ 哪些词算"立在地上"在 box_guards 里: 逐实例生成那步要用同一个判法决定"这个盒子量到的高度算不算数"
+        if not box_guards.rests_on_floor(w, _REST, _HUNG): continue
         bot = _bot(b); top = bot + b["尺寸"][2]; gap = bot - best_h
         if gap <= EXT_MIN: continue
         c0 = np.array(b["中心"], float); on = None
@@ -261,47 +264,25 @@ if FLOOR_EXTEND and REST_P and os.path.exists(REST_P):
 #   人也算证据(BODY_RUN, 给了才用): 深度图里那一点拍到的是人(body4d 的人物抠图), 说明人站在那,
 #   家具就不可能在那 —— 算"看穿"。不这么做的话, 人站在桌前的那一片恰好全是"看到表面", 人越贴着
 #   桌子站, 那张桌子越缩不回去(office table_7: 超出的那片 604 个点只有 84 个被看穿)。
-FIT_WORDS = {x.strip().replace("_", " ") for x in os.environ.get(
-    "FIT_WORDS", "desk,table,dining table,side table,coffee table,counter,cabinet,file cabinet,"
-                 "shelf,shelf unit,bookcase,credenza").split(",") if x.strip()}
-_fit_word = lambda w: w in FIT_WORDS or base_word(w) in FIT_WORDS
-DEDUP_BOX = os.environ.get("DEDUP_BOX", "0") == "1"
+FIT_WORDS = box_guards.FIT_WORDS
+_fit_word = box_guards.fit_word
+DEDUP_BOX = box_guards.DEDUP_BOX
 FREE_TRIM = os.environ.get("FREE_TRIM", "0") == "1"
-DUP_OVERLAP = float(os.environ.get("DUP_OVERLAP", "0.5"))
-DUP_DH = float(os.environ.get("DUP_DH", "0.12"))
+DUP_OVERLAP, DUP_DH = box_guards.DUP_OVERLAP, box_guards.DUP_DH
 TRIM_OVER = 0.05      # mesh 超出盒子边这么多以上才看
 TRIM_EMPTY = 0.6      # 那一片里被看穿的点占有观测的点的比例
 TRIM_MIN_OBS = 30     # 有观测的点至少这么多才下结论
 TRIM_KEEP = 0.02      # 缩到盒子边外 2cm
 TRIM_MIN_W = 0.35     # 缩完不能窄过这个
-def _box_rc(b):
-    c = np.array(b["中心"], float); a = np.array(b["长轴"], float); a = a - UP*(a @ UP)
-    a /= max(np.linalg.norm(a), 1e-9)
-    return c, a, np.cross(UP, a), b["尺寸"][0]/2, b["尺寸"][1]/2
-def _box_top(b):
-    return (float(b["底高"]) if "底高" in b else float(np.array(b["中心"]) @ UP - b["尺寸"][2]/2)) + b["尺寸"][2]
+def _box_rc(b): return box_guards.box_rc(b, UP)
+def _box_top(b): return box_guards.box_top(b, UP)
 def _in_share(b1, b2):
     """b1 的水平矩形有多大比例落在 b2 里 (24x24 网格采样)。"""
-    c1, a1, s1, h1, k1 = _box_rc(b1); c2, a2, s2, h2, k2 = _box_rc(b2)
-    g = (np.arange(24) + 0.5)/24*2 - 1
-    U_, V_ = np.meshgrid(g*h1, g*k1); q = c1 + U_.ravel()[:, None]*a1 + V_.ravel()[:, None]*s1 - c2
-    return float(((np.abs(q @ a2) <= h2) & (np.abs(q @ s2) <= k2)).mean())
-_DUP = {}
-if DEDUP_BOX:
-    for w, bs in boxes.items():
-        if not _fit_word(w) or w in EXCLUDE or base_word(w) in EXCLUDE: continue
-        order = sorted(bs, key=lambda b: -(b.get("点数") or 0))
-        for i, bi in enumerate(order):
-            if (w, bi["obj_id"]) in _DUP: continue
-            for bj in order[i+1:]:
-                if (w, bj["obj_id"]) in _DUP or abs(_box_top(bi) - _box_top(bj)) > DUP_DH: continue
-                small, big = (bj, bi) if bj["尺寸"][0]*bj["尺寸"][1] <= bi["尺寸"][0]*bi["尺寸"][1] else (bi, bj)
-                ov = _in_share(small, big)
-                if ov >= DUP_OVERLAP:
-                    _DUP[(w, bj["obj_id"])] = (f"{w}#{bi['obj_id']}", ov)
-    if _DUP:
-        print(f"[去重] {len(_DUP)} 个盒子和同类另一个是同一件(水平重叠 >= {DUP_OVERLAP:.0%}, 顶面高差 <= {DUP_DH:.2f} m), 留点数多的: "
-              + "; ".join(f"{w}#{i} 并进 {k} (重叠 {ov:.0%})" for (w, i), (k, ov) in _DUP.items()))
+    return box_guards.in_share(b1, b2, UP)
+_DUP = box_guards.dup_boxes(boxes, UP, EXCLUDE)       # {(词, 实例号): (留下的那个, 重叠比例)}; DEDUP_BOX 关着就是空的
+if _DUP:
+    print(f"[去重] {len(_DUP)} 个盒子和同类另一个是同一件(水平重叠 >= {DUP_OVERLAP:.0%}, 顶面高差 <= {DUP_DH:.2f} m), 留点数多的: "
+          + "; ".join(f"{w}#{i} 并进 {k} (重叠 {ov:.0%})" for (w, i), (k, ov) in _DUP.items()))
 _FS = None
 def _people_masks():
     """{相机帧名: 人物抠图的路径}。body4d 和场景用的是同一套帧: 相机帧名 -> 原视频帧号(02_da3/frame_map.json)
@@ -530,7 +511,7 @@ REL_MIN_N = int(os.environ.get("REL_MIN_N", "4"))   # 类内实例数不到这�
 #   2.89/3.35/3.98/4.01 这四根**唯一符合常识**的路灯, 12.63 那根倒留下了。方向整个是反的。
 #   剔掉垃圾之后中位变成 5.05 m, 拦的对象立刻翻转 —— 一行之差, 结论相反。
 def _abs_ok(b):
-    e=np.array(b["尺寸"]); return not (e[2]<MIN_H or e.max()>MAX_D)
+    return box_guards.abs_ok(b["尺寸"])
 # ★ 只收 ext[2]>=0.2 的盒子进中位数。ruler 会按这个界在"最长边"和"高度"之间切换,
 #   而绝对守卫的下限是 MIN_H=0.15 —— 高度落在 [0.15,0.20) 的盒子会过绝对守卫却贡献最长边,
 #   和贡献高度的盒子混进同一个统计量, 两个量纲搅在一起。扁的那批也不判(它们本来就该被
@@ -597,6 +578,11 @@ for w,bs in boxes.items():
         _vetoed = b["obj_id"] in VLM_REJ.get(w, ())
         if _vetoed and _gen_name(w, b["obj_id"]) not in VLM_REL:
             skipped.append((w,b["obj_id"],[],"VLM否决(人没放行)")); continue
+        # ★ 绝对守卫只看盒子, 所以排在找 mesh 之前(2026-10-12 提上来的): 过不了它的盒子, 逐实例生成那步已经不生成了
+        #   (gen_per_instance.py 用同一条规则先筛), 排在后面的话它们的原因会变成"没有 mesh", 查"为什么没进场景"时被带偏。
+        ext=np.array(b["尺寸"])
+        if not box_guards.abs_ok(ext):
+            skipped.append((w,b["obj_id"],ext.round(2).tolist(),"绝对")); continue
         mk=pick_mesh(w, b["obj_id"])
         if mk is None:
             # ★ 以前这里一声不吭地 continue, 跳过名单里没有它, 查"为什么没进场景"时查不到。
@@ -609,9 +595,6 @@ for w,bs in boxes.items():
         #   be_r2_w_0 摆出来: 名义上的名字不在名单里, 被否掉的东西照样出现在场景里。
         if mk in SKIP_NAMES:
             skipped.append((w,b["obj_id"],[],"人工否掉(借的是被否的mesh)")); continue
-        ext=np.array(b["尺寸"])
-        if ext[2]<MIN_H or ext.max()>MAX_D:
-            skipped.append((w,b["obj_id"],ext.round(2).tolist(),"绝对")); continue
         # ---- 类内相对守卫 ----
         # ★ 只守**盒子决定尺寸**的那条路: 专属 mesh 和逐实例词走下面的 one_scale(ext, me),
         #   盒子量错多少, 摆出来就大多少倍 —— 12 米的垃圾桶就是这么来的。

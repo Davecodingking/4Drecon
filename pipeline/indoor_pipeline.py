@@ -68,14 +68,14 @@
     data/test_noblur*, 是模块级常量没有 flag。这条 pipeline 暂时不接墙。
 
 """
-import os, sys, json, glob, csv, argparse, subprocess, shlex, time
+import os, sys, json, glob, csv, argparse, subprocess, shlex, threading, time
 
 # ★ 驱动层的公共件搬到 _common.py 了(见那个文件的文件头): GPU 锁、跑命令、配置解析、
 #   计时、帧号映射。留在本文件里的是室内真正独有的部分。
 #   sh 用偏函数固定住 GPUENV —— 室内所有命令都要带 CUDA_HOME 那一套, 室外不带。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import functools as _ft
-from _common import (GpuSlot, wait_gpu, envcmd, stamp_path,
+from _common import (GpuSlot, wait_gpu, envcmd, stamp_path, parallel_on,
                      timing as _timing, resolve_cfg as _resolve_cfg,
                      write_frame_map, load_frame_map)
 import people_decisions           # 挑人闸的决策文件 + BODY_RUN 自动指向, 室内外共用
@@ -459,23 +459,72 @@ print("[done]", len(fs), "帧 gamma", g)
 '''
     sh([PY["sam3d"], "-c", code], f"{c.LOG}/01_bright.log", dry)
 
+VGGT_GEOM = f"{SAM3D}/vggt-omega/tools/vggt_omega_geom.py"
+VGGT_NEED = 20000          # VGGT-Ω 推理显存峰值 16 G(120 帧 384x688), 领卡时要的余量(MB)
+
 def _geom_vggt(c, dry, frames, out, max_frames, conf_min, extra):
     """GEOM = vggt_l / vggt_g2 时两条链共用的 VGGT-Ω 调用(深度和位姿全用 VGGT-Ω), 参数和
     da3_to_ply.py 那边一一对应。--no-sky: 室内没有天空, 外挂的天空分割只会误伤白天花板。
     ★ 室内不推荐: cyberpunk 黑区出几百米假深度, 见 CFG 里 GEOM 的注释。"""
     scale = {"vggt_l": "metric3d_l", "vggt_g2": "metric3d_g2"}[c.cfg["GEOM"]]
-    sh([PY["vggt_omega"], f"{SAM3D}/vggt-omega/tools/vggt_omega_geom.py", "--images", frames, "--out", out,
+    sh([PY["vggt_omega"], VGGT_GEOM, "--images", frames, "--out", out,
         "--max-frames", max_frames, "--scale", scale, "--no-sky",
         "--conf-min", conf_min, "--max-points", c.cfg["MAX_POINTS"], *extra],
        f"{c.LOG}/02_da3.log", dry)
 
-def _geom_pose_swap(c, dry, frames, out, conf_min):
+def _geom_pose_swap(c, dry, frames, out, conf_min, cache=None):
     """GEOM = vggt_da3(室内默认): DA3 已经把 out 写好之后调用, 位姿/深度/内参换成 VGGT-Ω 的,
     置信度和米制尺度沿用 DA3。帧列表读 out/cameras.json, 保证一帧对一帧。
-    DA3 原件(cameras.json + depth/)备份在 out/_da3_orig/。原理见 vggt_omega_geom.py 的 pose_into()。"""
-    sh([PY["vggt_omega"], f"{SAM3D}/vggt-omega/tools/vggt_omega_geom.py", "--images", frames, "--out", out,
-        "--pose-into", "--conf-min", conf_min, "--max-points", c.cfg["MAX_POINTS"]],
+    DA3 原件(cameras.json + depth/)备份在 out/_da3_orig/。原理见 vggt_omega_geom.py 的 pose_into()。
+    cache: VGGT-Ω 的推理结果已经提前算好存在这里(见 _da3_with_vggt), 直接读; 没给就在这一步现算。"""
+    sh([PY["vggt_omega"], VGGT_GEOM, "--images", frames, "--out", out,
+        "--pose-into", "--conf-min", conf_min, "--max-points", c.cfg["MAX_POINTS"]]
+       + (["--cache", cache] if cache else []),
        f"{c.LOG}/02_da3.log", dry)
+
+def _da3_with_vggt(c, dry, da3_cmd, frames, out, n, conf_min):
+    """GEOM = vggt_da3 的整段: 跑 DA3(da3_cmd, 写进 out) + VGGT-Ω 推理 + 把两边混合。n: 最多用几帧(和 DA3 的一样)。
+    ★ 2026-10-12 两个模型同时跑。VGGT-Ω 的推理只要图, 不依赖 DA3; 只有最后的"混合"(形状用 VGGT-Ω 的, 米数和置信度
+      用 DA3 的)才要 DA3 的结果。以前是一张卡上一前一后: DA3 约 50 秒, 跑完才起 VGGT-Ω(载模型 26 秒 + 推理 25 秒),
+      office 这一步 1 分 54 秒, 而这时另外几张卡是空的。现在有第二张空卡就让 VGGT-Ω 在那张卡上和 DA3 同时推理,
+      结果存进 logs/_vggt_infer.npz, 混合时直接读。
+    ★ 提前推理是为了快, 不是必须: 没有空卡 / PARALLEL=0 / 它没跑成 / DA3 跳了帧(帧列表对不上) —— 都退回老办法,
+      混合那步自己现算, 结果一样。"""
+    log, cache = f"{c.LOG}/02_da3.log", f"{c.LOG}/_vggt_infer.npz"
+    infer = [PY["vggt_omega"], VGGT_GEOM, "--images", frames, "--out", out, "--max-frames", str(n),
+             "--infer-only", "--cache", cache]
+    if dry:                                      # 干跑不知道到时候有没有空卡: 打印"同时跑"的那三条
+        sh(da3_cmd, log, dry, cwd=DA3REPO); sh(infer, log, dry)
+        return _geom_pose_swap(c, dry, frames, out, conf_min, cache)
+    if os.path.exists(cache):
+        os.remove(cache)                         # 上一次留下的(混合之前失败了): 不知道是哪批帧算的, 不用
+    err, t = [], None
+    # ★ 卡池要看"这一步之外"的: 主循环替 da3 领卡时把 CUDA_VISIBLE_DEVICES 钉成了那一张, 默认的卡池只剩它自己
+    pool = _cm.outer_pool()
+
+    def _infer():
+        try:
+            with GpuSlot("da3/vggt", VGGT_NEED, set_env=False, pool=pool) as slot:
+                _sh(infer, log=log, env=dict(GPUENV, CUDA_VISIBLE_DEVICES=slot.card, CUDA_DEVICE_ORDER="PCI_BUS_ID"))
+        except (Exception, SystemExit) as e:
+            err.append(e)
+
+    if parallel_on() and _cm.gpus_free_now(VGGT_NEED, pool=pool) >= 1:
+        print("    [几何] DA3 和 VGGT-Ω 推理同时跑(各一张卡), 都完了再混合", flush=True)
+        t = threading.Thread(target=_infer); t.start()
+    try:
+        sh(da3_cmd, log, dry, cwd=DA3REPO)
+    finally:
+        if t is not None:
+            t.join()
+    ok = t is not None and not err and os.path.exists(cache)
+    if t is not None and not ok:
+        print(f"    [几何] VGGT-Ω 提前推理没成({err[0] if err else '没有结果文件'}), 混合那步现算", flush=True)
+    try:
+        _geom_pose_swap(c, dry, frames, out, conf_min, cache if ok else None)
+    finally:
+        if os.path.exists(cache):                # 几百兆; 混合脚本读完自己会删, 这里兜底(它没读 / 中途失败)
+            os.remove(cache)
 
 def _frame_map(c, dry, frames_dir, out):
     """在 cameras.json 旁边写一份"帧 -> 原视频帧号 + fps"。两条链同一个路径、同一份格式,
@@ -514,9 +563,10 @@ def s_da3(c, dry):
             fx = float(c.cfg["FX"])
             json.dump(dict(fx=fx, fy=fx, cx=W / 2, cy=H / 2), open(k, "w"))
         cmd += ["--intrinsics-json", k]
-    sh(cmd, f"{c.LOG}/02_da3.log", dry, cwd=DA3REPO)
     if c.cfg["GEOM"] == "vggt_da3":     # 俯视图要画换过位姿的点云, 所以排在它前面
-        _geom_pose_swap(c, dry, c.FRB, f"{c.R1}/02_DA3点云", c.cfg["CONF_MIN"])
+        _da3_with_vggt(c, dry, cmd, c.FRB, f"{c.R1}/02_DA3点云", c.cfg["MAX_FRAMES"], c.cfg["CONF_MIN"])
+    else:
+        sh(cmd, f"{c.LOG}/02_da3.log", dry, cwd=DA3REPO)
     sh([PY["spatiallm"], "topview_da3.py", "--pred", f"{c.R1}/02_DA3点云",
         "--out", f"{c.R1}/02_DA3点云_俯视.png"], f"{c.LOG}/02_da3.log", dry, cwd=DA3REPO)
     _frame_map(c, dry, c.FRB, f"{c.R1}/02_DA3点云")
@@ -748,12 +798,13 @@ def o_da3(c, dry):
         _geom_vggt(c, dry, c.FRO, f"{c.R1}/02_da3", str(n), c.cfg["OBJ_CONF"],
                    ["--fx", c.cfg["FX"]] if c.cfg["FX"] else [])
         _frame_map(c, dry, c.FRO, f"{c.R1}/02_da3"); return
-    sh([PY["spatiallm"], "da3_to_ply.py", "--images", c.FRO, "--out", f"{c.R1}/02_da3",
-        "--max-frames", str(n), "--use-ray-pose",
-        "--conf-min", c.cfg["OBJ_CONF"], "--max-points", c.cfg["MAX_POINTS"]],
-       f"{c.LOG}/02_da3.log", dry, cwd=DA3REPO)
+    cmd = [PY["spatiallm"], "da3_to_ply.py", "--images", c.FRO, "--out", f"{c.R1}/02_da3",
+           "--max-frames", str(n), "--use-ray-pose",
+           "--conf-min", c.cfg["OBJ_CONF"], "--max-points", c.cfg["MAX_POINTS"]]
     if c.cfg["GEOM"] == "vggt_da3":
-        _geom_pose_swap(c, dry, c.FRO, f"{c.R1}/02_da3", c.cfg["OBJ_CONF"])
+        _da3_with_vggt(c, dry, cmd, c.FRO, f"{c.R1}/02_da3", n, c.cfg["OBJ_CONF"])
+    else:
+        sh(cmd, f"{c.LOG}/02_da3.log", dry, cwd=DA3REPO)
     _frame_map(c, dry, c.FRO, f"{c.R1}/02_da3")
 
 def o_vlm(c, dry):
@@ -1065,10 +1116,16 @@ def o_scale(c, dry):
 def o_solo(c, dry):
     """主体逐实例抠图 + 生成。吧台/钢琴/沙发/大盆栽形态各异, 复用一个 mesh 会很假;
     餐桌餐椅吧凳高度重复, 复用把生成次数从几十次压到个位数。"""
+    # ★ 2026-10-12 DEDUP_BOX 也传给它: 组装时会被当成"同一件量了两遍"扔掉的盒子, 生成之前就不列(box_guards.py)。
+    #   开着召回时不传开的: 那时组装读的是并进了召回物体的盒子文件, 和这一步读的不是同一份, 去重的结论可能不同
     sh(envcmd(PY["sam3d"], f"{SCRIPTS}/gen_per_instance.py",
                dict(**_base(c), EXCLUDE=c.cfg["EXCLUDE"], SOLO=c.cfg["SOLO"],
                     SOLO_KEEP=c.cfg["SOLO_KEEP"],
-                    SOLO_MIN_PX=c.cfg["SOLO_MIN_PX"])), f"{c.LOG}/06_solo.log", dry)
+                    SOLO_MIN_PX=c.cfg["SOLO_MIN_PX"],
+                    DEDUP_BOX=c.cfg["DEDUP_BOX"] if c.cfg["RECALL"] != "1" else "0",
+                    # 组装会把"立在地上"的类补到地面再判高度, 这类盒子不能按量到的高度提前筛: 和 o_assemble 传同样的三个
+                    REST=f"{c.R1}/01_vlm_rest.json", FLOOR_EXTEND=c.cfg["FLOOR_EXTEND"],
+                    HUNG_LABELS=c.cfg["HUNG_LABELS"])), f"{c.LOG}/06_solo.log", dry)
     jobs = f"{c.LOG}/solo_jobs.txt"
     names = open(jobs).read().split() if os.path.exists(jobs) else []
     _gen_dirs(c, [f"{GEN}/my_images/{n}" for n in names], f"{c.LOG}/06_gen_solo.log", dry)
