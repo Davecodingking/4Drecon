@@ -37,15 +37,18 @@ def test_shell_lock_matches_python():
 
 
 def test_different_gpus_do_not_block():
-    held = open(_with_cvd("7", _common.lock_path), "a+")
+    # ★ 用两张假卡(t96 / t97), 不碰真卡的锁。以前用的是真的 6、7 号卡: 机器上有别的任务拿着 6 号卡的锁时
+    #   (流水线在跑, 或者 pixie 的 with_cards.sh —— 它用的是同一套锁文件), "别的卡拿得到"就失败, 整套测试跟着挂,
+    #   和被测的代码没关系(2026-10-12 就这么假失败了一次)。这条要验的是"不同的卡互不挡、同一张卡会挡", 用不着真卡。
+    held = open(_with_cvd("t97", _common.lock_path), "a+")
     fcntl.flock(held, fcntl.LOCK_EX)
     try:
         probe = "import fcntl,sys; sys.path.insert(0,%r); import _common; f=open(_common.lock_path(),'a+');" \
                 "fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)" % f"{SAM3D}/pipeline"
         run = lambda v: subprocess.run([sys.executable, "-c", probe], env=dict(os.environ, CUDA_VISIBLE_DEVICES=v),
                                         stderr=subprocess.DEVNULL).returncode
-        assert run("6") == 0            # 别的卡: 拿得到
-        assert run("7") != 0            # 同一张卡: 被占着
+        assert run("t96") == 0          # 别的卡: 拿得到
+        assert run("t97") != 0          # 同一张卡: 被占着
     finally:
         fcntl.flock(held, fcntl.LOCK_UN); held.close()
 
