@@ -59,7 +59,7 @@ def build(R1, trk, min_frames=5):
                      "最大面积帧": int(best) if best else None,
                      "告警": alarms.get(i, 0),
                      "决定": "keep" if n >= min_frames else "drop"})
-    d = {"说明": "决定只认 keep / drop。id 和 03_check.jpg 上的数字一致。改完在第 2 道闸 --go。",
+    d = {"说明": "决定只认 keep / drop。id 和 03_check.jpg 上的数字一致。改完点继续(哪道闸都行): 新勾上的人现算网格, 点掉的删掉, 别人的不动。",
          "跟踪目录": trk, "人": rows}
     _save(R1, d)
     return d

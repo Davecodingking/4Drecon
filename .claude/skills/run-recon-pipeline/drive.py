@@ -367,7 +367,7 @@ def placed_people_lines(R1):
         return []
     out = [f"人: 摆进场景 {t['人数']} 个 {t['人号']}"
            + ("  ★过期: 上一次按新挑的人重跑没跑完, 点继续会接着重跑" if t["重跑没完"] else
-              "  ★过期: 这是按上一次勾的人算的, 点继续会重出网格、重摆、重导出" if t["过期"] else "")]
+              "  ★过期: 这是按上一次勾的人算的, 点继续会按现在勾的重摆、重导出(网格只算新勾上的人, 别人的不重算)" if t["过期"] else "")]
     for r in t["行"]:
         out.append(f"  #{r['id']:<3} {r['决定'] or '':4s}  {people_decisions.fate_text(r)}"
                    + ("  ★可疑: " + "; ".join(r["可疑"]) if r["可疑"] else ""))
@@ -627,6 +627,7 @@ PEOPLE_LOOP = ["people_mesh", "people", "phys", "people_glb", "motion", "render"
 def rerun_people(R1, kind, scene, run, dry):
     """挑人改了 -> 出网格、摆人、物理、合成、导出那几步重来(只重跑跑过的)。尺度不重定: 它已经乘进深度, 幂等守卫拒绝再乘。
     返回重跑了哪些步骤(没改 = [])。
+    ★ 2026-10-12 出网格那步只算库里没有的人(pipeline/mesh_store.py): 点掉一个人它几秒就过, 留下的人网格一个字节不动。
     ★ 10-09 之前这里漏了 motion: 闸口上点掉一个人再点继续, 验收视频里他没了, 交付的 FBX 里还在。"""
     if not people_changed(R1, people_decisions.auto_dir(R1)):
         return []

@@ -26,9 +26,12 @@
   (<出网格目录>/relabel.json) -> 核对后的人号。三个场景里它们碰巧一样(没人被点掉过), 所以一直没出事; 但在闸口点掉
   一个人, 后面的人全部往前挪一号: FBX 里的 P5 和上一版视频里的 5 号不是同一个人, 网页上的截图也对到别人头上。
   现在核对完的人直接用他的跟踪编号命名(track_ids), 从这里往后(10_people.json、验收视频、FBX 里的名字)只有这一套号。
+★ 2026-10-12 出网格目录也直接用跟踪编号命名了(mesh_store.py), 中间那套重排的号没有了; 10-12 之前出的目录还是老排法,
+  所以 track_ids 照旧读 relabel.json(新目录里它两边一样)。
 """
 import json, os, shutil
 import numpy as np
+import mesh_store
 
 GAP_S = 1.0          # 秒: 一个编号中断这么久以上, 前后算两段
 SAME_M = 0.5         # 米: 两段相距不到这么多 = 站在同一个地方
@@ -115,14 +118,17 @@ def _frame_counts(run):
 def raw_run(body):
     """出网格那一轮的目录(跟踪原来的编号)。开了补全的优先。"""
     for d in ("04_mesh_occ1", "04_mesh_occ0"):
+        # ★ 出网格那步改库改到一半失败了(有的人删了、有的还没算): 不能拿它往下走。见 mesh_store.begin / finish
+        if mesh_store.finished(f"{body}/{d}") is False:
+            raise SystemExit(f"[失败] {body}/{d} 出网格没跑完(上一次改到一半失败了) —— 重跑 people_mesh(出人体网格)")
         if os.path.isdir(f"{body}/{d}/mesh_4d_individual"):
             return f"{body}/{d}"
     raise SystemExit(f"[失败] {body} 下没有 mesh_4d_individual, 先跑 body4d_pipeline 的 mesh 那步(people_mesh)")
 
 
 def track_ids(run):
-    """{出网格目录里的编号: 跟踪编号}。出网格那步把挑中的人重排成连续的 1..N, 对照写在 relabel.json
-    (左 = 跟踪编号, 右 = 重排后的)。老的出网格目录没有这个文件 = 没重排过, 原样。"""
+    """{出网格目录里的编号: 跟踪编号}。10-12 起目录名就是跟踪编号, 对照表两边一样; 之前出的目录是把挑中的人重排成
+    连续的 1..N, 对照写在 relabel.json(左 = 跟踪编号, 右 = 重排后的)。更老的目录没有这个文件 = 没重排过, 原样。"""
     p = f"{run}/relabel.json"
     if os.path.exists(p):
         return {str(v): int(k) for k, v in json.load(open(p))["relabel"].items()}
@@ -143,8 +149,17 @@ def source_of(body):
     """这份人体网格的"指纹": 哪个目录、每个编号多少帧、编号对的是跟踪的谁。核对身份和摆人的结果都记着它,
     读的时候再算一遍对一下 —— 人体网格重出过(或者挑的人变了)就对不上。
     ★ 只比帧数不够: 点掉甲、留下乙, 两人帧数一样的话帧数表一模一样, 但 1 号已经换了人; 所以带上编号对照。"""
-    raw = raw_run(body)
-    return dict(来源=os.path.basename(raw), 来源帧数=_frame_counts(raw), 编号对照=track_ids(raw))
+    return _source(raw_run(body))
+
+
+def _source(run):
+    """★ 算于(2026-10-12): 每个人的网格是哪一次算的。一个人重算过(跟踪变了 / 代码变了), 帧数和编号都可能不变,
+      但网格已经不是那一份 —— 模型在个别帧上每次算都不一样。10-12 之前出的目录没有登记簿, 就没有这一项。"""
+    src = dict(来源=os.path.basename(run), 来源帧数=_frame_counts(run), 编号对照=track_ids(run))
+    who = mesh_store.people(run)
+    if who:
+        src["算于"] = {str(o): e.get("算于") for o, e in sorted(who.items())}
+    return src
 
 
 def mesh_run_of(body, resolved=True):
@@ -191,7 +206,7 @@ def write(body, run, people, log):
     for pid, items in people.items():
         for rid, b in items:
             by[pid].setdefault(rid, []).append(b)
-    json.dump(dict(来源=os.path.basename(run), 来源帧数=_frame_counts(run), 编号对照=track_ids(run), 人=by, 记录=log,
+    json.dump(dict(**_source(run), 人=by, 记录=log,
                    规则=dict(中断多久算两段_秒=GAP_S, 同一个位置_米=SAME_M, 至少几帧才算人=MIN_FRAMES)),
               open(f"{tmp}/identity.json", "w"), ensure_ascii=False, indent=1)
     shutil.rmtree(dst, ignore_errors=True)

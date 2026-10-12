@@ -147,15 +147,16 @@ if PEOPLE_RUN:
         sys.path.insert(0, os.path.expanduser("~/sam3d/pipeline"))
         import body_into_scene as BIS
         import people_identity as _PID
-        # ★ 这一步在摆人之前: 身份还没核对, 读的是出网格那步的原始目录(编号 = 出网格时重排的 1..N)。
+        # ★ 这一步在摆人之前: 身份还没核对, 读的是出网格那步的原始目录(人体网格的库; 10-12 起目录名 = 跟踪编号,
+        #   之前出的目录是重排过的 1..N, 所以下面还是经 track_ids 换一道)。
         #   以前借 load_body 把所有网格读一遍只为了知道"每人有哪些帧", 而且它读的是"核对过身份的目录(如果有)"、
         #   根平移和抠图又读原始目录 —— 重跑时两边的编号对不上。现在明说只读原始目录, 帧号直接数文件名。
         _mrun = _PID.raw_run(PEOPLE_RUN)
         _kept = json.load(open(f"{PEOPLE_RUN}/00_frames/frames.json"))["kept_indices"]
         _da3, _cams, _UPb, _GHb, _v2k = BIS.load_scene(R1)
         _roots = BIS.load_roots(_mrun)
-        # ★ 报告里的人按**跟踪编号**记(挑人卡片上的数字), 不按出网格时重排的: 闸口上点掉一个人会重出网格、重排编号,
-        #   但尺度不重定(已经乘进深度了) —— 记重排后的编号的话, 网页"尺度"那张表的截图就对到别人头上
+        # ★ 报告里的人按**跟踪编号**记(挑人卡片上的数字): 尺度定完就不重定了(已经乘进深度), 这份报告要一直对得上人。
+        #   (10-12 之前目录名是出网格时重排的号, 闸口上点掉一个人就全部挪位, 网页"尺度"那张表的截图会对到别人头上)
         _tid = _PID.track_ids(_mrun)
         _per = {}
         for _pid in sorted(_PID._frame_counts(_mrun), key=int):

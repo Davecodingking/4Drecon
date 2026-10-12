@@ -28,8 +28,8 @@
   * ★ body4d 必须是独立 conda 环境。sam-body4d 仓库内嵌了另一份 SAM 3, 包名同样叫 sam3,
     装进我们的 sam3 环境会把 track_all.py 依赖的那份静默替换掉。
   * ★ 挑人会挑出不连续的 id (比如 1/2/4), 而上游用"第几个"冒充"是谁"。
-    mesh 那步会重编号成连续 1..N 并写 relabel.json。已给上游打了补丁, 但重编号仍保留 ——
-    少依赖一个补丁少一个风险。
+    出网格脚本每次把要算的人重编号成连续 1..n 再喂给上游(已给上游打了补丁, 但重编号仍保留 —— 少依赖一个补丁
+    少一个风险)。这套号只活在那一次的临时目录里; 搬进库(04_mesh_occ*/)时换回跟踪编号, 见 mesh_store.py。
   * ★ 开补全 (OCC=1) 在 32G 上会 OOM。Diffusion-VAS 两个 SVD 加 SAM 3D Body 一起驻留,
     实测撞在 25G 还要再申请 7.2G。要开先降 BATCH 和 MAX_OCC_LEN。
   * 视频一律 H.264/yuv420p。cv2 的 mp4v 不报错但浏览器不认。
@@ -44,7 +44,7 @@
     python body4d_pipeline.py --scene mayday -n                  # 干跑, 打印能直接粘的命令
     PICK=1,2,4 python body4d_pipeline.py --scene mayday --from pick
 """
-import argparse, glob, json, os, shlex, subprocess, sys, time
+import argparse, glob, json, os, shlex, shutil, subprocess, sys, time
 
 # ★ 驱动层的公共件在 _common.py(见那个文件的文件头)。三条流水线共用同一把 GPU 锁、
 #   同一个跑命令/计时/配置解析的实现 —— 复制粘贴过的东西一定会漂移。
@@ -268,67 +268,76 @@ print(f"[挑人] 留 {{pick}}, 丢 {{[i for i in cov if i not in pick]}}")
     sh([PY["sam3d"], "-c", code], f"{c.LOG}/03_pick.log", dry)
 
 
-def _part_ok(part, meta):
-    """这一份上次已经算好、而且算的是同样的东西(人、参数、跟踪结果都没变): 直接用, 不重算。"""
-    try:
-        return json.load(open(f"{part}/part.json")) == meta and os.path.exists(f"{part}/mesh_report.json")
-    except (OSError, ValueError):
-        return False
-
-
 def s_mesh(c, dry):
-    """SAM 3D Body 出网格。OCC=1 时先跑 Diffusion-VAS 补全 (32G 上会 OOM, 见文件头)。
-    ★ 2026-09-29 按人拆分(默认关, FANOUT=1 才拆, 原因见 fanout.on): 有几张空卡就起几份, 每份算几个人
-      (按每人出现的帧数分, 各份工作量接近), 跑完并回一个目录(mesh_merge.py)。
-      只在补全关着的时候拆 —— 补全要看别人的遮挡, 不能按人拆开。"""
+    """SAM 3D Body 出网格 -> 人体网格的库(mesh_store.py)。OCC=1 时先跑 Diffusion-VAS 补全 (32G 上会 OOM, 见文件头)。
+    ★ 2026-10-12 库里每个人的目录名 = 他的跟踪编号; 算过、输入没变的人不重算(判法见 mesh_store.stamps)。
+      闸口上点掉一个人 = 删他的目录, 一次模型都不起; 加一个人 = 只算他。以前目录名是"第几个勾的人", 点掉一个
+      后面的人全部挪位, 只能全部重出(office 9 个人 3 分半), 而且刚在闸口看过的人也被重算。
+    ★ 2026-09-29 按人拆分(FANOUT=0 关, 原因见 fanout.on): 有几张空卡就起几份, 每份算几个人(按每人出现的帧数分,
+      各份工作量接近)。每一份写在自己的临时目录 _part<k>/ 里(上游要连续的 1..n, 重排只留在那里面), 算完盖章(seal),
+      再搬进库(absorb)。只在补全关着的时候拆 —— 补全要看别人的遮挡, 不能按人拆开, 勾的人一变也得全部重算。
+    ★ 不拆也走同一条路(一份), 没有"直接往库里写"的第二条路 —— 那条路自己不清旧文件, 10-09 nfl1 r8 把别人的帧混进来过。"""
+    import mesh_store
     g = c.cfg
     need = 26000 if g["OCC"] == "1" else 15000
     script = f"{B4D}/body4d_mesh_5090.py"
     log = f"{c.LOG}/04_mesh.log"
+    cam = f"{g['SCENE_R1']}/02_da3/cameras.json" if g["SCENE_R1"] else ""
     args = (["--dir", c.TRK, "--completion", g["OCC"], "--batch-size", g["BATCH"], "--max-occ-len", g["MAX_OCC_LEN"]]
-            + (["--cam-json", f"{g['SCENE_R1']}/02_da3/cameras.json"] if g["SCENE_R1"] else []))
+            + (["--cam-json", cam] if cam else []))
     picked = json.load(open(f"{c.TRK}/picked.json")) if os.path.exists(f"{c.TRK}/picked.json") else {}
-    ids = picked.get("keep_ids", [])
-    k = 1
-    if not dry and g["OCC"] != "1" and parallel_on() and fanout.on() and len(ids) > 1:
-        k = fanout.how_many(len(ids), need)
-    if k <= 1:
-        if dry:
-            return sh(envcmd(PY["body4d"], script, GPUENV, args + ["--out", c.MESH]), log, dry, cwd=B4D)
-        with GpuSlot("mesh", need):
-            # ★ 不拆时模型直接往 c.MESH 里写, 它自己不清旧文件: 闸口上点掉一个人再重出(8 个人 -> 7 个), 第 8 个人的目录还在,
-            #   新的 5 号目录里混着上一次 5 号(另一个人)的帧 —— 2026-10-09 nfl1 r8 对账报"3 个人身份被写串"。
-            #   拆开跑的那条路合并时本来就清(mesh_merge.merge), 所以以前只在"重出时正好没有空卡"才撞上
-            import mesh_merge
-            mesh_merge.clear_outputs(c.MESH)
-            return sh(envcmd(PY["body4d"], script, GPUENV, args + ["--out", c.MESH]), log, dry, cwd=B4D)
-    cover = picked.get("coverage", {})
-    groups = fanout.split(ids, [cover.get(str(i), 1) for i in ids], k)
-    print(f"    [拆分] {len(ids)} 个人分成 {len(groups)} 份: "
-          + " | ".join(",".join(map(str, grp)) for grp in groups), flush=True)
-    t0 = time.time()
-    tm = os.path.getmtime(f"{c.TRK}/track_report.json") if os.path.exists(f"{c.TRK}/track_report.json") else 0
+    ids = [int(i) for i in picked.get("keep_ids", [])]
 
-    def job(i):
-        part = f"{c.MESH}/_part{i}"
-        meta = dict(ids=groups[i], args=args, track_mtime=tm)
+    def cmd(part, who, card=None):
+        env = dict(GPUENV, CUDA_VISIBLE_DEVICES=card, CUDA_DEVICE_ORDER="PCI_BUS_ID") if card is not None else GPUENV
+        return envcmd(PY["body4d"], script, env, args + ["--out", part, "--ids", ",".join(map(str, who))])
 
-        def fn(card):
-            if _part_ok(part, meta):
-                print(f"    [拆分] 第 {i} 份(人 {groups[i]})上次已经算好, 直接用", flush=True)
-                return
-            sh(envcmd(PY["body4d"], script, dict(GPUENV, CUDA_VISIBLE_DEVICES=card, CUDA_DEVICE_ORDER="PCI_BUS_ID"),
-                      args + ["--out", part, "--ids", ",".join(map(str, groups[i]))]), log, dry, cwd=B4D)
-            json.dump(meta, open(f"{part}/part.json", "w"), ensure_ascii=False)
-        return fn
+    if dry:                                     # 干跑不知道库里已经有谁: 打印"全部都算"的那条命令
+        return sh(cmd(f"{c.MESH}/_part0", ids), log, dry, cwd=B4D)
+    if not ids:
+        raise SystemExit(f"[失败] 没有要出网格的人({c.TRK}/picked.json 不在或者一个都没留) —— 先跑 pick")
+    settings = dict(补全=g["OCC"], batch=g["BATCH"], max_occ_len=g["MAX_OCC_LEN"], 焦距=mesh_store.focal_of(cam))
+    want = mesh_store.stamps(c.TRK, ids, settings, B4D)
+    if mesh_store.begin(c.MESH):
+        print("    [库] 这个目录是 10-12 之前的写法(目录名按\"第几个勾的人\"排, 没记是拿什么算的): 清掉, 全部重算一次", flush=True)
+    for part in sorted(glob.glob(f"{c.MESH}/_part*")):               # 上一次算好没来得及收的(别的份失败了 / 被杀了)
+        got = mesh_store.absorb(c.MESH, part, want)
+        if got:
+            print(f"    [库] 上次算好还没收的: 人 {got}", flush=True)
+    for o, why in mesh_store.prune(c.MESH, want).items():
+        print(f"    [库] 人 {o} 的网格删掉: {why}", flush=True)
+    todo = [i for i in ids if i not in mesh_store.people(c.MESH)]
+    print(f"    [库] 勾了 {len(ids)} 个人: 沿用 {[i for i in ids if i not in todo] or '无'}, 要算 {todo or '无'}", flush=True)
+    t0, groups = time.time(), []
+    if todo:
+        k = 1
+        if g["OCC"] != "1" and parallel_on() and fanout.on() and len(todo) > 1:
+            k = fanout.how_many(len(todo), need)
+        cover = picked.get("coverage", {})
+        groups = fanout.split(todo, [cover.get(str(i), 1) for i in todo], k)
+        if len(groups) > 1:
+            print(f"    [拆分] {len(todo)} 个人分成 {len(groups)} 份: "
+                  + " | ".join(",".join(map(str, grp)) for grp in groups), flush=True)
 
-    res = fanout.run_workers([(f"p{i}", job(i)) for i in range(len(groups))], "mesh", need)
-    bad = [int(n[1:]) for n, e in res.items() if e]
-    if bad:
-        raise SystemExit(f"[失败] 出网格有 {len(bad)} 份重试后还是没跑成。没算出来的人: "
-                         f"{sorted(x for i in bad for x in groups[i])}。算好的几份留着, 重跑这一步只补没算出来的")
-    sh([PY["sam3d"], f"{PIPE}/mesh_merge.py", "--run", c.MESH, "--trk", c.TRK, "--ids", ",".join(map(str, ids)),
-        "--parts", str(len(groups)), "--seconds", f"{time.time() - t0:.1f}"], log, dry)
+        def job(i):
+            part = f"{c.MESH}/_part{i}"
+
+            def fn(card):
+                shutil.rmtree(part, ignore_errors=True)              # 换卡重试时, 上一次试到一半的不能留: 脚本自己不清旧文件
+                sh(cmd(part, groups[i], card), log, dry, cwd=B4D)
+                mesh_store.seal(part, {o: want[o] for o in groups[i]})
+            return fn
+
+        res = fanout.run_workers([(f"p{i}", job(i)) for i in range(len(groups))], "mesh", need)
+        for i in range(len(groups)):                                 # 算成的先收进库: 别的份失败了, 重跑时它们不用再算
+            if res[f"p{i}"] is None:
+                mesh_store.absorb(c.MESH, f"{c.MESH}/_part{i}", want)
+        bad = [i for i in range(len(groups)) if res[f"p{i}"]]
+        if bad:
+            raise SystemExit(f"[失败] 出网格有 {len(bad)} 份重试后还是没跑成。没算出来的人: "
+                             f"{sorted(x for i in bad for x in groups[i])}。算好的人已经收进库, 重跑这一步只补没算出来的")
+    mesh_store.finish(c.MESH, c.TRK, ids, new=todo, seconds=round(time.time() - t0, 1) if todo else 0.0,
+                      parts=len(groups), settings=settings)
 
 
 def s_report(c, dry):
@@ -360,7 +369,7 @@ ARTIFACTS = {
     "track":  ["@TRK/images/00000000.jpg", "@TRK/masks", "@TRK/track_report.json"],
     "check":  ["03_track.mp4", "03_check.jpg"],
     "pick":   ["@TRK/picked.json"],
-    "mesh":   ["@MESH/mesh_report.json", "@MESH/relabel.json", "@MESH/rendered_frames"],
+    "mesh":   ["@MESH/mesh_report.json", "@MESH/relabel.json", "@MESH/store.json"],
     "report": ["05_mesh_overlay.mp4", "05_summary.txt"],
 }
 

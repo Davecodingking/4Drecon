@@ -1,9 +1,9 @@
 diff --git a/NOTES_5090.md b/NOTES_5090.md
 new file mode 100644
-index 0000000..9f9de06
+index 0000000..66a48e9
 --- /dev/null
 +++ b/NOTES_5090.md
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,174 @@
 +# SAM-Body4D 在 RTX 5090 上的部署记录（2026-09-09）
 +
 +装在**独立的 `body4d` 环境**里：`source ~/sam3d/env_body4d.sh`。
@@ -88,6 +88,7 @@ index 0000000..9f9de06
 +| 7 | `models/sam_3d_body/notebook/utils.py` 两处 `process_frames(...)` + `meta_arch/sam3d_body.py` 体型锁定 | 2026-10-08: **所有人共用第一个人第一帧的体型**。模型按 `hid in range(num_human)` 记体型, 带遮罩这条路一次只送一个人, 每个人都是 hid=0。修法: 字典按 `obj_id` 分格(`setdefault(obj_id, {})`); 锁定时取这一批里有效帧的中位, 没有有效帧就先不锁(人不在的帧全是 NaN, 取 t=0 会把中途进画面的人锁成 NaN -> 整段空网格)。实测 nfl1: 修前 8 人身高全是 1.664 m, 修后 1.64~1.72 m |
 +| 8 | `body4d_mesh_5090.py` 热身 | 2026-10-08: 进程里**第一次**调模型的结果和后面的不一样（office 人 4: 排第一算 vs 排第二算, 每帧顶点差 2 mm, 个别帧 3 cm; 参数和 buffer 都没变, 是 GPU 库第一次跑的路径不同）。正式算之前先用第一批帧算一遍扔掉, 这样不拆、按人拆、排第几都走同一条路 |
 +| 9 | `notebook/utils.py` `process_image_with_mask` | 2026-10-09: 人不在画面里的帧不再送进模型。以前空帧按全零框照算(出 NaN 再丢), office 1200 次里 868 次白算; 而且批内姿势平滑见到 NaN 整批不做, 含空帧的批都没平滑过(office 23% 的帧)。只改了不遮挡那条路(补全那条路这台机器跑不了, 没动) |
++| 10 | `body4d_mesh_5090.py` 不画检查图 | 2026-10-12: 上游每帧画的"所有人合在一张"(`rendered_frames/`)也不画了(给它一张 2x2 白图占位, 结尾拼 mp4 跳过; 要画加 `--renders`)。它每帧新建一个离屏渲染器, 一帧 0.4~0.8 秒, office 人 4 那一份出网格 80 秒里有 45 秒在画图。叠加视频改由 `body4d_report_5090.py` 从存下来的网格现画(`pipeline/mesh_overlay.py`) |
 +
 +**2 和 3 是同一个根源，也是最危险的一个：用位置序号冒充身份 ID。**
 +他们的流程里 id 永远是连续的 1..N 且从不中途消失，所以两者恰好等价。
@@ -130,6 +131,20 @@ index 0000000..9f9de06
 +`--ids` 不给就读 `<dir>/picked.json`（人工闸）。会建独立运行目录 `04_mesh_occ{0,1}/`，
 +`images` 用软链不复制，`masks` 过滤+重编号成连续 1..N（见补丁 2 的原因），
 +并写 `relabel.json` 记住"新 id ↔ 原跟踪 id"。
++
++**这套 1..N 的编号只活在这一次的输出目录里（2026-10-12）。** 流水线（`pipeline/body4d_pipeline.py` 的 mesh 步）
++每次让这个脚本写进临时目录 `04_mesh_occ0/_part<k>/`，算完由 `pipeline/mesh_store.py` 搬进库 `04_mesh_occ0/`，
++目录名换回**跟踪编号**；库里的 `store.json` 记着每个人是拿什么输入算的，没变就不重算。
++以前库里也是重排的号：闸口上点掉一个人，后面的人全部挪位，只能全部重出（office 9 个人 3 分半）。
++
++### `body4d_report_5090.py` —— 叠加视频 + 对账
++
++```bash
++python body4d_report_5090.py --run 04_mesh_occ0目录 --track 02_body4d目录 [--fps 8]   # RP_WORKERS=8 画图的进程数
++```
++叠加视频（`05_mesh_overlay.mp4`）从库里的网格现画：库里有谁图里就有谁，所有人画在同一个场景里（前后遮挡是对的），
++颜色跟跟踪编号走。画图用的是上游的 `visualize_sample_together`，开 8 个进程，office 120 帧整步 17 秒。
++对账：每人"有抠图的帧"和"有网格的帧"逐帧比，有网格却没抠图 = 身份写串了，退出码非 0。
 +
 +## 实测
 +
@@ -283,10 +298,10 @@ index 0000000..5e59671
 +print(f"[覆盖] " + "  ".join(f"id{i}:{cov[i]}/{N}" for i in ids))
 diff --git a/body4d_mesh_5090.py b/body4d_mesh_5090.py
 new file mode 100644
-index 0000000..509f094
+index 0000000..9eb527f
 --- /dev/null
 +++ b/body4d_mesh_5090.py
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,221 @@
 +#!/usr/bin/env python
 +"""第二段: 拿盘上的 images/ + masks/ 出人体网格 (SAM 3D Body [+ Diffusion-VAS 补全])。
 +
@@ -328,6 +343,9 @@ index 0000000..509f094
 +ap.add_argument("--out", default="", help="运行目录; 默认 <b1>/04_mesh_occ{0,1}")
 +ap.add_argument("--individual-renders", action="store_true",
 +                help="也画每个人单独一张的检查图(rendered_frames_individual/)。默认不画: 没人读, 占这一步近一半时间")
++ap.add_argument("--renders", action="store_true",
++                help="也画上游的检查图(rendered_frames/ 所有人合在一张 + 4d_*.mp4)。默认不画: 叠加视频由\n"
++                     "body4d_report_5090.py 从存下来的网格现画, 这里画的没人读")
 +ap.add_argument("--cam-json", default="", help="场景重建的 cameras.json。给了就用它的焦距, 不让 MoGe-2 自己估 ——\n"
 +                "人离镜头多远是 SAM 3D Body 用焦距换算出来的, 焦距跟场景不一致, 人的远近就跟场景不一致")
 +a = ap.parse_args()
@@ -384,6 +402,9 @@ index 0000000..509f094
 +#   他们自己一路都是 1..N 连续, 所以永远踩不到。
 +# ★ 为什么另开目录而不是就地改: masks/ 是跟踪那一步的产物, 是"全部人"的真相,
 +#   不该被"这一轮挑了谁"污染。另外补全开/关两轮要并排比较, 也不能互相覆盖。
++# ★ 2026-10-12: 这套 1..n 的编号只在这一次的输出目录里用。流水线(body4d_pipeline.s_mesh)每次让这个脚本写进一个
++#   临时目录 _part<k>/, 算完由 pipeline/mesh_store.py 搬进库, 目录名换回**跟踪编号**(对照就是下面写的 relabel.json)。
++#   库里没有这套重排的号 —— 以前有, 闸口上点掉一个人, 后面的人全部挪位, 只能全部重出。
 +import shutil, glob as _glob
 +from PIL import Image as _Image
 +RUN = os.path.abspath(a.out or f"{os.path.dirname(os.path.abspath(a.dir))}/"
@@ -431,6 +452,13 @@ index 0000000..509f094
 +#   所以改模块属性就生效, 不用动上游文件。要这些图的话加 --individual-renders。
 +if not a.individual_renders:
 +    _oa.visualize_sample = lambda *args, **kw: []
++# ★ 2026-10-12: "所有人合在一张"的检查图(rendered_frames/)也不画了。它以前给叠加视频用; 现在叠加视频由
++#   body4d_report_5090.py 从存下来的网格现画(pipeline/mesh_overlay.py 讲了为什么: 按人拆开后这里画的只有本份的人,
++#   点掉一个人也没法从图里只去掉他)。上游每帧新建一个离屏渲染器, 一帧 0.4~0.8 秒 —— office 人 4(115 帧)那一份
++#   出网格 80 秒里有 45 秒是画图。给上游的循环一张 2x2 的白图占位(它照常写文件), 结尾拼 mp4 那步跳过。
++if not a.renders:
++    _oa.visualize_sample_together = lambda img, *args, **kw: np.full((2, 2, 3), 255, np.uint8)
++    _oa.jpg_folder_to_mp4 = lambda *args, **kw: None
 +
 +t0 = time.time()
 +app = OfflineApp(config_path=cfg_path)
@@ -474,9 +502,11 @@ index 0000000..509f094
 +with torch.autocast("cuda", enabled=False):    # 照抄他们 inference() 的做法
 +    out = app.on_4d_generation()
 +peak = torch.cuda.max_memory_allocated() / 2**30
-+print(f"[出网格] {time.time()-t1:.0f}s  显存峰值 {peak:.1f}G  -> {out}")
++print(f"[出网格] {time.time()-t1:.0f}s  显存峰值 {peak:.1f}G  -> {out if a.renders else RUN}")
 +if not a.individual_renders:                   # 上游建好的空目录, 清掉, 免得看起来像漏画了
 +    shutil.rmtree(f"{RUN}/rendered_frames_individual", ignore_errors=True)
++if not a.renders:                              # 里面是占位的 2x2 白图
++    shutil.rmtree(f"{RUN}/rendered_frames", ignore_errors=True)
 +
 +# ---------- 落一份机器可读的账 ----------
 +# 每个人到底有多少帧真出了网格 —— 这是"遮挡帧掉不掉网格"的唯一硬数字,
@@ -492,7 +522,7 @@ index 0000000..509f094
 +               peak_vram_gb=round(peak, 2), seconds=round(time.time() - t1, 1)),
 +          open(f"{RUN}/mesh_report.json", "w"), ensure_ascii=False, indent=1)
 +print(f"[网格数] 共 {n_img} 帧: " + "  ".join(f"id{k}:{v}" for k, v in res.items()))
-+print(f"[done] -> {RUN}/{{mesh_4d_individual,rendered_frames}}/ + mesh_report.json")
++print(f"[done] -> {RUN}/{{mesh_4d_individual,focal_4d_individual,mhr_4d_individual}}/ + mesh_report.json")
 diff --git a/body4d_occ_5090.py b/body4d_occ_5090.py
 new file mode 100644
 index 0000000..e0efbc4
@@ -618,10 +648,10 @@ index 0000000..e0efbc4
 +print(f"[done] {sp}  ({sheet.shape[1]}x{sheet.shape[0]})")
 diff --git a/body4d_report_5090.py b/body4d_report_5090.py
 new file mode 100644
-index 0000000..bea34e4
+index 0000000..3a32e79
 --- /dev/null
 +++ b/body4d_report_5090.py
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,157 @@
 +#!/usr/bin/env python
 +"""验收: 网格叠回原片的 mp4 + 一份交叉核对的摘要。
 +
@@ -630,18 +660,30 @@ index 0000000..bea34e4
 +  数字长得一样体面, 只有对照才发现前者第二个目录里前后装了两个人。
 +  所以这里不做美化, 做的是**两个独立来源的数字对账**。
 +
-+叠加图是判断"位置和尺度准不准"的唯一办法 —— 他们自己出的 rendered_frames 是白底,
++叠加图是判断"位置和尺度准不准"的唯一办法 —— 上游自己画的图是白底,
 +网格再漂亮也看不出有没有对齐。
++
++★ 2026-10-12 叠加图从库里的网格现画, 不再读出网格那步顺手画的 rendered_frames/(为什么见 pipeline/mesh_overlay.py):
++  库里有谁图里就有谁(闸口上点掉一个人, 重画就没有他了, 不用重出网格); 所有人画在同一个场景里, 前后遮挡是对的;
++  颜色跟跟踪编号走。画图用的还是上游的 visualize_sample_together, 样子和以前一样。
++  上游画一帧 0.4~0.8 秒(每帧新建一个离屏渲染器), 串着画 120 帧要 1 分钟, 所以开 RP_WORKERS(默认 8)个进程一起画。
 +
 +用法:
 +  python body4d_report_5090.py --run 04_mesh_occ0目录 --track 02_body4d目录 [--fps 8]
 +"""
-+import argparse, json, os, glob
++import argparse, json, os, glob, sys, time
++import multiprocessing as mp
 +import cv2, numpy as np
 +import imageio.v2 as imageio
 +
++ROOT = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, ROOT)
++sys.path.append(os.path.join(ROOT, "models", "sam_3d_body"))
++sys.path.append(os.path.join(ROOT, "..", "pipeline"))      # 放最后: 不挡这个目录自己的模块
++import mesh_overlay
++
 +ap = argparse.ArgumentParser()
-+ap.add_argument("--run", required=True, help="含 rendered_frames/ mesh_4d_individual/ 的运行目录")
++ap.add_argument("--run", required=True, help="人体网格的库(含 mesh_4d_individual/ focal_4d_individual/ images/)")
 +ap.add_argument("--track", required=True, help="含 track_report.json 的跟踪目录")
 +ap.add_argument("--out-dir", default=None, help="默认写到 --run 的上一级")
 +ap.add_argument("--fps", type=float, default=8.0)
@@ -662,27 +704,39 @@ index 0000000..bea34e4
 +W, H = tr["wh"]
 +
 +# ---------- 1. 叠加视频 ----------
-+# 白底之外的像素才算网格。他们渲染的底色是纯白, 245 这个阈值留了点抗锯齿的余量。
++# 先载上游的画图函数再开进程: 子进程是 fork 出来的, 不用各自再载一遍(载一次 5 秒)。载的时候不建渲染器, fork 是安全的。
++from models.sam_3d_body.tools.vis_utils import visualize_sample_together
++from utils.painter import color_list
++DIRS = {oid: str(nid) for oid, nid in rl.items()}          # {跟踪编号: 库里的目录名}; 10-12 起两边一样
++
++
++def _draw(fi):
++    """画一帧: 库里这一帧在场的人画在一个场景里, 半透明叠到原片上。返回 RGB。"""
++    img = cv2.imread(f"{a.run}/images/{FILES[fi]}")
++    outs, ids, faces = mesh_overlay.frame_people(a.run, FILES[fi][:-4], DIRS)
++    ren = visualize_sample_together(img, outs, faces, [mesh_overlay.color_slot(i, len(color_list)) for i in ids]) if outs else None
++    ov = mesh_overlay.blend(img, ren, a.alpha)
++    if ov is img:
++        ov = img.copy()
++    cv2.putText(ov, f"#{fi}", (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
++    return cv2.cvtColor(ov[:EH, :EW], cv2.COLOR_BGR2RGB)
++
++
 +EW, EH = W - W % 2, H - H % 2
 +vp = f"{OUT}/{a.prefix}_mesh_overlay.mp4"
++t0 = time.time()
++nw = max(1, min(int(os.environ.get("RP_WORKERS", "8")), N))
 +wr = imageio.get_writer(vp, fps=a.fps, codec="libx264", quality=8,
 +                        macro_block_size=1, ffmpeg_params=["-pix_fmt", "yuv420p"])
-+n_ov = 0
-+for fi in range(N):
-+    img = cv2.imread(f"{a.run}/images/{FILES[fi]}")
-+    rp = f"{a.run}/rendered_frames/{FILES[fi][:-4]}.jpg"
-+    if not os.path.exists(rp):
-+        continue
-+    ren = cv2.imread(rp)
-+    if ren.shape != img.shape:
-+        ren = cv2.resize(ren, (img.shape[1], img.shape[0]))
-+    fg = (ren.min(axis=2) < 245).astype(np.float32)[..., None]
-+    ov = (img * (1 - a.alpha * fg) + ren * (a.alpha * fg)).astype(np.uint8)
-+    cv2.putText(ov, f"#{fi}", (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-+    wr.append_data(cv2.cvtColor(ov[:EH, :EW], cv2.COLOR_BGR2RGB))
-+    n_ov += 1
++if nw > 1:
++    with mp.get_context("fork").Pool(nw) as pool:
++        for fr in pool.imap(_draw, range(N), chunksize=1):     # imap: 按帧的顺序一帧一帧拿回来, 直接喂给编码器
++            wr.append_data(fr)
++else:
++    for fi in range(N):
++        wr.append_data(_draw(fi))
 +wr.close()
-+print(f"[叠加视频] {vp}  {n_ov} 帧 @ {a.fps}fps")
++print(f"[叠加视频] {vp}  {N} 帧 @ {a.fps}fps  (人 {sorted(DIRS)}; 从库里的网格现画, {nw} 个进程, {time.time() - t0:.0f}s)")
 +
 +# ---------- 2. 对账 ----------
 +# ★ 只比数量是不够的, 因为"对不上"有两个完全不同的原因, 严重性差一个数量级:
@@ -703,7 +757,7 @@ index 0000000..bea34e4
 +lines.append(f"帧 {N}  分辨率 {W}x{H}  补全 {'开' if mr['completion'] else '关'}  "
 +             f"batch {mr['batch_size']}  显存峰值 {mr['peak_vram_gb']}G  耗时 {mr['seconds']}s")
 +lines.append("")
-+lines.append(f"{'原id':>5} {'新id':>5} {'mask帧':>7} {'网格帧':>7} {'像素高中位':>10}   结论")
++lines.append(f"{'编号':>5} {'目录':>5} {'mask帧':>7} {'网格帧':>7} {'像素高中位':>10}   结论")   # 10-12 起目录名 = 跟踪编号
 +for oid in sorted(rl):
 +    nid = rl[oid]
 +    md = f"{a.run}/mesh_4d_individual/{nid}"

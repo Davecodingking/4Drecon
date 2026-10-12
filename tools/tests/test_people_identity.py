@@ -202,6 +202,51 @@ def test_identity_written_before_the_relabel_was_recorded_still_reads():
         assert ID.mesh_run_of(T) == f"{T}/{ID.DIR}"
 
 
+def _store(run, people, done=True):
+    """给假的出网格目录配上登记簿(pipeline/mesh_store.py 的写法): {人: 哪天算的}。"""
+    json.dump(dict(版本=2, 完成=done, 人={p: dict(印记={}, 帧=3, 算于=t) for p, t in people.items()}),
+              open(f"{run}/store.json", "w"), ensure_ascii=False)
+
+
+def test_a_half_written_mesh_store_is_refused():
+    """出网格那步改库改到一半失败了(有的人删了、有的人还没算): 摆人不能拿这个库往下走。"""
+    with tempfile.TemporaryDirectory() as T:
+        run = _fake_run(T, {"1": [0, 1, 2], "2": [0, 1, 2]})
+        _store(run, {"1": "2026-10-12 10:00:00", "2": "2026-10-12 10:00:00"}, done=False)
+        try:
+            ID.raw_run(T); assert False, "没改完的库该拒绝"
+        except SystemExit as e:
+            assert "people_mesh" in str(e) and "没跑完" in str(e), str(e)
+        _store(run, {"1": "2026-10-12 10:00:00", "2": "2026-10-12 10:00:00"})
+        assert ID.raw_run(T) == run
+
+
+def test_recomputing_a_person_makes_the_resolved_identity_stale():
+    """2 号重算过(跟踪变了 / 代码变了): 帧数、编号都没变, 但网格已经不是核对身份时的那一份 —— 必须算过期。
+    模型在个别帧上每次算都不一样, 拿旧的摆人结果配新的网格, 网页看到的和交付的就对不上。"""
+    with tempfile.TemporaryDirectory() as T:
+        run = _fake_run(T, {"1": [0, 1, 2], "2": [0, 1, 2]})
+        json.dump(dict(relabel={"1": 1, "2": 2}), open(f"{run}/relabel.json", "w"))
+        _store(run, {"1": "2026-10-12 10:00:00", "2": "2026-10-12 10:00:00"})
+        ID.write(T, run, {"1": [("1", b) for b in range(3)], "2": [("2", b) for b in range(3)]}, [])
+        src = ID.source_of(T)
+        assert src["算于"] == {"1": "2026-10-12 10:00:00", "2": "2026-10-12 10:00:00"}, src
+        assert ID.mesh_run_of(T) == f"{T}/{ID.DIR}"
+        _store(run, {"1": "2026-10-12 10:00:00", "2": "2026-10-12 11:30:00"})          # 2 号重算了
+        assert ID.source_of(T) != src
+        try:
+            ID.mesh_run_of(T); assert False
+        except SystemExit as e:
+            assert "重跑 people" in str(e)
+
+
+def test_mesh_dirs_without_a_store_file_read_as_before():
+    """10-12 之前出的人体网格没有登记簿: 指纹里不带"算于", 老轮次的摆人结果照旧算新鲜的。"""
+    with tempfile.TemporaryDirectory() as T:
+        run = _fake_run(T, {"1": [0, 1, 2]})
+        assert ID.raw_run(T) == run and "算于" not in ID.source_of(T)
+
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_") and callable(f):

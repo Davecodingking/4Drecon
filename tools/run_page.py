@@ -405,7 +405,7 @@ function peopleHTML(t){
   const sus = t.行.filter(r => r.可疑.length && r.决定 === 'keep').length;
   return '<h3>人(摆进场景 ' + t.人数 + ' 个)</h3>' +
     (t.重跑没完 ? '<p class=warn>上一次按新挑的人重跑没跑完(失败了, 看日志)。下面还是之前的结果; 点继续会接着重跑。</p>' :
-     t.过期 ? '<p class=warn>下面是按上一次勾的人算的。点继续会按现在勾的重出网格、重摆、重导出。</p>' : '') +
+     t.过期 ? '<p class=warn>下面是按上一次勾的人算的。点继续会按现在勾的重摆、重导出(网格只算新勾上的人; 点掉的直接删, 别人的不重算)。</p>' : '') +
     '<table class=kv>' + t.行.map(r =>
       '<tr' + (r.决定 === 'drop' ? ' class=dim' : '') + '><td style="width:112px">' +
       (r.新号 ? '' : '<img class=thumb src="' + U('/run/img', {what:'person', id:r.id}) + '">') + '</td><td>#' + r.id + '</td><td>' +
@@ -413,7 +413,7 @@ function peopleHTML(t){
       (r.可疑.length ? '<br><span class=warn>可疑: ' + esc(r.可疑.join('; ')) + '</span>' : '') + '</td></tr>').join('') +
     '</table><p class=note>编号 = 挑人卡片上的数字, 验收视频和 FBX 里的人(P&lt;号&gt;)也是这个号。' +
     (sus ? '<b>有 ' + sus + ' 个可疑的</b>: 看截图, 不是人(衣服、手、别人身上的一块)就去' : '要去掉谁, 去') +
-    '<a href="#people" onclick="openPeople()">第 2 段的"人"</a>把他点成不要、保存, 再点继续 —— 会重出网格、重摆、重导出 FBX。</p>';
+    '<a href="#people" onclick="openPeople()">第 2 段的"人"</a>把他点成不要、保存, 再点继续 —— 会删掉他的网格(别人的不重算)、重摆、重导出 FBX。</p>';
 }
 
 function openPeople(){

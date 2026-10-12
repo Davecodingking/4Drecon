@@ -25,19 +25,24 @@ def track(A, B):
 
 
 def mesh(A, B):
+    """按**跟踪编号**对人: 10-12 起目录名就是跟踪编号, 之前是出网格时重排的 1..N(对照在 relabel.json), 两种写法能互相比。"""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pipeline"))
+    import people_identity
     worst = 0.0
-    da, db = (glob.glob(f"{x}/body4d/04_mesh_occ*/mesh_4d_individual")[0] for x in (A, B))
-    for pid in sorted(set(os.listdir(da)) | set(os.listdir(db)), key=int):
-        fa = set(os.listdir(f"{da}/{pid}")) if os.path.isdir(f"{da}/{pid}") else set()
-        fb = set(os.listdir(f"{db}/{pid}")) if os.path.isdir(f"{db}/{pid}") else set()
-        d = [float(np.abs(np.asarray(trimesh.load(f"{da}/{pid}/{f}", process=False).vertices)
-                          - np.asarray(trimesh.load(f"{db}/{pid}/{f}", process=False).vertices)).max())
+    ra, rb = (glob.glob(f"{x}/body4d/04_mesh_occ*")[0] for x in (A, B))
+    ta, tb = ({tid: d for d, tid in people_identity.track_ids(r).items()} for r in (ra, rb))     # {跟踪编号: 目录名}
+    for tid in sorted(set(ta) | set(tb)):
+        pa, pb = (f"{r}/mesh_4d_individual/{t[tid]}" if tid in t else None for r, t in ((ra, ta), (rb, tb)))
+        fa = set(os.listdir(pa)) if pa and os.path.isdir(pa) else set()
+        fb = set(os.listdir(pb)) if pb and os.path.isdir(pb) else set()
+        d = [float(np.abs(np.asarray(trimesh.load(f"{pa}/{f}", process=False).vertices)
+                          - np.asarray(trimesh.load(f"{pb}/{f}", process=False).vertices)).max())
              for f in sorted(fa & fb)]
         mx = 1000 * max(d) if d else float("nan")
         worst = max(worst, mx if d else 0.0)
         if fa != fb:
             worst = float("inf")
-        print(f"  人 {pid}: A {len(fa)} 帧, B {len(fb)} 帧, 共有 {len(d)} 帧; 顶点最大差 {mx:.4f} mm, "
+        print(f"  人 {tid}: A {len(fa)} 帧, B {len(fb)} 帧, 共有 {len(d)} 帧; 顶点最大差 {mx:.4f} mm, "
               f"中位 {1000 * float(np.median(d)) if d else float('nan'):.4f} mm" + ("   ★ 帧不一样" if fa != fb else ""))
     return worst
 
