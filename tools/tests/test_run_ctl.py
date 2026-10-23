@@ -164,6 +164,35 @@ def test_steps_view_for_the_wizard():
         assert nxt["段"] == 4 and nxt["停在"] == 5, nxt                              # 跑第 4 段, 跳过闸 4, 停在闸 5
 
 
+def test_scale_gate_in_plain_numbers():
+    """尺度闸用人话: 场景放大百分之几、几个人定的、每个人按他算场景里多高、拿物体高度对照、谁要人看一眼。
+    起因(pedestrian r1, 2026-10-23): 页面只有"场景深度 / 人体模型 = 0.87", 用户看不懂这是倍数还是高度。"""
+    import trimesh
+    with tempfile.TemporaryDirectory() as T:
+        _sandbox(T)
+        R1 = run_ctl.new_run("outdoor", "soccer", "r1", people="1", recall="0")
+        _state(R1, 2, True)
+        os.makedirs(f"{R1}/02_da3")
+        json.dump({"k": 1.05, "来源": "人",
+                   "逐类": [{"词": "car", "实例数": 8, "量到": 1.43, "真实": 1.5, "采用": True},
+                            {"词": "tree", "实例数": 3, "量到": 4.1, "真实": 10.0, "采用": False},
+                            {"词": "sign", "实例数": 4, "量到": 1.49, "真实": 1.2, "采用": True}],
+                   "人": {"每人": {"1": {"场景深度比模型": 1.0}, "2": {"场景深度比模型": 0.9}, "12": {"场景深度比模型": 2.0}},
+                          "踢掉": {"12": "离全体中位 0.95 差 110%, 超过 25%"}}},
+                  open(f"{R1}/02_da3/world_scale.json", "w"))
+        for pid, h in (("1", 1.7), ("2", 1.6), ("12", 1.2)):          # 人体网格: 一个竖着的盒子, 高 h
+            d = f"{R1}/body4d/04_mesh_occ0/mesh_4d_individual/{pid}"; os.makedirs(d)
+            trimesh.creation.box(extents=(0.4, h, 0.25)).export(f"{d}/00000000.ply")
+        sc = run_ctl.state("outdoor", "soccer", "r1")["段列表"][2]["尺度"]
+        assert sc["放大"] == 5.0 and sc["尺子人数"] == 2, sc                       # 3 个人, 踢掉 1 个
+        h = sc["身高"]
+        assert abs(h["1"]["模型"] - 1.7) < 0.02 and abs(h["1"]["场景"] - 1.7 * 1.0 * 1.05) < 0.02, h
+        assert abs(h["12"]["场景"] - 1.2 * 2.0 * 1.05) < 0.03, h                 # 按 12 号算, 场景里他有 2.5 m
+        top = sc["对照"]
+        assert [x["词"] for x in top] == ["car", "sign"], top                    # 实例最多的两类, 离群不用的 tree 不拿来对照
+        assert abs(top[0]["量到"] - 1.43 * 1.05) < 0.01 and top[0]["对"] is True and top[1]["对"] is False, top
+
+
 def test_scene_gate_offers_the_fbx_downloads():
     """验收那道闸的产出里有两个下载: 场景 + 人的 FBX、只有场景的 FBX(motion 步出的); 没出就不列。"""
     with tempfile.TemporaryDirectory() as T:

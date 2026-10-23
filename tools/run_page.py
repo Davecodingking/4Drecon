@@ -240,6 +240,7 @@ RUN_PAGE = """<!doctype html><meta charset=utf-8><title>本轮</title>""" + _STY
  a.dl:hover{border-color:currentColor}
  .decide{border-left:3px solid var(--hi);padding:2px 0 2px 12px;margin-top:14px}
  table.kv{border-collapse:collapse;font-size:13px} table.kv td{padding:3px 14px 3px 0;border-top:1px solid var(--line)}
+ .okc{color:var(--ok);font-weight:600}
  .thumb{height:64px;border-radius:4px;vertical-align:middle;margin-right:6px}
 </style>
 <div class=wrap>
@@ -362,9 +363,12 @@ function segHTML(g){
       '<span class=dim> (共 ' + c.候选 + ' 个候选' + (c.作废词.length ? ', 整词作废: ' + c.作废词.map(esc).join(', ') : '') +
       ')</span></p>';
   }
-  if (g.报告 && g.报告.length) h += '<h3>闸口报告' + (g.候选决定 ? '(到这道闸时的快照, 之后改的决定不在里面)' : '') +
-    '</h3><div class=rep>' + esc(g.报告.join('\\n')) + '</div>';
   if (g.尺度) h += scaleHTML(g.尺度);
+  if (g.报告 && g.报告.length) h += g.尺度
+    ? '<details><summary>原始报告</summary><div class=rep>' + esc(g.报告.join('\\n')) + '</div></details>'
+    : '<h3>闸口报告' + (g.候选决定 ? '(到这道闸时的快照, 之后改的决定不在里面)' : '') +
+      '</h3><div class=rep>' + esc(g.报告.join('\\n')) + '</div>';
+
   if (g.人表) h += peopleHTML(g.人表);
   if (g.跳过的物体 && g.跳过的物体.length) h += '<h3>没摆进场景的物体</h3><table class=kv>' + g.跳过的物体.map(x =>
     '<tr><td>' + esc(x.词) + ' #' + x.实例 + '</td><td>' + esc(x.原因) + '</td><td class=dim>' +
@@ -382,12 +386,34 @@ function segHTML(g){
 }
 
 function scaleHTML(sc){
-  const rows = Object.entries(sc.每人 || {}), out = sc.踢掉 || {};
-  return '<h3>尺度</h3><table class=kv><tr><td>倍数 k</td><td><b>' + sc.k + '</b></td></tr><tr><td>尺子</td><td>' +
-    esc(sc.来源) + '</td></tr></table>' + (rows.length ? '<table class=kv style="margin-top:6px">' + rows.map(([i, r]) =>
-    '<tr' + (out[i] ? ' style="opacity:.55"' : '') + '><td><img class=thumb src="' + U('/run/img', {what:'person', id:i}) + '">#' + esc(i) +
-    '</td><td>场景深度 / 人体模型 = ' + r + (out[i] ? ' <b class=warn>没当尺子</b>: ' + esc(out[i]) + ' —— 多半不是人或深度被挡, 看截图; 不是人就在挑人那栏点掉' : '') +
-    '</td></tr>').join('') + '</table><p class=note>每个人给一个比例, 取中位数当尺子。离得远、人小的那个最不准; 离群的(和别人差 25% 以上)不算。</p>' : '');
+  // ★ 2026-10-23 pedestrian r1: 原来只有"场景深度 / 人体模型 = 0.87", 用户看不懂是倍数还是高度。改成人话:
+  //   先一句结论(放大百分之几、几个人定的), 再拿物体高度对照, 再点名要人看的, 每个人的细节收起来。
+  const H = sc.身高 || {}, kicked = Object.entries(sc.踢掉 || {}), dec = {};
+  ((S.人 || {}).人 || []).forEach(r => dec[String(r.id)] = r.决定);
+  const pct = sc.放大 == null ? '' : sc.放大 >= 0 ? '放大 ' + sc.放大 + '%' : '缩小 ' + (-sc.放大) + '%';
+  const m = v => v == null ? '?' : v.toFixed(2) + ' m';
+  let h = '<h3>尺度</h3><p style="font-size:16px;font-weight:600;margin:4px 0">场景' + pct +
+    ' <span class=dim style="font-size:13px;font-weight:400">(倍数 k = ' + sc.k + ', ' +
+    (sc.来源 === '人' ? '按 ' + sc.尺子人数 + ' 个人的身高定的' : '按家具的真实高度定的') + ')</span></p>';
+  if ((sc.对照 || []).length) h += '<p>对照: ' + sc.对照.map(c => esc(c.词) + ' 按这个尺度高 ' + m(c.量到) +
+    ', 真实约 ' + c.真实 + ' m ' + (c.对 ? '<span class=okc>✓</span>' : '<b class=warn>差得多</b>')).join('; ') + '</p>';
+  if (kicked.length) h += '<h3>需要你看</h3>' + kicked.map(([i, why]) => {
+    const x = H[i] || {}, gone = dec[i] === 'drop';
+    return '<div class=row style="' + (gone ? 'opacity:.5' : '') + '"><img class=thumb src="' + U('/run/img', {what:'person', id:i}) +
+      '"><span><b>#' + esc(i) + '</b> 按他算, 他在场景里身高 <b class=warn>' + m(x.场景) + '</b>(人体模型给他 ' + m(x.模型) +
+      '), 和别人差太远, 没当尺子 —— ' + (gone ? '已点成不要' : '多半不是人或被挡住了。不是人就 <button data-drop="' + esc(i) +
+      '">点掉</button>, 是人就不用管') + '</span></div>';
+  }).join('');
+  const ids = Object.keys(sc.每人 || {}).sort((a, b) => +a - +b);
+  if (ids.length) h += '<details style="margin-top:8px"><summary>每个人按他算的身高(' + ids.length + ' 个)</summary>' +
+    '<table class=kv style="margin-top:6px">' + ids.map(i => {
+      const x = H[i] || {}, gone = dec[i] === 'drop', out = (sc.踢掉 || {})[i];
+      return '<tr' + (gone ? ' style="opacity:.5"' : '') + '><td><img class=thumb src="' + U('/run/img', {what:'person', id:i}) + '">#' + esc(i) +
+        '</td><td>场景里 ' + m(x.场景) + '</td><td class=dim>人体模型 ' + m(x.模型) + '</td><td class=dim>' +
+        (gone ? '已不要' : out ? '没当尺子' : '当尺子') + '</td></tr>';
+    }).join('') + '</table><p class=note>人体模型先按这个人的体型估一个身高; 场景深度说他离相机多远, 换算出他在场景里该有多高。' +
+    '尺度定成让这些身高的中位数对上人体模型。坐着的人这里会偏矮。</p></details>';
+  return h;
 }
 
 // 一个跟踪编号最后算谁(和 people_decisions.fate_text 是同一句)
@@ -437,7 +463,14 @@ function decideHTML(g){
       '<div class=row style="margin-top:10px"><button id=savepeople disabled>保存挑人</button><span class=note id=pcount></span></div><div class=msg id=pmsg></div>';
     return h + '</div>';
   }
-  if (g.段 === 3 && waiting) return '<div class=decide><h3>你要决定</h3><p>看上面的尺度和人体网格视频, 也可以点顶上 3D 看盒子。没问题就点继续。</p></div>';
+  if (g.段 === 3 && waiting){
+    const dec = {}; ((S.人 || {}).人 || []).forEach(r => dec[String(r.id)] = r.决定);
+    const todo = Object.keys((g.尺度 || {}).踢掉 || {}).filter(i => dec[i] !== 'drop');
+    return '<div class=decide><h3>你要决定</h3><p>' + (todo.length
+      ? '只有一件事: 上面"需要你看"里的 ' + todo.map(i => '#' + esc(i)).join('、') + ' 是不是人。看完点继续。'
+      : '尺度这里没有要你判断的, 点继续。') +
+      '<br><span class=dim>想再核对: 下面"人体网格叠回原片"的视频, 或者顶上的 3D。</span></p></div>';
+  }
   if (g.状态 === 'waiting') return '<div class=decide><h3>你要决定</h3><p>看上面的图和视频, 没问题就点继续。</p></div>';
   return '';
 }
@@ -451,6 +484,12 @@ function cardFate(id){
 }
 
 function wire(){
+  document.querySelectorAll('button[data-drop]').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    const r = await post('/api/run/people', {[b.dataset.drop]: 'drop'});
+    if (r.error){ alert(r.error); b.disabled = false; return; }
+    load();
+  });
   const pe = $('people'), rc = $('recall');
   if (pe){
     if (!cfgDirty){ pe.checked = S.有人 === '1'; rc.checked = S.召回 === '1'; }

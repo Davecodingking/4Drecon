@@ -280,6 +280,40 @@ def gate_report(R1, gate, total):
     return []
 
 
+def _model_heights(R1, ids):
+    """人体模型给的每个人的身高(米): 这个人每帧网格沿自己最长方向的长度, 取 8 帧里的 90 分位(走路时腿迈开会短一点)。
+    坐着的人会偏矮 —— 只给闸口上的人看个大概, 不进任何计算。结果按网格库 store.json 的时间缓存, 网页每 5 秒刷新不重算。"""
+    base = f"{people_decisions.auto_dir(R1)}/04_mesh_occ0"
+    cache = f"{R1}/02_da3/人体模型身高.json"
+    try:
+        stamp = os.path.getmtime(f"{base}/store.json") if os.path.exists(f"{base}/store.json") else \
+            max(os.path.getmtime(f"{base}/mesh_4d_individual/{i}") for i in ids)
+    except (OSError, ValueError):
+        return {}
+    try:
+        c = json.load(open(cache))
+        if c.get("时间") == stamp and set(ids) <= set(c["身高"]):
+            return c["身高"]
+    except (OSError, ValueError, KeyError):
+        pass
+    import numpy as np, trimesh
+    out = {}
+    for i in ids:
+        fs = sorted(glob.glob(f"{base}/mesh_4d_individual/{i}/*.ply"))
+        hs = []
+        for f in fs[::max(1, len(fs) // 8)][:8]:
+            v = np.asarray(trimesh.load(f, process=False).vertices, float); v = v - v.mean(0)
+            p = v @ np.linalg.svd(v, full_matrices=False)[2][0]
+            hs.append(float(p.max() - p.min()))
+        if hs:
+            out[i] = float(np.percentile(hs, 90))
+    try:
+        json.dump({"时间": stamp, "身高": out}, open(cache, "w"), ensure_ascii=False)
+    except OSError:
+        pass
+    return out
+
+
 def _gate_extra(check, kind, scene, run):
     """闸口要单独摆出来的结构化数字(报告原文之外)。"""
     R1 = r1_of(kind, scene, run)
@@ -304,10 +338,23 @@ def _gate_extra(check, kind, scene, run):
         except (OSError, ValueError):
             return {}
         per = (w.get("人") or {}).get("每人") or {}
+        k = float(w.get("k") or 1.0)
+        out_ = (w.get("人") or {}).get("踢掉") or {}
+        ratio = {i: v.get("场景深度比模型") for i, v in per.items()}
+        # ★ 2026-10-23 pedestrian r1: 页面只有"场景深度 / 人体模型 = 0.87", 用户看不懂是倍数还是高度。
+        #   改成人话: 场景放大百分之几、几个人定的、按每个人算他在场景里多高、拿实例最多的两类物体对照。
+        model_h = _model_heights(R1, list(ratio))
+        heights = {i: {"模型": round(model_h[i], 2), "场景": round(model_h[i] * r * k, 2)}
+                   for i, r in ratio.items() if r and i in model_h}
+        top = sorted((c for c in (w.get("逐类") or []) if c.get("真实") and c.get("量到") and c.get("采用", True)),
+                     key=lambda c: -int(c.get("实例数") or 0))[:2]
+        cmp_ = [{"词": c["词"], "实例数": c.get("实例数"), "量到": round(c["量到"] * k, 2), "真实": c["真实"],
+                 "对": abs(c["量到"] * k / c["真实"] - 1) <= 0.2} for c in top]
         return {"尺度": {"k": w.get("k"), "来源": w.get("来源") or "家具",
-                         "每人": {i: v.get("场景深度比模型") for i, v in per.items()},
+                         "放大": round((k - 1) * 100, 1), "尺子人数": len([i for i in ratio if i not in out_]),
+                         "每人": ratio, "身高": heights, "对照": cmp_,
                          # 离群、没当尺子的人和原因(world_scale.py 踢的, 见 body_into_scene.ruler_people): 网页上要标出来
-                         "踢掉": (w.get("人") or {}).get("踢掉") or {}}}
+                         "踢掉": out_}}
     if check == "check_scene":
         try:
             sk = json.load(open(f"{R1}/07_scene_skipped.json")).get("skipped", [])
