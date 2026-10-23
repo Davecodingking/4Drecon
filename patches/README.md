@@ -6,7 +6,7 @@
 文件名 = `<仓库目录>@<基于的 commit>.patch`；子模块用 `__` 连接路径。
 只有在重新 clone 原版仓库时才需要：`git -C <仓库> checkout <commit> && git -C <仓库> apply ../patches/<文件>`
 
-在用的：sam-3d-objects、sam-body4d、Depth-Anything-3、vggt-omega
+在用的：sam-3d-objects、sam-body4d、Depth-Anything-3、vggt-omega、FoundationPose(2026-10-23 起, 试验中)
 已弃用路线（留档）：SpatialGen（含子模块 Sparse-RaDeGS）、SpatialLM、InvSR、Pano2Room
 PiSA-SR 的"改动"只是删掉的 __pycache__，没导出。
 
@@ -16,3 +16,5 @@ PiSA-SR 的"改动"只是删掉的 __pycache__，没导出。
 
 2026-10-12 起 vggt-omega 也有快照: 上游文件没改过, 快照里全是我们自己写在 `vggt-omega/tools/` 下的脚本
 (`vggt_omega_geom.py` 等 6 个 + `shims/`), 同样 `git add -N` 过。之前它们哪里都没版本。
+
+2026-10-23 起 FoundationPose 也有快照: 上游文件没改, 快照里是我们的 `ours/` 脚本和 `NOTES.md`(坑、安装、自检), 同样 `git add -N` 过。
