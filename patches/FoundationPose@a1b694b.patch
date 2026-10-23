@@ -104,10 +104,10 @@ index 0000000..846af25
 +直接照用会弄坏现在没问题的东西。接进流水线前要先定规则: 比如只接受 180° 的翻转, 或者分差够大才改。
 diff --git a/ours/flip_eval.py b/ours/flip_eval.py
 new file mode 100644
-index 0000000..eececd6
+index 0000000..aef91bf
 --- /dev/null
 +++ b/ours/flip_eval.py
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,224 @@
 +"""FP 判前后的离线实验(2026-10-23): 不改流水线, 拿一轮已经摆好的场景, 每个物体在
 +"现在摆的朝向"和"绕竖直轴转 180°"之间让 FP 选。只读那一轮的文件, 结果写到 --out。
 +
@@ -214,6 +214,7 @@ index 0000000..eececd6
 +    c = mesh.bounds.mean(0); mesh.vertices -= c                       # 物体系: 原点在盒子中心, 轴和世界系一致
 +    Tc = np.eye(4); Tc[:3, 3] = c
 +    cur = w2c @ Tc; flip = cur @ rot_about(UP, 180)                   # 绕"天"转 180°
++    Pc0 = cur.copy()                                                  # 原流程摆的, 出对比图用
 +    est = FoundationPose(model_pts=mesh.vertices, model_normals=mesh.vertex_normals, mesh=mesh, scorer=scorer, refiner=refiner,
 +                         glctx=glctx, debug=0, debug_dir=a.out)
 +    assert np.allclose(est.get_tf_to_centered_mesh().cpu().numpy(), np.eye(4), atol=1e-4)
@@ -317,13 +318,17 @@ index 0000000..eececd6
 +               修后打分=[round(x, 2) for x in S1], 修正转了几度=[round(x, 1) for x in drift],
 +               只打分选=("现在" if S0[0] >= S0[1] else "转180"), 修后选=("现在" if S1[0] >= S1[1] else "转180"), **row_grid)
 +    rows.append(row); print(json.dumps(row, ensure_ascii=False))
-+    # 对比图: 照片(抠图框) | 现在 | 转 180°, 都裁到物体附近
++    # 对比图: 照片 | 原流程摆的 | FP 挑的(没跑 FP 时只有前两格)。标题单独一条, 不压在图上
 +    ys, xs = np.nonzero(mask | sil); y0, y1 = max(0, ys.min() - 20), min(H, ys.max() + 20); x0, x1 = max(0, xs.min() - 20), min(W, xs.max() + 20)
++    now_tile = np.where(sil[..., None], to_rgb8(col[0]) if False else rgb, rgb)
++    c0, d0, _ = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=torch.as_tensor(Pc0[None], dtype=torch.float, device="cuda"), glctx=glctx, mesh_tensors=est.mesh_tensors)
++    now_tile = np.where((d0[0].cpu().numpy() > 0.001)[..., None], to_rgb8(c0[0]), (rgb * 0.35).astype(np.uint8))
 +    tiles = []
-+    for img in (rgb, ) + tuple(np.where((dep[i].cpu().numpy() > 0.001)[..., None], to_rgb8(col[i]), (rgb * 0.35).astype(np.uint8)) for i in (0, 1)) + ((best_tile,) if best_tile is not None else ()):
-+        t = img[y0:y1, x0:x1]; t = cv2.resize(t, (int(t.shape[1] * 220 / t.shape[0]), 220)); tiles.append(t)
-+    sheet = np.hstack(tiles)[..., ::-1].copy()
-+    cv2.putText(sheet, f"{node} f{f} | photo | now | flip180 | FP pick ({row_grid.get('第一名离现在', '-')} deg from now)", (6, 18), 0, 0.5, (0, 255, 255), 1)
++    for img in (rgb, now_tile) + ((best_tile,) if best_tile is not None else ()):
++        t = img[y0:y1, x0:x1]; t = cv2.resize(t, (int(t.shape[1] * 260 / t.shape[0]), 260)); tiles.append(np.pad(t, ((0, 0), (0, 6), (0, 0))))
++    body = np.hstack(tiles)[..., ::-1].copy(); bar = np.zeros((30, body.shape[1], 3), np.uint8)
++    lab = f"{node} (frame {f})   photo | ours (pipeline)" + (f" | FP (turned {row_grid['绕天转了']:.0f} deg)" if "绕天转了" in row_grid else "")
++    cv2.putText(bar, lab, (6, 21), 0, 0.6, (0, 255, 255), 1); sheet = np.vstack([bar, body])
 +    cv2.imwrite(f"{a.out}/{node}.jpg", sheet)
 +json.dump(rows, open(f"{a.out}/flip_eval.json", "w"), ensure_ascii=False, indent=1)
 +print(f"共 {len(rows)} 个物体 -> {a.out}/flip_eval.json")
