@@ -1,9 +1,9 @@
 diff --git a/NOTES.md b/NOTES.md
 new file mode 100644
-index 0000000..c612eb2
+index 0000000..846af25
 --- /dev/null
 +++ b/NOTES.md
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,98 @@
 +# FoundationPose 笔记(2026-10-23 调研 + 安装)
 +
 +用途: 只让 FP 判断物体前后(我们摆好的朝向 vs 转 180°), 位置和大小仍用我们量盒子的结果。
@@ -88,6 +88,20 @@ index 0000000..c612eb2
 +   只绕天转(24 个, 每 15°)就够, 快 6 倍, 也不会选出躺着的。
 +10. 物体被挡住时摆放和照片的轮廓重合度很低(0.1~0.4), 深度对得上(差几厘米), 主要是左右偏几十像素。
 +11. 修正网络会把位置挪很远(绕天 24 个那组位置差中位十几厘米, 最多 88 cm): 只取它的转角, 位置用我们的。
++
++### 结论(2026-10-23, 正确答案是 Claude 看图标的: ours/runs/office_r1_fp_标注.json)
++
++39 个物体里只有 7 个能从照片看出朝向(显示器、笔记本、几把椅子、一扇门); 其余 32 个前后长得一样(桌子、盆栽、窗、柜子)
++或者图太糊、生成网格和实物不像, 判不了 —— 这些翻不翻看不出区别。7 个能判的:
++
++| | 对几个 |
++|---|---|
++| 现在流水线摆的 | 2 / 7 |
++| FP 原版(252 个朝向) | 4 / 7 |
++| FP 只绕天转 24 个 | **6 / 7**(错的是 door_2: 现在摆的和 FP 都差 90°) |
++
++但只绕天转那组在 32 个"分不出"的里有 11 个选了侧向(转 90° 左右), 对长方形的桌子会把它整个横过来 ——
++直接照用会弄坏现在没问题的东西。接进流水线前要先定规则: 比如只接受 180° 的翻转, 或者分差够大才改。
 diff --git a/ours/flip_eval.py b/ours/flip_eval.py
 new file mode 100644
 index 0000000..eececd6
@@ -313,6 +327,16 @@ index 0000000..eececd6
 +    cv2.imwrite(f"{a.out}/{node}.jpg", sheet)
 +json.dump(rows, open(f"{a.out}/flip_eval.json", "w"), ensure_ascii=False, indent=1)
 +print(f"共 {len(rows)} 个物体 -> {a.out}/flip_eval.json")
+diff --git "a/ours/runs/office_r1_fp_\346\240\207\346\263\250.json" "b/ours/runs/office_r1_fp_\346\240\207\346\263\250.json"
+new file mode 100644
+index 0000000..743e793
+--- /dev/null
++++ "b/ours/runs/office_r1_fp_\346\240\207\346\263\250.json"
+@@ -0,0 +1,4 @@
++{"说明": "2026-10-23 Claude 看对比图(照片|现在|转180)标的正确朝向。分不出 = 前后长得一样(桌子/盆栽/窗)或图太糊/生成网格和实物不像。office_chair_8 把握中等。",
++ "现在": ["computer_monitor_1", "computer_monitor_6"],
++ "转180": ["office_chair_8", "computer_monitor_2", "computer_monitor_12"],
++ "侧向": ["office_chair_1", "door_2"]}
 diff --git a/ours/selftest.py b/ours/selftest.py
 new file mode 100644
 index 0000000..36830ce
