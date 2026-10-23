@@ -1,9 +1,9 @@
 diff --git a/NOTES.md b/NOTES.md
 new file mode 100644
-index 0000000..93308e3
+index 0000000..c612eb2
 --- /dev/null
 +++ b/NOTES.md
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,84 @@
 +# FoundationPose 笔记(2026-10-23 调研 + 安装)
 +
 +用途: 只让 FP 判断物体前后(我们摆好的朝向 vs 转 180°), 位置和大小仍用我们量盒子的结果。
@@ -66,6 +66,253 @@ index 0000000..93308e3
 +- 权重(Google Drive, 本机能连): `weights/2023-10-28-18-33-37/model_best.pth` 修正网络 68 MB,
 +  `weights/2024-01-11-20-02-45/model_best.pth` 打分网络 190 MB。
 +- 不用 Docker: 官方镜像是旧 CUDA, 和我们的 conda 流程不一致。
++
++## 实验: office r1(原 r12)39 个物体判前后(2026-10-23, ours/flip_eval.py)
++
++每个物体放回它生成时那一帧(06_solo.log 的"第 N 帧"), 用那一帧的 DA3 深度和 SAM3 抠图, 变换和渲染回图同一个(world_frame.inverse_T)。
++结果在 `ours/runs/office_r1_fp_orig/`(原版 register 原样) 和 `office_r1_fp_yaw/`(我们的位置 + 只绕天转 24 个), 每个物体一张图:
++照片 | 现在 | 转 180° | FP 挑的。前几轮试错的在 `ours/runs/_试错/`。
++
++| | 原版 252 个朝向 | 只绕天转 24 个 |
++|---|---|---|
++| 每个物体 | 1.37 秒 | 0.23 秒 |
++| 39 个合计 | 53 秒 | 9 秒 |
++| 同意现在 / 转180 / 侧向 | 8 / 18 / 13 | 11 / 16 / 12 |
++| 结果歪了 20° 以上(躺着、倒着) | 20 个 | 2 个 |
++两种结论一致 25/39。**准不准还不知道: 要人标正确答案。** 已确认的一个: computer_monitor_2 现在摆反了(照片是屏幕正面, 现在渲染出来是背面), 两种都选对。
++
++试错时踩到的(都记在这里免得再踩):
++8. 只给打分网络 2 个候选(现在 / 转 180°)分不出来: 两个分数只差 0.1~1。它是把一批候选放在一起互相比(score_network.py 里
++   的 att_cross), 训练时一批几百个。照片和深度都换成完美的渲染假图也一样分不出 -> 不是数据问题, 是候选太少。
++9. 原版 252 个朝向是整个球面(42 个"哪一面朝相机" x 6 个"绕视线转"), 包括躺着、倒立; 我们的家具都正立,
++   只绕天转(24 个, 每 15°)就够, 快 6 倍, 也不会选出躺着的。
++10. 物体被挡住时摆放和照片的轮廓重合度很低(0.1~0.4), 深度对得上(差几厘米), 主要是左右偏几十像素。
++11. 修正网络会把位置挪很远(绕天 24 个那组位置差中位十几厘米, 最多 88 cm): 只取它的转角, 位置用我们的。
+diff --git a/ours/flip_eval.py b/ours/flip_eval.py
+new file mode 100644
+index 0000000..eececd6
+--- /dev/null
++++ b/ours/flip_eval.py
+@@ -0,0 +1,219 @@
++"""FP 判前后的离线实验(2026-10-23): 不改流水线, 拿一轮已经摆好的场景, 每个物体在
++"现在摆的朝向"和"绕竖直轴转 180°"之间让 FP 选。只读那一轮的文件, 结果写到 --out。
++
++每个物体:
++  1. 从 07_scene_phy.glb 取出摆好的网格, 用 world_frame.inverse_T 转回 DA3 世界系(和渲染回图同一个变换)
++  2. 用生成时那一帧(06_solo.log 里"第 N 帧")的相机、DA3 深度、SAM3 抠图
++  3. 先核对: 按现在的位姿渲染出轮廓, 和抠图算重合度(IoU)。对不上说明变换错了, 后面的打分没意义
++  4. 两个候选: 现在的朝向 / 绕"天"转 180°。打分两种都记: 只打分(不修), 和修正 2 轮之后再打分
++  5. 存一张对比图: 照片 | 按现在朝向渲染 | 按转 180° 渲染
++用法: python ours/flip_eval.py --r1 <轮次目录> --out <输出目录> [--only 词_号,...]"""
++import sys, os, re, json, argparse, logging, warnings
++warnings.filterwarnings("ignore")
++HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); sys.path.insert(0, HERE)
++sys.path.insert(0, os.path.expanduser("~/sam3d/data/outdoor/scripts"))
++from estimater import *
++from pycocotools import mask as mask_util
++from world_frame import load_up, inverse_T
++logging.getLogger().setLevel(logging.WARNING)
++
++ap = argparse.ArgumentParser(); ap.add_argument("--r1", required=True); ap.add_argument("--out", required=True)
++ap.add_argument("--scene", default="07_scene_phy.glb"); ap.add_argument("--only", default="")
++ap.add_argument("--mode", default="", help="orig = 原版 register() 原样(252 个朝向、自己猜位置); yaw = 我们的位置 + 只绕天转 --nyaw 个")
++ap.add_argument("--nyaw", type=int, default=24)
++ap.add_argument("--grid", type=int, default=0, help="1 = 按 FP 原本用法: 位置用我们对齐的, 朝向从它的 252 个候选里挑, 再看离现在/转180 哪个近")
++ap.add_argument("--diag", type=int, default=0, help="1 = 诊断: 照片/深度分别换成按现在朝向渲染的假图再打分")
++ap.add_argument("--full", type=int, default=0, help="1 = 用原视频帧的分辨率(深度插值放大, 内参按比例放大)")
++a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
++R1 = a.r1; DA3 = f"{R1}/02_da3"; FR = f"{os.path.dirname(R1)}/frames_{os.path.basename(R1)}"
++
++cams = json.load(open(f"{DA3}/cameras.json"))["cameras"]
++UP, _, _ = load_up(DA3, "fp 判前后"); UP = np.asarray(UP, float); UP /= np.linalg.norm(UP)
++INV = inverse_T(UP)
++# 生成时用的帧: "[office chair#8] 第59帧 占3.30% (68346px) -> off_r12_office_chair_8"
++gen = {}
++for l in open(f"{R1}/logs/06_solo.log"):
++    m = re.match(r"\[(.+)#(\d+)\] 第(\d+)帧", l)
++    if m: gen[(m.group(1), int(m.group(2)))] = int(m.group(3))
++
++def rot_about(axis, deg):
++    a_ = np.deg2rad(deg); k = axis / np.linalg.norm(axis); Kx = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
++    T = np.eye(4); T[:3, :3] = np.eye(3) + np.sin(a_) * Kx + (1 - np.cos(a_)) * Kx @ Kx; return T
++
++def mask_of(word, oid, frame, hw):
++    z = np.load(f"{R1}/03_masks/{word.replace(' ', '_')}.npz", allow_pickle=True)
++    meta, counts, (H, W) = z["meta"], z["counts"], z["hw"]
++    i = np.where((meta["oid"] == oid) & (meta["frame"] == frame))[0]
++    if not len(i): return None
++    m = mask_util.decode({"counts": counts[i[0]], "size": [int(H), int(W)]}).astype(np.uint8)
++    return cv2.resize(m, (hw[1], hw[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
++
++def align_ts(P, verts, dep_r, depth, mask, K, iters=30):
++    """朝向不动, 只调位置和大小, 让网格**看得到的那部分**贴上抠图里的深度点。返回新位姿和平均距离(米)。"""
++    from scipy.spatial import cKDTree
++    H, W = depth.shape
++    v_cam = verts @ P[:3, :3].T + P[:3, 3]
++    uv = v_cam @ K.T; u = np.round(uv[:, 0] / uv[:, 2]).astype(int); v = np.round(uv[:, 1] / uv[:, 2]).astype(int)
++    ok = (u >= 0) & (u < W) & (v >= 0) & (v < H)
++    vis = np.zeros(len(verts), bool)
++    vis[ok] = np.abs(dep_r[v[ok], u[ok]] - v_cam[ok, 2]) < 0.03       # 渲染深度 = 自己的深度 -> 没被自己挡住
++    if vis.sum() < 30: return P, float("nan")
++    ys, xs = np.nonzero(mask & (depth > 0.01))
++    if len(ys) < 30: return P, float("nan")
++    sel = np.random.default_rng(0).choice(len(ys), min(3000, len(ys)), replace=False)
++    z = depth[ys[sel], xs[sel]]; Y = np.stack([(xs[sel] - K[0, 2]) * z / K[0, 0], (ys[sel] - K[1, 2]) * z / K[1, 1], z], 1)
++    V0 = verts[vis] @ P[:3, :3].T                                   # 以物体中心为原点、相机朝向的顶点
++    t = P[:3, 3].copy(); s_ = 1.0
++    for _ in range(iters):
++        V = V0 * s_ + t; d, nn = cKDTree(V).query(Y)
++        keep = d < np.percentile(d, 90)                             # 甩掉最远的 10%(抠图边上混进的背景)
++        t = t + (Y[keep] - V[nn[keep]]).mean(0)
++        A = V0[nn[keep]]; s_ = float(np.clip(((Y[keep] - t) * A).sum() / max(1e-9, (A * A).sum()), 0.8, 1.25))
++    V = V0 * s_ + t; d, _ = cKDTree(V).query(Y)
++    Q = P.copy(); Q[:3, :3] = P[:3, :3] * s_; Q[:3, 3] = t
++    return Q, float(np.median(d))
++
++
++def to_rgb8(c): return (c.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
++
++sc = trimesh.load(f"{R1}/{a.scene}")
++skip = re.compile(r"^(wall|floor|pillar|ground|column)(_\d+)?$")
++only = set(x for x in a.only.split(",") if x)
++glctx = dr.RasterizeCudaContext(); scorer = ScorePredictor(); refiner = PoseRefinePredictor()
++rows = []
++for node in sc.graph.nodes_geometry:
++    if skip.match(node) or (only and node not in only): continue
++    word, oid = node.rsplit("_", 1)[0].replace("_", " "), int(node.rsplit("_", 1)[1])
++    if (word, oid) not in gen: print(f"{node}: 06_solo.log 里找不到生成帧, 跳过"); continue
++    f = gen[(word, oid)]; fn = f"{f:04d}.jpg"; cam = cams.get(fn)
++    if cam is None: print(f"{node}: 第 {f} 帧没有相机, 跳过"); continue
++    K = np.array(cam["intrinsic_3x3"], float); w2c = np.array(cam["extrinsic_w2c_4x4"], float).reshape(4, 4)
++    depth = np.load(f"{DA3}/depth/{f:04d}_depth.npy").astype(np.float32); H, W = depth.shape
++    img = cv2.imread(f"{FR}/{fn}")[..., ::-1]
++    if a.full:   # ★ 原图分辨率: 深度 688x384 下 5 米外的椅子只有 ~80 px 高, FP 裁出来放大到 160 再比, 细节全糊
++        Hf, Wf = img.shape[:2]; K = K.copy(); K[0] *= Wf / W; K[1] *= Hf / H
++        depth = cv2.resize(depth, (Wf, Hf), interpolation=cv2.INTER_LINEAR); H, W = Hf, Wf; rgb = np.ascontiguousarray(img)
++    else:
++        rgb = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
++    mask = mask_of(word, oid, f, (H, W))
++    if mask is None or mask.sum() < 20: print(f"{node}: 第 {f} 帧没有抠图, 跳过"); continue
++
++    T, g = sc.graph[node]; mesh = sc.geometry[g].copy(); mesh.apply_transform(T); mesh.apply_transform(INV)   # -> DA3 世界系
++    if isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals) and not hasattr(mesh.visual.material, "image"):
++        mesh.visual.material = mesh.visual.material.to_simple()     # ★ FP 只认普通贴图(见 NOTES.md 坑 6)
++    c = mesh.bounds.mean(0); mesh.vertices -= c                       # 物体系: 原点在盒子中心, 轴和世界系一致
++    Tc = np.eye(4); Tc[:3, 3] = c
++    cur = w2c @ Tc; flip = cur @ rot_about(UP, 180)                   # 绕"天"转 180°
++    est = FoundationPose(model_pts=mesh.vertices, model_normals=mesh.vertex_normals, mesh=mesh, scorer=scorer, refiner=refiner,
++                         glctx=glctx, debug=0, debug_dir=a.out)
++    assert np.allclose(est.get_tf_to_centered_mesh().cpu().numpy(), np.eye(4), atol=1e-4)
++    P = torch.as_tensor(np.stack([cur, flip]), dtype=torch.float, device="cuda")
++    col, dep, _ = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=P, glctx=glctx, mesh_tensors=est.mesh_tensors)
++    sil = dep[0].cpu().numpy() > 0.001
++    iou = float((sil & mask).sum() / max(1, (sil | mask).sum()))
++    dsc = float(np.median(depth[mask])); drd = float(np.median(dep[0].cpu().numpy()[sil])) if sil.any() else float("nan")
++    cy_m, cx_m = np.argwhere(mask).mean(0); cy_s, cx_s = (np.argwhere(sil).mean(0) if sil.any() else (np.nan, np.nan))
++    print(f"  [{node}] 抠图深度中位 {dsc:.2f} m, 渲染深度中位 {drd:.2f} m, 渲染面积/抠图面积 {sil.sum()/mask.sum():.2f}, "
++          f"中心差 ({cx_s-cx_m:+.0f}, {cy_s-cy_m:+.0f}) px")
++    Pa, dists = [], []
++    for i in (0, 1):
++        Q, dd = align_ts(P[i].cpu().numpy(), mesh.vertices, dep[i].cpu().numpy(), depth, mask, K); Pa.append(Q); dists.append(dd)
++    # ★ FP 的网格不能带缩放: 把对齐出来的大小乘进网格太麻烦, 这里只取对齐后的位置, 大小差在 0.8~1.25 内由修正网络消化
++    for Q in Pa:
++        sc_ = np.cbrt(np.linalg.det(Q[:3, :3])); Q[:3, :3] /= sc_
++    P = torch.as_tensor(np.stack(Pa), dtype=torch.float, device="cuda")
++    col, dep, _ = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=P, glctx=glctx, mesh_tensors=est.mesh_tensors)
++    ious = [float(((dep[i].cpu().numpy() > 0.001) & mask).sum() / max(1, ((dep[i].cpu().numpy() > 0.001) | mask).sum())) for i in (0, 1)]
++    S0, _ = scorer.predict(mesh=est.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=P.cpu().numpy(), normal_map=None,
++                           mesh_tensors=est.mesh_tensors, glctx=glctx, mesh_diameter=est.diameter)
++    row_grid, best_tile = {}, None
++    if a.mode:
++        def angle(A, B): return float(np.degrees(np.arccos(np.clip((np.trace(A[:3, :3].T @ B[:3, :3]) - 1) / 2, -1, 1))))
++        def yaw_of(Pc_, Q):   # Q 相对 Pc_ 绕天转了多少度(只看水平面里的转角)
++            Rrel = np.linalg.inv(w2c[:3, :3]) @ Q[:3, :3] @ Pc_[:3, :3].T @ w2c[:3, :3]   # 世界系里的相对旋转
++            e1 = np.cross(UP, [1, 0, 0]); e1 = e1 / np.linalg.norm(e1) if np.linalg.norm(e1) > 1e-6 else np.cross(UP, [0, 0, 1])
++            e2 = np.cross(UP, e1); x = Rrel @ e1
++            return float(np.degrees(np.arctan2(x @ e2, x @ e1))) % 360, float(np.degrees(np.arccos(np.clip((Rrel @ UP) @ UP, -1, 1))))
++        Pc = P[0].cpu().numpy()
++        torch.cuda.synchronize(); t0 = time.time()
++        if a.mode == "orig":
++            best = est.register(K=K, rgb=rgb, depth=depth, ob_mask=mask, iteration=5)   # 原版原样: 预处理深度 + 猜位置 + 252 个
++        else:
++            dpp = erode_depth(depth, radius=2, device="cuda"); dpp = bilateral_filter_depth(dpp, radius=2, device="cuda")   # 和原版同样的预处理
++            dpp = dpp.cpu().numpy() if torch.is_tensor(dpp) else dpp
++            G = np.stack([Pc @ np.linalg.inv(Tc) @ np.eye(4) for _ in range(1)])  # 占位, 下面重建
++            cands = []
++            for k_ in range(a.nyaw):
++                R = rot_about(UP, 360.0 * k_ / a.nyaw)                       # 世界系里绕天转(过物体中心)
++                cands.append(w2c @ Tc @ R)
++            cands = np.stack(cands); cands[:, :3, 3] = Pc[:3, 3]             # 位置: 我们对齐好的
++            Gr, _ = refiner.predict(mesh=est.mesh, mesh_tensors=est.mesh_tensors, rgb=rgb, depth=dpp, K=K, ob_in_cams=cands,
++                                    normal_map=None, xyz_map=depth2xyzmap(dpp, K), glctx=glctx, mesh_diameter=est.diameter, iteration=5)
++            Sg, _ = scorer.predict(mesh=est.mesh, rgb=rgb, depth=dpp, K=K, ob_in_cams=Gr.cpu().numpy(), normal_map=None,
++                                   mesh_tensors=est.mesh_tensors, glctx=glctx, mesh_diameter=est.diameter)
++            Sg = np.asarray(Sg.cpu() if torch.is_tensor(Sg) else Sg, float); best = Gr.cpu().numpy()[int(np.argmax(Sg))]
++        torch.cuda.synchronize(); dt = time.time() - t0
++        yaw, tilt = yaw_of(Pc, best)
++        pick = "现在" if min(yaw, 360 - yaw) <= 45 else ("转180" if abs(yaw - 180) <= 45 else "侧向")
++        row_grid = dict(FP第一名=pick, 绕天转了=round(yaw, 1), 歪了=round(tilt, 1), 用时秒=round(dt, 2),
++                        位置差cm=round(float(np.linalg.norm(best[:3, 3] - Pc[:3, 3])) * 100, 1))
++        print(f"  [{a.mode} {node}] 绕天转了 {yaw:.0f}° 歪了 {tilt:.0f}° -> {pick}, 位置差 {row_grid['位置差cm']} cm, {dt:.2f} 秒")
++        cb, db, _ = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=torch.as_tensor(best[None], dtype=torch.float, device="cuda"),
++                                      glctx=glctx, mesh_tensors=est.mesh_tensors)
++        best_tile = np.where((db[0].cpu().numpy() > 0.001)[..., None], to_rgb8(cb[0]), (rgb * 0.35).astype(np.uint8))
++    if a.grid:
++        def angle(A, B): return float(np.degrees(np.arccos(np.clip((np.trace(A[:3, :3].T @ B[:3, :3]) - 1) / 2, -1, 1))))
++        fake = None
++        if a.diag:
++            s0 = dep[0].cpu().numpy() > 0.001
++            fake = (np.where(s0[..., None], to_rgb8(col[0]), rgb), np.where(s0, dep[0].cpu().numpy(), depth).astype(np.float32))
++        for name, R_, D_ in (("真照片", rgb, depth),) + ((("渲染假图(现在朝向)",) + fake,) if fake else ()):
++            G = est.rot_grid.clone(); G[:, :3, 3] = P[0, :3, 3]          # 位置: 我们对齐好的; 朝向: FP 自己的 252 个
++            Gr, _ = refiner.predict(mesh=est.mesh, mesh_tensors=est.mesh_tensors, rgb=R_, depth=D_, K=K, ob_in_cams=G.cpu().numpy(),
++                                    normal_map=None, xyz_map=depth2xyzmap(D_, K), glctx=glctx, mesh_diameter=est.diameter, iteration=5)
++            Sg, _ = scorer.predict(mesh=est.mesh, rgb=R_, depth=D_, K=K, ob_in_cams=Gr.cpu().numpy(), normal_map=None,
++                                   mesh_tensors=est.mesh_tensors, glctx=glctx, mesh_diameter=est.diameter)
++            Sg = np.asarray(Sg.cpu() if torch.is_tensor(Sg) else Sg, float); Gr = Gr.cpu().numpy(); o = np.argsort(-Sg)
++            Pc, Pf = P[0].cpu().numpy(), P[1].cpu().numpy()
++            top = [(round(Sg[j], 2), round(angle(Gr[j], Pc), 1), round(angle(Gr[j], Pf), 1)) for j in o[:3]]
++            # 离现在近的里面最高分 vs 离转180近的里面最高分
++            near_c = [Sg[j] for j in range(len(Sg)) if angle(Gr[j], Pc) < 45]; near_f = [Sg[j] for j in range(len(Sg)) if angle(Gr[j], Pf) < 45]
++            pick = "现在" if angle(Gr[o[0]], Pc) < angle(Gr[o[0]], Pf) else "转180"
++            print(f"  [252候选 {node}] {name}: 第一名离现在 {top[0][1]}° / 离转180 {top[0][2]}° -> {pick}; 前三(分,离现在,离转180) {top}; "
++                  f"现在附近最高 {max(near_c) if near_c else None:.2f}, 转180附近最高 {max(near_f) if near_f else float('nan'):.2f}")
++            if name == "真照片":
++                row_grid = dict(FP第一名=pick, 第一名离现在=top[0][1], 第一名离转180=top[0][2],
++                                现在附近最高=round(max(near_c), 2) if near_c else None, 转180附近最高=round(max(near_f), 2) if near_f else None)
++                cb, db, _ = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=torch.as_tensor(Gr[o[0]][None], dtype=torch.float, device="cuda"),
++                                              glctx=glctx, mesh_tensors=est.mesh_tensors)
++                best_tile = np.where((db[0].cpu().numpy() > 0.001)[..., None], to_rgb8(cb[0]), (rgb * 0.35).astype(np.uint8))
++    if a.diag and not a.grid:
++        fr_rgb = to_rgb8(col[0]); fr_dep = dep[0].cpu().numpy().astype(np.float32); sil0 = fr_dep > 0.001
++        fake_rgb = np.where(sil0[..., None], fr_rgb, rgb); fake_dep = np.where(sil0, fr_dep, depth)
++        for name, R_, D_ in (("真照片+真深度", rgb, depth), ("渲染图+真深度", fake_rgb, depth),
++                             ("真照片+渲染深度", rgb, fake_dep), ("渲染图+渲染深度", fake_rgb, fake_dep)):
++            Sd, _ = scorer.predict(mesh=est.mesh, rgb=R_, depth=D_, K=K, ob_in_cams=P.cpu().numpy(), normal_map=None,
++                                   mesh_tensors=est.mesh_tensors, glctx=glctx, mesh_diameter=est.diameter)
++            Sd = np.asarray(Sd.cpu() if torch.is_tensor(Sd) else Sd, float)
++            print(f"  [诊断 {node}] {name}: 现在 {Sd[0]:.2f} / 转180 {Sd[1]:.2f}  差 {Sd[0]-Sd[1]:+.2f}")
++    Pr, _ = refiner.predict(mesh=est.mesh, mesh_tensors=est.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=P.cpu().numpy(),
++                            normal_map=None, xyz_map=depth2xyzmap(depth, K), glctx=glctx, mesh_diameter=est.diameter, iteration=2)
++    S1, _ = scorer.predict(mesh=est.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=Pr.cpu().numpy(), normal_map=None,
++                           mesh_tensors=est.mesh_tensors, glctx=glctx, mesh_diameter=est.diameter)
++    S0 = np.asarray(S0.cpu() if torch.is_tensor(S0) else S0, float); S1 = np.asarray(S1.cpu() if torch.is_tensor(S1) else S1, float)
++    Pr = Pr.cpu().numpy()
++    drift = [float(np.degrees(np.arccos(np.clip((np.trace(Pr[i][:3, :3].T @ P[i].cpu().numpy()[:3, :3]) - 1) / 2, -1, 1)))) for i in (0, 1)]
++    row = dict(物体=node, 帧=f, 抠图像素=int(mask.sum()), 轮廓IoU=round(iou, 3), 对齐后IoU=[round(x, 3) for x in ious], 对齐后距离cm=[round(x*100, 1) for x in dists], 只打分=[round(x, 2) for x in S0],
++               修后打分=[round(x, 2) for x in S1], 修正转了几度=[round(x, 1) for x in drift],
++               只打分选=("现在" if S0[0] >= S0[1] else "转180"), 修后选=("现在" if S1[0] >= S1[1] else "转180"), **row_grid)
++    rows.append(row); print(json.dumps(row, ensure_ascii=False))
++    # 对比图: 照片(抠图框) | 现在 | 转 180°, 都裁到物体附近
++    ys, xs = np.nonzero(mask | sil); y0, y1 = max(0, ys.min() - 20), min(H, ys.max() + 20); x0, x1 = max(0, xs.min() - 20), min(W, xs.max() + 20)
++    tiles = []
++    for img in (rgb, ) + tuple(np.where((dep[i].cpu().numpy() > 0.001)[..., None], to_rgb8(col[i]), (rgb * 0.35).astype(np.uint8)) for i in (0, 1)) + ((best_tile,) if best_tile is not None else ()):
++        t = img[y0:y1, x0:x1]; t = cv2.resize(t, (int(t.shape[1] * 220 / t.shape[0]), 220)); tiles.append(t)
++    sheet = np.hstack(tiles)[..., ::-1].copy()
++    cv2.putText(sheet, f"{node} f{f} | photo | now | flip180 | FP pick ({row_grid.get('第一名离现在', '-')} deg from now)", (6, 18), 0, 0.5, (0, 255, 255), 1)
++    cv2.imwrite(f"{a.out}/{node}.jpg", sheet)
++json.dump(rows, open(f"{a.out}/flip_eval.json", "w"), ensure_ascii=False, indent=1)
++print(f"共 {len(rows)} 个物体 -> {a.out}/flip_eval.json")
 diff --git a/ours/selftest.py b/ours/selftest.py
 new file mode 100644
 index 0000000..36830ce
