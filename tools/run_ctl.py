@@ -195,6 +195,7 @@ def media_paths(kind, scene, run):
             "render":    (f"{R1}/08_render_back_phy.jpg", "渲染回图: 实拍 | 重建 | 叠加"),
             "people4d":  (f"{R1}/09_people_check.mp4", "带人的验收视频: 原片 | 重建+人 | 叠加"),
             "people4d_prev": (f"{R1}/09_people_check_prev.mp4", "上一版带人验收视频(重跑前的, 对比用)"),
+            "people4d_2col": (f"{R1}/09_people_check_两列.mp4", "带人的验收视频, 两列: 原片 | 重建+人(从三列那份剪掉叠加列, 有才显示)"),
             "blender":   (f"{mo}_blender.mp4", "Blender 里从原视频的视角渲的视频(场景 + 人, 用的就是交付的那份数据)"),
             # 交付的文件: 页面上是下载链接, 不是图
             "fbx_scene_people": (f"{mo}_scene_people.fbx", "场景 + 人 + 相机的 FBX(人带骨骼动画, 相机带每帧的位姿和焦距)"),
@@ -202,7 +203,7 @@ def media_paths(kind, scene, run):
 
 GATE_MEDIA = {"check_ground": ["ground"], "check_picks": ["sheet", "check", "track"], "check_scale": ["overlay"],
               "check_recall": ["recall2d"],
-              "check_scene": ["render", "people4d", "people4d_prev", "blender", "fbx_scene_people", "fbx_scene"]}
+              "check_scene": ["render", "people4d", "people4d_2col", "people4d_prev", "blender", "fbx_scene_people", "fbx_scene"]}
 
 
 _PIPE_MOD = {}
