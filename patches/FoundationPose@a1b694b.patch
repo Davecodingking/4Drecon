@@ -1,9 +1,9 @@
 diff --git a/NOTES.md b/NOTES.md
 new file mode 100644
-index 0000000..846af25
+index 0000000..a0daa8b
 --- /dev/null
 +++ b/NOTES.md
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,112 @@
 +# FoundationPose 笔记(2026-10-23 调研 + 安装)
 +
 +用途: 只让 FP 判断物体前后(我们摆好的朝向 vs 转 180°), 位置和大小仍用我们量盒子的结果。
@@ -102,12 +102,26 @@ index 0000000..846af25
 +
 +但只绕天转那组在 32 个"分不出"的里有 11 个选了侧向(转 90° 左右), 对长方形的桌子会把它整个横过来 ——
 +直接照用会弄坏现在没问题的东西。接进流水线前要先定规则: 比如只接受 180° 的翻转, 或者分差够大才改。
++
++## 接进流水线(2026-10-28, 室内物体链的 fpose 步, pipeline/fp_yaw.py)
++
++用户看过 32 个"分不出"的对比图, 定了: **全部按 FP 的角度转, 位置和大小不动**(上面"只接受 180°"那条规则不要)。
++排在组装之后、摆人之前; 原摆放存 `07_scene_摆放.glb`, 每个物体转了几度在 `07_fp_yaw.json`, 对比图在 `07_fp_yaw/`。开关 `FP_YAW`(默认 1)。
++做法和实验的"只绕天转 24 个"一样, 只是读的是组装刚出的 07_scene.glb(实验读的是物理之后的 07_scene_phy.glb, 起点差几厘米)。
++
++12. **慢在建对象, 不在 FP 本身**: 每个物体 5.4 秒里, `compute_mesh_diameter` 在 CPU 上算 1 万个点两两距离 3.8 秒,
++    `reset_object` 往 /tmp 存一份带贴图的 obj 0.7 秒(用不上, 也从不删 —— 10-23 到 10-28 堆了两百多个、四百多 MB)。
++    fp_yaw.py 里换成显卡算直径、建对象时不存 obj(都不改 FP 的代码): 39 个物体 3 分 44 秒 -> 28 秒。
++13. **同一个输入连跑两次结果会变**: 算直径是随机抽 1 万个点, 直径差一点, 裁的小块就差一点; 分不出前后的物体
++    (chair_8、table_4、plant_stand_1)分数本来就接近, 会在两个朝向之间来回换(差 180° 或 90°)。
++    每个物体建对象前 `np.random.seed(0); torch.manual_seed(0)` 之后, 连跑两次 39 个角度完全一样。
++    ★ 所以 10-23 实验里"同一个物体两次结论不一样"(monitor_stand_1)也是这个原因, 不是输入变了。
 diff --git a/ours/flip_eval.py b/ours/flip_eval.py
 new file mode 100644
-index 0000000..aef91bf
+index 0000000..e40b0aa
 --- /dev/null
 +++ b/ours/flip_eval.py
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,225 @@
 +"""FP 判前后的离线实验(2026-10-23): 不改流水线, 拿一轮已经摆好的场景, 每个物体在
 +"现在摆的朝向"和"绕竖直轴转 180°"之间让 FP 选。只读那一轮的文件, 结果写到 --out。
 +
@@ -267,6 +281,7 @@ index 0000000..aef91bf
 +        yaw, tilt = yaw_of(Pc, best)
 +        pick = "现在" if min(yaw, 360 - yaw) <= 45 else ("转180" if abs(yaw - 180) <= 45 else "侧向")
 +        row_grid = dict(FP第一名=pick, 绕天转了=round(yaw, 1), 歪了=round(tilt, 1), 用时秒=round(dt, 2),
++                        FP位姿=np.asarray(best).tolist(), 原位姿=Pc.tolist(), w2c=w2c.tolist(),
 +                        位置差cm=round(float(np.linalg.norm(best[:3, 3] - Pc[:3, 3])) * 100, 1))
 +        print(f"  [{a.mode} {node}] 绕天转了 {yaw:.0f}° 歪了 {tilt:.0f}° -> {pick}, 位置差 {row_grid['位置差cm']} cm, {dt:.2f} 秒")
 +        cb, db, _ = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=torch.as_tensor(best[None], dtype=torch.float, device="cuda"),

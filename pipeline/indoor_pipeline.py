@@ -114,6 +114,8 @@ PY = {
     "wilddet":    f"{HOME}/miniforge3/envs/wilddet/bin/python",
     # VGGT-Ω 几何后端(GEOM != da3 时用), 环境和权重在 nvme; 它内部再调 metricdepth 环境跑 Metric3D
     "vggt_omega": "/mnt/nvme/jincheng/envs/vggt_omega/bin/python",
+    # FoundationPose(定朝向那步), 装法和坑见 FoundationPose/NOTES.md
+    "fpose":      f"{HOME}/miniforge3/envs/fpose/bin/python",
 }
 
 # 物体链和 outdoor 共用同一套算法脚本。★ 这是"对齐"的实质: 不是把 outdoor 的逻辑
@@ -221,6 +223,9 @@ CFG = dict(
     # 把水平朝向吸到墙给出的建筑网格上。默认关 —— 见 assemble_scene.py 里的长注释:
     # 椅子被人转出来是真实的, 无差别吸附会把真信息抹掉。按词开, 逗号分隔, "*" = 全部。
     YAW_SNAP    = "",
+    # 组装之后用 FoundationPose 重定每个物体的水平朝向: 只绕天转(24 个候选, 每 15° 一个), 只取角度, 位置和大小不动。
+    # 2026-10-28 office r1 实验: 能看出朝向的 7 个里原流程对 2 个、这样转对 6 个; 39 个物体共约 9 秒。0 = 关(用组装的原摆放)
+    FP_YAW      = "1",
     YAW_SNAP_MAX= "25",     # 偏超过这个角度就不吸 —— 那种要么是另一套朝向, 要么盒子彻底错了    # 逐实例生成的面积下限(像素), 和 outdoor 同一个值、同一个键名, 见 solo_gate.py。
                             # ★ 以前键叫 TH="0.1"(%) —— 和 outdoor 的 SOLO_TH 名字对不上, 传错就静默用 0.5;
                             #   0.1% 在 cyberpunk(1920x1080)是 2073 像素, 在 ithor312(512x512)是 262。
@@ -1241,6 +1246,20 @@ def o_assemble(c, dry):
                     ROOM_SHELL=shell if os.path.exists(shell) else "")),
        f"{c.LOG}/07_assemble.log", dry)
 
+def o_fpose(c, dry):
+    """FP 定朝向(组装之后、摆人之前): 每个物体在生成时那一帧上, 让 FoundationPose 从绕天转的 24 个朝向里挑 ->
+    把 07_scene.glb 里这个物体绕自己盒子中心转过去。只取角度; FP 顺带挪的位置不要, 大小不动。
+    原摆放存成 07_scene_摆放.glb, 重跑这一步从它转; 每个物体转了几度在 07_fp_yaw.json, 对比图在 07_fp_yaw/。
+    FP_YAW=0: 不转, 有原摆放就还原回去。"""
+    if c.cfg.get("FP_YAW", "1") != "1":
+        bak = f"{c.R1}/07_scene_摆放.glb"
+        print("    FP_YAW=0, 不转" + (", 还原成组装的原摆放" if os.path.exists(bak) else ""))
+        if not dry and os.path.exists(bak):
+            import shutil; shutil.copyfile(bak, f"{c.R1}/07_scene.glb")
+            if os.path.exists(f"{c.R1}/07_fp_yaw.json"): os.remove(f"{c.R1}/07_fp_yaw.json")
+        return
+    sh(envcmd(PY["fpose"], f"{PIPE}/fp_yaw.py", None, ["--r1", c.R1, "--fr", c.FRO]), f"{c.LOG}/07_fpose.log", dry)
+
 def o_phys(c, dry):
     """落地 + 推开穿模 -> 07_scene_phy.glb。纯几何, 不上物理引擎。
     SNAP 从 outdoor 的 0.8 收到 0.15: 室内桌面离地才 0.75m, 0.8 会把桌上的东西传送到地板。
@@ -1434,6 +1453,7 @@ STEPS_OBJ = [
     ("zup",         "spatiallm", "转 z 朝上(房间壳要用)",               o_zup),
     ("shell",       "sam3d",     "房间壳: 点云足迹 -> 地板+灰墙",        o_shell),
     ("assemble",    "sam3d",     "摆回房间 + 房间壳(等比缩放)",          o_assemble),
+    ("fpose",       "fpose",     "FP 定朝向(只绕天转, 位置不动)",       o_fpose),
     ("people",      "sam3d",     "摆人: 远近/脚着地/坐哪把椅子/走过的路", o_people),
     ("phys",        "sam3d",     "落地 + 推开穿模(墙是静态碰撞体)",       o_phys),
     ("people_glb",  "sam3d",     "人放进物理后的场景 + 验收视频",         o_people_glb),
@@ -1522,6 +1542,7 @@ ARTIFACTS_OBJ = {
     "recall_merge": ["06_all_boxes_merged.json"],
     "shell":        ["09_房间壳.glb", "09_房间壳_墙线.json"],
     "assemble":     ["07_scene.glb"],
+    "fpose":        [],                     # FP_YAW=0 时不出 07_fp_yaw.json, 只认完成戳
     "people":       [],                     # 没有人的场景这步是空的, 产物不能写死
     "phys":         ["07_scene_phy.glb"],
     "people_glb":   [],
@@ -1553,8 +1574,9 @@ DEPS_OBJ = {
     #   以前步骤一个接一个跑, recall_merge 排在前面没出过事; 并行之后依赖表不写, 两步就会同时跑
     "shell": ["zup", "up", "scale", "recall_merge"],
     "assemble": ["scale", "solo", "recall_merge", "shell"],
-    "people": ["assemble", "people_mesh"],
-    "phys": ["assemble", "people"],
+    "fpose": ["assemble"],
+    "people": ["assemble", "fpose", "people_mesh"],   # 坐哪把椅子要看转过之后的椅子
+    "phys": ["assemble", "fpose", "people"],
     "people_glb": ["phys", "people"],
     "motion": ["people_glb", "people"],               # 场景用合成那步出的 09_scene_nopeople.glb
     "render": ["phys"],
@@ -1569,7 +1591,7 @@ DEPS_OBJ = {
 # ★ people / motion 也不在这里: 它们进了步骤、确认这一轮真的有人才领(_with_card) —— 写在这里的话,
 #   没有人的轮次也要先排队等一张卡, 就为了打一句"跳过"
 GPU_STEPS = {"vlm", "vlm_sizes", "vlm_rest", "da3", "track", "verify", "gen", "solo",
-             "detect", "recall_mask", "recall_gen", "shell",             # 物体链
+             "detect", "recall_mask", "recall_gen", "shell", "fpose",    # 物体链
              "lm", "mask", "floor"}                            # SpatialLM 链
 # 内部拆分的步骤: 它起的每一份各领一张卡, 主循环不替它领
 # gen 只在物体链上是分卡的(o_gen -> _gen_dirs); lm 链的 s_gen 自己领卡, 所以 gen 由主循环按链加进来

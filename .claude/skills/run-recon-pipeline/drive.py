@@ -104,7 +104,7 @@ SEGMENTS = {
         # zup 排在 scale 之后(见 indoor_pipeline 的注释), 所以它在这一段不在地基段
         # ★ people / people_glb 以前也漏在外面 —— 室内走驱动从来没把人放进场景过。和室外同序
         ("验收",   ["recall_gen", "recall_merge", "zup", "shell",
-                    "assemble", "people", "phys", "people_glb", "motion", "render"],   "check_scene"),
+                    "assemble", "fpose", "people", "phys", "people_glb", "motion", "render"],   "check_scene"),
     ],
 }
 
@@ -427,8 +427,20 @@ def check_scene(R1, tag, scene, kind="outdoor", run="r1"):
                 lines.append("  " + l.strip())
             elif l.strip():
                 续 = False
+    lines += fp_yaw_lines(R1)
     lines += placed_people_lines(R1)
     return lines, [f"{R1}/08_render_back_phy.jpg"]
+
+def fp_yaw_lines(R1):
+    """FP 定朝向那步(室内 fpose): 转了 15° 以上的按转得多少列出来, 对比图在 07_fp_yaw/<物体>.jpg; 没转的写原因。"""
+    r = _j(f"{R1}/07_fp_yaw.json")
+    if not r: return []
+    turned = [(x["物体"], round(min(x["转了"], 360 - x["转了"]))) for x in r["物体"] if x.get("转了") is not None]
+    big = sorted([t for t in turned if t[1] >= 15], key=lambda t: -t[1])
+    out = [f"[FP 朝向] {len(turned)} 个物体用了 {r.get('总用时秒', '?')} 秒, 转了 15° 以上的 {len(big)} 个"
+           f"(位置不动; 每个的对比图在 07_fp_yaw/): " + ", ".join(f"{n} {d}°" for n, d in big)]
+    out += [f"  没转: {x['物体']} —— {x.get('原因')}" for x in r["物体"] if x.get("转了") is None]
+    return out
 
 def check_recall(R1, tag, scene, kind="outdoor", run="r1"):
     lines = []
