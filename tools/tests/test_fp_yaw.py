@@ -57,17 +57,24 @@ def test_rerun_reads_original_placement():
         _scene(f"{R1}/07_scene.glb"); new = open(f"{R1}/07_scene.glb", "rb").read()   # 组装重跑
         assert open(G.source(R1), "rb").read() == new, "组装重跑后还在读旧的原摆放"
 
+def test_visible_fraction():
+    """露出 = 抠图面积 / 按摆放渲染出的整个轮廓面积。office table_7 被胳膊挡得只剩 29%, FP 把它转错了 87°。"""
+    sil = np.zeros((100, 100), bool); sil[40:60, 40:60] = True
+    half = sil.copy(); half[:, 50:] = False
+    assert G.visible_frac(sil, sil) == 1 and G.visible_frac(half, sil) == 0.5
+    assert G.visible_frac(sil, np.zeros_like(sil)) == 0          # 物体不在画面里
+
 def test_step_sits_between_assemble_and_people():
     spec = importlib.util.spec_from_file_location("indoor_pipeline", f"{SAM3D}/pipeline/indoor_pipeline.py")
     p = importlib.util.module_from_spec(spec); spec.loader.exec_module(p)
     names = [s[0] for s in p.STEPS_OBJ]
     assert names.index("fpose") == names.index("assemble") + 1 and names.index("people") == names.index("fpose") + 1
     assert "fpose" in p.DEPS_OBJ["people"] and "fpose" in p.DEPS_OBJ["phys"] and p.DEPS_OBJ["fpose"] == ["assemble"]
-    assert "fpose" in p.GPU_STEPS and p.CFG["FP_YAW"] == "1"
+    assert "fpose" in p.GPU_STEPS and p.CFG["FP_YAW"] == "1" and p.CFG["FP_MIN_VIS"] == "0.5"
     c = p.Ctx("office", "_test_fp"); c.R1, c.LOG = "/x/r1", "/x/r1/logs"
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf): p.o_fpose(c, True)
-    assert "fp_yaw.py" in buf.getvalue() and p.PY["fpose"] in buf.getvalue(), buf.getvalue()
+    assert "fp_yaw.py" in buf.getvalue() and p.PY["fpose"] in buf.getvalue() and "--min-vis 0.5" in buf.getvalue(), buf.getvalue()
 
 def test_web_driver_runs_it_and_gate_5_reports_it():
     """网页走的是驱动的分段表, 不是 STEPS_OBJ —— 漏在表外面这一步就永远不跑(people 以前就这么漏过)。"""
@@ -83,7 +90,7 @@ def test_web_driver_runs_it_and_gate_5_reports_it():
 
 if __name__ == "__main__":
     for t in (test_rotate_only_named_object_about_its_center, test_yaw_read_from_fp_pose,
-              test_rerun_reads_original_placement, test_step_sits_between_assemble_and_people,
+              test_rerun_reads_original_placement, test_visible_fraction, test_step_sits_between_assemble_and_people,
               test_web_driver_runs_it_and_gate_5_reports_it):
         t(); print("ok", t.__name__)
     print("== test_fp_yaw 全过 ==")

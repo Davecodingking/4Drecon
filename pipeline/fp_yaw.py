@@ -5,7 +5,7 @@
   2. 对齐: 朝向不动, 按这一帧看得到的深度点把位置和大小贴紧 —— 只给 FP 当起点(FP 裁小块比对, 起点偏了就比错)
   3. 24 个候选 = 绕天每 15° 一个, 位置都用对齐后的; FP 修 5 轮再打分, 取第一名
   4. 只取第一名"绕天转了几度", 在 07_scene.glb 里让这个物体绕自己盒子中心转过去。对齐和 FP 挪的位置都不用
-找不到生成帧 / 相机 / 抠图的物体不转, 原样留着, 07_fp_yaw.json 里写原因。
+找不到生成帧 / 相机 / 抠图的物体不转; 生成帧里露出不到 --min-vis 的也不转(被挡得多, FP 是在猜)。原样留着, 07_fp_yaw.json 里写原因。
 用法: python fp_yaw.py --r1 <轮次目录> --fr <frames_<run> 目录> [--nyaw 24] [--only 词_号,...]"""
 import sys, os, re, json, time, argparse, logging, warnings
 warnings.filterwarnings("ignore")
@@ -35,6 +35,7 @@ def _no_tmp_obj():
 
 ap = argparse.ArgumentParser(); ap.add_argument("--r1", required=True); ap.add_argument("--fr", required=True)
 ap.add_argument("--nyaw", type=int, default=24); ap.add_argument("--only", default="")
+ap.add_argument("--min-vis", type=float, default=0.5, help="生成帧里露出不到这个比例就不转(FP 看到的太少, 转的角度不可靠)")
 a = ap.parse_args(); R1 = a.r1; DA3 = f"{R1}/02_da3"; SHEETS = f"{R1}/07_fp_yaw"; os.makedirs(SHEETS, exist_ok=True)
 t_all = time.time()
 
@@ -114,6 +115,10 @@ for node in sc.graph.nodes_geometry:
                              glctx=glctx, debug=0, debug_dir=SHEETS)
     _, d0, _ = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=torch.as_tensor(P0[None], dtype=torch.float, device="cuda"),
                                  glctx=glctx, mesh_tensors=est.mesh_tensors)
+    vis = G.visible_frac(mask, d0[0].cpu().numpy() > 0.001)
+    if vis < a.min_vis:
+        why = f"第 {f} 帧只露出 {vis:.0%}(门槛 {a.min_vis:.0%}), FP 看到的太少"
+        print(f"[{node}] 不转: {why}"); rows.append(dict(物体=node, 帧=f, 露出=round(vis, 2), 转了=None, 原因=why)); continue
     Pa = align_ts(P0, mesh.vertices, d0[0].cpu().numpy(), depth, mask, K)
     dpp = bilateral_filter_depth(erode_depth(depth, radius=2, device="cuda"), radius=2, device="cuda")   # 和原版 register 同样的预处理
     dpp = dpp.cpu().numpy() if torch.is_tensor(dpp) else dpp
@@ -125,7 +130,7 @@ for node in sc.graph.nodes_geometry:
     S = np.asarray(S.cpu() if torch.is_tensor(S) else S, float); best = Gr.cpu().numpy()[int(np.argmax(S))]
     yaw, tilt = G.yaw_of(P0, best, w2c, UP); dt = time.time() - t0
     yaws[node] = (yaw, c)
-    rows.append(dict(物体=node, 帧=f, 转了=round(yaw, 1), 歪了=round(tilt, 1), 用时秒=round(dt, 2)))
+    rows.append(dict(物体=node, 帧=f, 露出=round(vis, 2), 转了=round(yaw, 1), 歪了=round(tilt, 1), 用时秒=round(dt, 2)))
     print(f"[{node}] 第 {f} 帧, 绕天转 {yaw:.0f}°(FP 歪了 {tilt:.0f}°, 不用), {dt:.2f} 秒")
 
     # 对比图: 照片 | 原摆放 | 转过之后(位置是原摆放的, 和场景里一样)

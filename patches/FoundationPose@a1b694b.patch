@@ -1,9 +1,9 @@
 diff --git a/NOTES.md b/NOTES.md
 new file mode 100644
-index 0000000..a0daa8b
+index 0000000..8016458
 --- /dev/null
 +++ b/NOTES.md
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,116 @@
 +# FoundationPose 笔记(2026-10-23 调研 + 安装)
 +
 +用途: 只让 FP 判断物体前后(我们摆好的朝向 vs 转 180°), 位置和大小仍用我们量盒子的结果。
@@ -116,6 +116,10 @@ index 0000000..a0daa8b
 +    (chair_8、table_4、plant_stand_1)分数本来就接近, 会在两个朝向之间来回换(差 180° 或 90°)。
 +    每个物体建对象前 `np.random.seed(0); torch.manual_seed(0)` 之后, 连跑两次 39 个角度完全一样。
 +    ★ 所以 10-23 实验里"同一个物体两次结论不一样"(monitor_stand_1)也是这个原因, 不是输入变了。
++14. **物体在生成帧里被挡得多, FP 是在猜**(2026-10-29): office table_7 那一帧被人的胳膊挡得只露 29%, FP 把它转了 87°(长桌横过来),
++    伸进人 2 走的路里, 物理推不开(只许推 0.15 m), 最后压着人 23 升。按"露出 = 抠图面积 / 按原摆放渲染的整个轮廓"排, 低于 50% 的 8 个
++    (desk_10 2%、table_12 11%、potted_plant_3 26%、table_7 29%、table_9 33%、office_chair_6 43%、table_10 47%、table_4 49%)不让 FP 转;
++    能看出朝向的 7 个都露 95% 以上。用户定门槛 0.5(配置 FP_MIN_VIS)。
 diff --git a/ours/flip_eval.py b/ours/flip_eval.py
 new file mode 100644
 index 0000000..e40b0aa

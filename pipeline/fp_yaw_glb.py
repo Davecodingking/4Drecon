@@ -81,3 +81,12 @@ def source(R1):
 def mark_done(R1, info=None):
     d = dict(info or {}); d["出_sha"] = _sha(f"{R1}/07_scene.glb")
     json.dump(d, open(f"{R1}/{MARK}", "w"), ensure_ascii=False, indent=1)
+
+
+
+def visible_frac(mask, sil):
+    """露出 = 抠图面积 / 按原摆放渲染出的整个轮廓面积(只渲这一个物体, 不管谁挡它)。
+    这一帧物体被挡得多, FP 能比的东西就少: office table_7 只露 29%, FP 把它转错了 87°、伸进人 2 走的路里。
+    轮廓为空(物体不在画面里)当 0。超过 1 是摆放和照片有偏差, 不算问题。"""
+    n = int(np.count_nonzero(sil))
+    return float(np.count_nonzero(mask)) / n if n else 0.0

@@ -226,6 +226,9 @@ CFG = dict(
     # 组装之后用 FoundationPose 重定每个物体的水平朝向: 只绕天转(24 个候选, 每 15° 一个), 只取角度, 位置和大小不动。
     # 2026-10-28 office r1 实验: 能看出朝向的 7 个里原流程对 2 个、这样转对 6 个; 39 个物体共约 9 秒。0 = 关(用组装的原摆放)
     FP_YAW      = "1",
+    # 生成帧里物体露出不到这个比例(抠图面积 / 按原摆放渲染的整个轮廓)就不让 FP 转, 保持原摆放。
+    # 2026-10-29 office: table_7 只露 29%, FP 把它横过来、伸进人 2 走的路里; 能看出朝向的 7 个都露 95% 以上。用户定 0.5
+    FP_MIN_VIS  = "0.5",
     YAW_SNAP_MAX= "25",     # 偏超过这个角度就不吸 —— 那种要么是另一套朝向, 要么盒子彻底错了    # 逐实例生成的面积下限(像素), 和 outdoor 同一个值、同一个键名, 见 solo_gate.py。
                             # ★ 以前键叫 TH="0.1"(%) —— 和 outdoor 的 SOLO_TH 名字对不上, 传错就静默用 0.5;
                             #   0.1% 在 cyberpunk(1920x1080)是 2073 像素, 在 ithor312(512x512)是 262。
@@ -1258,7 +1261,8 @@ def o_fpose(c, dry):
             import shutil; shutil.copyfile(bak, f"{c.R1}/07_scene.glb")
             if os.path.exists(f"{c.R1}/07_fp_yaw.json"): os.remove(f"{c.R1}/07_fp_yaw.json")
         return
-    sh(envcmd(PY["fpose"], f"{PIPE}/fp_yaw.py", None, ["--r1", c.R1, "--fr", c.FRO]), f"{c.LOG}/07_fpose.log", dry)
+    sh(envcmd(PY["fpose"], f"{PIPE}/fp_yaw.py", None, ["--r1", c.R1, "--fr", c.FRO,
+                                                       "--min-vis", c.cfg.get("FP_MIN_VIS", "0.5")]), f"{c.LOG}/07_fpose.log", dry)
 
 def o_phys(c, dry):
     """落地 + 推开穿模 -> 07_scene_phy.glb。纯几何, 不上物理引擎。
