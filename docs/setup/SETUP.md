@@ -811,12 +811,17 @@ TCNN_CUDA_ARCHITECTURES=120 $P/bin/pip install --no-build-isolation --no-deps \
 | `FoundationPose` | https://github.com/NVlabs/FoundationPose | `a1b694b83e633c2cb6115b9063d940a687759392` | `patches/FoundationPose@a1b694b.patch`（上游文件没改，只加了 `NOTES.md` 和 `ours/`） |
 | `sam3`（正文已有） | 同正文 | `8f0b7f4d…` | `patches/sam3@8f0b7f4.patch`（11-18 新出：我们加的 `pick_mask_5090.py` 等 4 个文件，`pipeline/indoor_pipeline.py` 里有步骤调 `pick_mask_5090.py`；以前这几个文件哪里都没版本） |
 
+| `RoHM` | https://github.com/sanweiliti/RoHM.git | `57ba22cde1595285276ddb88c8c82b25bf0d9722` | `patches/RoHM@57ba22c.patch`（只加了 `ours/` 下的 8 个脚本）。摆人时的补腿（`pipeline/legs_proc.py` → `proclegs/proclegs.py`）一开头要导入 `RoHM/ours/rohm_ours.py`；只用到 numpy/scipy，**不用装 rohm 环境、不用下 RoHM 的权重** |
+
+`carryfit/`（被人拿着的物体）和 `proclegs/`（补腿）是我们自己写的，11-18 起在本仓库里，不用另外拿。
+
 `sam-body4d` 的补丁 11-18 重出过（11-10 改成每帧用场景自己的焦距），用仓库里现在这份。
 
 ```bash
 cd ~/sam3d
 git clone https://github.com/NVlabs/FoundationPose FoundationPose && git -C FoundationPose checkout a1b694b83e633c2cb6115b9063d940a687759392
-for p in sam-3d-objects sam3 Depth-Anything-3 vggt-omega sam-body4d FoundationPose; do
+git clone https://github.com/sanweiliti/RoHM.git RoHM && git -C RoHM checkout 57ba22cde1595285276ddb88c8c82b25bf0d9722
+for p in sam-3d-objects sam3 Depth-Anything-3 vggt-omega sam-body4d FoundationPose RoHM; do
   f=$(ls patches/ | grep "^$p@") && git -C $p apply ../patches/$f && echo "已打 $p"
 done
 ```

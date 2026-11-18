@@ -33,3 +33,11 @@ tools/.last_run
 tools/*.log
 # 网页服务启动时导出的本机环境变量, 不进仓库
 tools/.gate_ui_env.sh
+# 2026-11-18 流水线在用、但以前不在放行名单里的两块自己写的代码(carry 步 / 补腿)。只收代码, 跑出来的结果不收
+!carryfit/
+carryfit/runs/
+carryfit/**/__pycache__/
+!proclegs/
+proclegs/outputs/
+proclegs/versions/
+proclegs/__pycache__/
