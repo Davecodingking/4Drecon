@@ -30,10 +30,34 @@ DUP_DH = float(os.environ.get("DUP_DH", "0.12"))
 FIT_WORDS = {x.strip().replace("_", " ") for x in os.environ.get(
     "FIT_WORDS", "desk,table,dining table,side table,coffee table,counter,cabinet,file cabinet,"
                  "shelf,shelf unit,bookcase,credenza").split(",") if x.strip()}
+# A missing leg is plausible for these classes. A VLM "floor" label alone is
+# insufficient evidence to grow a measured box or deform its mesh.
+LEG_EXTEND_WORDS = {"desk", "table", "dining table", "side table", "coffee table", "nightstand", "counter",
+                    # 2026-11-10 椅子也会腿被挡住: hitch r1 chair#3 只量到椅背(高 0.53 m, 底离地 0.30 m), 悬着、矮一截。
+                    # 补完还要过 assemble 的"不超过常识高度 2 倍"那道, 挂墙的东西不会被拉下来
+                    "chair", "dining chair", "armchair", "office chair", "stool", "bar stool"}
 
 
 def fit_word(w):
     return w in FIT_WORDS or base_word(w) in FIT_WORDS
+
+
+def may_extend_legs(w):
+    return w in LEG_EXTEND_WORDS or base_word(w) in LEG_EXTEND_WORDS
+
+
+def slim_hung_rail(w, ext, rest, hung=()):
+    """A measured wall rail can be thinner than the generic outdoor height guard."""
+    e = np.asarray(ext, float)
+    r = rest.get(w) if rest.get(w) is not None else rest.get(base_word(w))
+    is_hung = r == "hung" or w in hung or base_word(w) in hung
+    long, short = max(e[:2]), min(e[:2])
+    return (is_hung and 0.05 <= e[2] < MIN_H and long >= 0.3
+            and long >= 4 * max(short, 1e-6) and long >= 4 * e[2])
+
+
+def min_height_for(w, ext, rest, hung=()):
+    return 0.05 if slim_hung_rail(w, ext, rest, hung) else MIN_H
 
 
 def abs_ok(ext, min_h=None, max_d=None):
@@ -99,7 +123,7 @@ def rests_on_floor(w, rest, hung=()):
     return r == "floor" and w not in hung and base_word(w) not in hung
 
 
-def never_placed(w, b, dup, may_grow=False):
+def never_placed(w, b, dup, may_grow=False, rest=None, hung=()):
     """这个盒子组装时一定会被扔的原因(给生成那步用: 有原因就不生成); 不会被这两条扔、或者现在还说不准 = None。
     may_grow: 组装有可能把它补到地面(rests_on_floor 且开着 FLOOR_EXTEND)。补完会变高, 所以"太矮"现在判不了 ——
       office r12 的 desk#4 量到 0.06 m(只有桌面), 组装补成 0.74 m 摆进了场景。补多高要等房间壳的地板高度(生成之后才有),
@@ -109,6 +133,7 @@ def never_placed(w, b, dup, may_grow=False):
     e = np.asarray(b["尺寸"], float)
     if e.max() > MAX_D:
         return f"最长边 {e.max():.1f} m, 超过 {MAX_D:g} m(当成量错了)"
-    if e[2] < MIN_H and not may_grow:
-        return f"高 {e[2]:.2f} m, 不到 {MIN_H} m(当成量错了)"
+    min_h = min_height_for(w, e, rest or {}, hung)
+    if e[2] < min_h and not may_grow:
+        return f"高 {e[2]:.2f} m, 不到 {min_h} m(当成量错了)"
     return None

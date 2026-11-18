@@ -40,7 +40,7 @@ def test_new_run_flow():
         assert [x["场景"] for x in d["outdoor"]] == ["beach", "nfl", "soccer"]
         h = _h("POST", "/api/new", body={"类型": "indoor", "场景": "office", "轮次": "r3", "有人": True, "召回": False})
         assert h.code == 200 and h.j()["url"] == "/run?s=office&r=r3&i=1", h.body()
-        assert json.load(open(f"{T}/ir/office/r3/00_run_config.json"))["覆盖"] == {"PEOPLE": "1", "RECALL": "0"}
+        assert json.load(open(f"{T}/ir/office/r3/00_run_config.json"))["覆盖"] == {"PEOPLE": "1", "RECALL": "0", "PEOPLE_FULL": "1"}   # 新开的一轮默认人体跟原片帧率(2026-11-13)
         h = _h("POST", "/api/new", body={"类型": "indoor", "场景": "office", "轮次": "r3", "有人": True, "召回": False})
         assert h.code == 400 and "已经存在" in h.j()["error"]
 

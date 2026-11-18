@@ -38,6 +38,24 @@ HAVE = usable_frames(DA3, "量盒子")
 #   事后旋转只是把错的盒子摆正, 数字不会变对。
 UP, _GH, _FB = load_up(DA3, "量盒子")
 
+# ★ 2026-11-10 切镜头的片子: 一个实例只用"占面积最多的那个镜头"的帧量盒子。
+#   各镜头的相机互相有误差, 点云并在一起就把盒子撑大: hitch_cuts_indoor r1 的 table#0 每个镜头单独量
+#   1.6~1.9 x 0.8~1.1 m, 镜头 5 整体错开 0.7 m, 并起来量成 3.6 x 2.3 m。
+#   做法: 每个镜头各量一个, 取占地面积居中的。切点读 02_da3/shot_cuts.json(split_cuts.py / 摆人那步写的, ffmpeg scdet); 没有这份 = 一镜到底, 和以前一样。
+try:
+    _SC = json.load(open(f"{DA3}/shot_cuts.json"))["cuts"]
+    _FM = json.load(open(f"{DA3}/frame_map.json")); _FPS = _FM.get("fps") or 25.0
+    _VF = {int(k[:-4]): v for k, v in _FM["frames"].items()}
+except (OSError, ValueError, KeyError):
+    _SC = []
+SHOT_POS_TOL = float(os.environ.get("SHOT_POS_TOL", "0.4"))
+def shot_of(fi):
+    if not _SC: return 0
+    # 室外 identity=True: 帧号就是视频帧号(DA3 没抽到的帧不在 frame_map 里); 室内查不到 = 编号对不上, 报错别悄悄当镜头 1
+    t = _VF[fi] if fi in _VF else (fi if _FM.get("identity") else _VF[fi])
+    return int(np.searchsorted(_SC, t / _FPS + 1e-3, side="right"))
+if _SC: print(f"[切镜头] {len(_SC)} 个切点: 每个实例按镜头各量一个盒子, 取占地面积居中的那个")
+
 def backproj(mask, fi, conf_min=None):
     if conf_min is None: conf_min = CONF_MIN
     fn=f"{fi:04d}.jpg"
@@ -93,17 +111,53 @@ for fn in sorted(os.listdir(MK)):
     boxes=[]
     for oid,rows in live.items():
         rows.sort(key=lambda t:-t[0])
-        pts=[]
-        for a,fi,i in rows[:SAMPLE_FRAMES]:
-            m=mask_util.decode({"counts":counts[i],"size":[int(H),int(W)]}).astype(bool)
-            P=backproj(m,fi)
-            if P is not None: pts.append(P)
+        def _measure(rr):
+            pts=[]
+            for a,fi,i in rr[:SAMPLE_FRAMES]:
+                m=mask_util.decode({"counts":counts[i],"size":[int(H),int(W)]}).astype(bool)
+                P_=backproj(m,fi)
+                if P_ is not None: pts.append(P_)
+            return pts
+        if _SC:
+            # 切镜头: 每个镜头各量一个盒子, 取占地面积居中的那个(某个镜头相机偏了、单独量大或量小, 都不会被选中)。
+            # ★ 先试过"面积加起来最多的镜头": hitch table#0 正好是相机偏的镜头 5(那几帧桌子露得最多), 照样 3.6 x 2.3 m。
+            _by = {}
+            for r in rows: _by.setdefault(shot_of(r[1]), []).append(r)
+            _cand = []
+            for _s, rr in _by.items():
+                pts = _measure(rr)
+                if not pts: continue
+                P_ = np.concatenate(pts); med_ = np.median(P_, 0); Q_ = P_ - med_
+                dd_ = np.linalg.norm(Q_ - np.outer(Q_ @ UP, UP), axis=1); P_ = P_[dd_ < np.percentile(dd_, 95)]
+                if len(P_) < MIN_POINTS: continue
+                b_ = fit_box(P_); _cand.append((b_["尺寸"][0] * b_["尺寸"][1], _s, pts, b_["尺寸"], b_))
+            if not _cand: drop_none+=1; continue
+            _cand.sort(key=lambda t: t[0]); _pick = _cand[(len(_cand) - 1) // 2]
+            pts = _pick[2]; _shot_note = dict(镜头=int(_pick[1]) + 1, 各镜头=[[int(c[1]) + 1, [round(x, 2) for x in c[3]]] for c in _cand])
+        else:
+            pts = _measure(rows); _shot_note = None
         if not pts: drop_none+=1; continue
         P=np.concatenate(pts)
-        med=np.median(P,0); dd=np.linalg.norm(P-med,axis=1)
-        P=P[dd<np.percentile(dd,95)]                          # 剔离群
+        # ★ 2026-11-10 剔离群只看水平方向。以前按三维到中位点的距离剔最远的 5%: 落地灯的灯罩点密、灯杆点稀,
+        #   杆子下半截离中位点最远, 整截被当离群删掉 —— hitch r1 右边那盏灯点云离地 0.44~1.87 m, 盒子只剩 0.38 m 高,
+        #   mesh 缩进去成了挂在高处的一个小灯罩。穿到背景的像素 backproj 里已经按深度剔过了。
+        med=np.median(P,0); Q=P-med; dd=np.linalg.norm(Q-np.outer(Q@UP,UP),axis=1)
+        P=P[dd<np.percentile(dd,95)]                          # 剔离群(水平)
         if len(P)<MIN_POINTS: drop_pts+=1; continue           # ← 门槛: 按点数, 不按帧数
         b=fit_box(P); b["obj_id"]=oid; b["点数"]=len(P); b["用帧"]=len(pts); b["总帧"]=len(rows)
+        if _shot_note:
+            # 高度取"位置对得上的几个镜头"的并集: 水平(位置、长宽)信选中的那个镜头, 竖直方向某个镜头才看得到的部分
+            # (落地灯的细杆: 有的镜头抠到、有的没抠到)也要算上 —— hitch lamp#0 选中的镜头只有灯罩, 盒子 0.35 m。
+            # 对得上 = 两个镜头的盒子中心水平距离不超过 SHOT_POS_TOL(切镜头之间的相机误差 hitch 上 0.1 m 上下, 偏的镜头 0.7 m)。
+            c0 = np.array(b["中心"]); c0h = c0 - UP*(c0 @ UP); lo, hi = b["底高"], b["底高"] + b["尺寸"][2]
+            for c_ in _cand:
+                cc = np.array(c_[4]["中心"]); cch = cc - UP*(cc @ UP)
+                if np.linalg.norm(cch - c0h) <= SHOT_POS_TOL:
+                    lo = min(lo, c_[4]["底高"]); hi = max(hi, c_[4]["底高"] + c_[4]["尺寸"][2])
+            if hi - lo > b["尺寸"][2] + 1e-6:
+                _shot_note["高度并上别的镜头"] = [round(b["尺寸"][2], 2), round(hi - lo, 2)]
+                b["中心"] = (c0h + UP*(lo + hi)/2).tolist(); b["尺寸"] = [b["尺寸"][0], b["尺寸"][1], hi - lo]; b["底高"] = float(lo)
+            b["切镜头"] = _shot_note
         b["_vox"]=set(map(tuple, np.round(P/VOX).astype(np.int32)))   # 体素占用, 判重复用
         boxes.append(b)
     all_boxes[word]=boxes
@@ -162,8 +216,35 @@ def shape_cost(w, ext):
     e=np.sort(np.array(ext))[::-1]; e=e/max(e[0],1e-9)
     return float(np.abs(np.log((e+1e-3)/(r+1e-3))).sum())
 
-kept={}; by_shape=0; by_rank=0
+# ★ 2026-11-10 组里选代表只在"会被摆出来"的成员里选(没被作废、没被 VLM 逐实例否决); 全都摆不出来才退回全组。
+#   以前会选中整词作废 / 被否决的那个当代表, 整组跟着消失: hitch r1 chair#0 并进 bar stool#1(人在闸 2 作废了 bar stool),
+#   chair#3 并进 bookshelf#3(VLM 否决) —— 两把真椅子从场景里没了。EXCLUDE 由流水线传进来(和挑图 / 组装同一份)。
+import solo_plan
+_EXCL = {w.strip() for w in os.environ.get("EXCLUDE", "").split(",") if w.strip()}
+_REJ = solo_plan.vlm_rejected(ROOT)
+def _placeable(i):
+    w = flat[i][0]
+    return w not in _EXCL and int(flat[i][2]["obj_id"]) not in _REJ.get(w, ())
+# ★ 2026-11-11 救回来的成员自己的盒子得像它那个词: 高度在常识高度(01_vlm_sizes.json)的 RESCUE_H 倍以内, 不像就不救,
+#   整组照老办法(代表可能是作废的词, 整组跟着不摆)。hitch r1 chair#7 = 反打镜头里"椅子"的跟踪跳到了沙发上,
+#   盒子 1.99 x 0.59 x 0.28 m(沙发坐垫), 和 sofa#0 一组; 救回来就成了场景里一把 2.35 m 高的巨型椅子。
+#   最坏情况 = 退回 11-10 之前的行为, 不会比以前差。
+_SZ = json.load(open(f"{ROOT}/01_vlm_sizes.json")) if os.path.exists(f"{ROOT}/01_vlm_sizes.json") else {}
+RESCUE_H = (0.5, 2.0)
+def _size_ok(i):
+    ref = _SZ.get(flat[i][0])
+    if not isinstance(ref, (int, float)) or ref <= 0: return True          # 没有常识高度: 不拦
+    return RESCUE_H[0] <= flat[i][2]["尺寸"][2] / ref <= RESCUE_H[1]
+kept={}; by_shape=0; by_rank=0; _saved=[]; _nosave=[]
 for g in groups.values():
+    _ok_g = [i for i in g if _placeable(i)]
+    if _ok_g and len(_ok_g) < len(g):
+        _bad = [i for i in _ok_g if not _size_ok(i)]
+        _nosave += [f"{flat[i][0]}#{flat[i][2]['obj_id']}(高 {flat[i][2]['尺寸'][2]:.2f} m, 常识 {_SZ[flat[i][0]]} m)" for i in _bad]
+        _ok_g = [i for i in _ok_g if _size_ok(i)]
+    if _ok_g and len(_ok_g) < len(g):
+        _saved.append(f"{flat[_ok_g[0]][0]}#{flat[_ok_g[0]][2]['obj_id']}")
+    g_all, g = g, (_ok_g or g)
     ext=flat[max(g,key=lambda i: flat[i][2]["点数"])][2]["尺寸"]   # 点最多那个的盒子当形状基准
     scored=sorted([(c,i) for c,i in ((shape_cost(flat[i][0],ext),i) for i in g) if c is not None])
     if len(scored)>=2 and scored[1][0]-scored[0][0] > 0.15:
@@ -179,12 +260,14 @@ for g in groups.values():
         best=min(_ok,key=lambda i:(rank(flat[i][0]), -flat[i][2]["点数"])); by_rank+=1
     w,_,b=flat[best]
     b=dict(b); b.pop("_vox")
-    b["同组候选"]=[f"{flat[i][0]}#{flat[i][2]['obj_id']}" for i in g]
+    b["同组候选"]=[f"{flat[i][0]}#{flat[i][2]['obj_id']}" for i in g_all]
     kept.setdefault(w,[]).append(b)
 
 json.dump(kept, open(f"{ROOT}/06_all_boxes.json","w"), ensure_ascii=False, indent=1)
 n0=N; n=sum(len(v) for v in kept.values())
 print(f"[选词] 形状判定 {by_shape} 组, 形状分不开退回优先级 {by_rank} 组")
+if _saved: print(f"[选代表] {len(_saved)} 组避开了作废 / 被否决的成员, 改选会被摆出来的: {', '.join(_saved)}")
+if _nosave: print(f"[选代表] 不救(盒子高度不像这个词, 整组照老办法): {', '.join(_nosave)}")
 print(f"\n[去重] {n0} -> {n} 个实例 (重复合并 {merged_dup} 对, 部件并入父体 {merged_part} 对)")
 for w in sorted(all_boxes, key=lambda w:-len(all_boxes[w])):
     a,bq=len(all_boxes[w]), len(kept.get(w,[]))

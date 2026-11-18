@@ -79,6 +79,11 @@ CFG = dict(
                           # mayday 人高 345~409px 一帧不丢; pedestrian 148~372px 仍有帧被跳。
                           # ★ 所以人像高度**不是**决定跳不跳帧的因素 —— 提分辨率救不回来, 实测过。
     MAX_FRAMES = "96",    # 帧数上限。论文自测 90 帧/5 人/A100-80G, 先不越过
+    FULL_FRAMES = "",     # ★ 2026-11-12 人体全帧: 给了(原视频全帧的目录, 文件名 = 原视频帧号)且有 SCENE_R1 时, 人体用这里每 FULL_STRIDE 帧,
+                          #   不再只用场景那批(室内 120 帧 ≈ 6 fps); 中间帧的相机由 dense_cams.py 插出来写进 SCENE_R1/02_da3/dense/。
+                          #   主流程按配置 PEOPLE_FULL=1 给(见 indoor/outdoor_pipeline 的 _people_cmd)。
+    FULL_STRIDE = "1",
+    FULL_MAX    = "1800", # 人体全帧最多这么多帧(30 fps 一分钟); 片子更长就按整数步长抽到这个数以内(人体那几步时间跟帧数走)
     SCENE_R1   = "",      # 场景重建的结果目录。给了就不从视频抽帧, 直接用场景那套帧(frames_r1)
                           # 和它的相机焦距 —— 人要放回这个场景, 每一帧都得有场景的相机和深度。
                           # ★ 自己抽帧的话帧对不齐: pedestrian 44 帧里只有 30 帧能对上场景相机。
@@ -178,6 +183,35 @@ def s_frames(c, dry):
     给了 SCENE_R1 就不抽: 直接软链场景那套帧, kept_indices 取场景的 frame_map ——
     这样人体的每一帧都对得上场景的一个相机, body_into_scene 按同一张表找回相机。"""
     g = c.cfg
+    if g["SCENE_R1"] and g["FULL_FRAMES"]:
+        code = f'''
+import json, os, sys
+sys.path.insert(0, {SAM3D + "/pipeline"!r})
+import dense_cams
+da3 = {g["SCENE_R1"] + "/02_da3"!r}
+src = {g["FULL_FRAMES"]!r}; step = max(1, int({g["FULL_STRIDE"]!r}))
+names = sorted((f for f in os.listdir(src) if f.endswith(".jpg") and f[:-4].isdigit()), key=lambda f: int(f[:-4]))
+step = max(step, -(-len(names) // max(1, int({g["FULL_MAX"]!r}))))      # 超长片子按整数步长抽到 FULL_MAX 帧以内
+names = names[::step]
+out = {c.FR!r}; os.makedirs(out, exist_ok=True)
+for f in os.listdir(out):
+    if f.endswith((".jpg", ".json")): os.remove(os.path.join(out, f))
+for i, n in enumerate(names):
+    os.symlink(os.path.join(src, n), os.path.join(out, f"{{i:04d}}.jpg"))
+from PIL import Image
+W, H = Image.open(os.path.join(src, names[0])).size
+fps = json.load(open(da3 + "/frame_map.json")).get("fps") if os.path.exists(da3 + "/frame_map.json") else None
+fps = fps or 30.0
+kept = [int(n[:-4]) for n in names]
+json.dump(dict(scene_r1={g["SCENE_R1"]!r}, frames_dir=src, out_wh=[W, H], n_frames=len(names), src_fps=float(fps),
+               kept_indices=kept, dense=True,
+               note="人体全帧: 原视频每 %d 帧取 1 帧(文件名 = 原视频帧号), 中间帧的相机见 SCENE_R1/02_da3/dense(dense_cams.py)" % step),
+          open(os.path.join(out, "frames.json"), "w"), ensure_ascii=False, indent=1)
+dense_cams.write({g["SCENE_R1"]!r}, kept)
+print(f"[人体全帧] {{len(names)}} 帧 {{W}}x{{H}} <- {{src}} (每 {{step}} 帧 1 帧, 原视频帧号 {{kept[0]}}..{{kept[-1]}})")
+'''
+        sh([PY["sam3d"], "-c", code], f"{c.LOG}/00_frames.log", dry)
+        return
     if g["SCENE_R1"]:
         code = f'''
 import json, os, sys
@@ -283,6 +317,8 @@ def s_mesh(c, dry):
     script = f"{B4D}/body4d_mesh_5090.py"
     log = f"{c.LOG}/04_mesh.log"
     cam = f"{g['SCENE_R1']}/02_da3/cameras.json" if g["SCENE_R1"] else ""
+    if cam and g["FULL_FRAMES"] and os.path.exists(f"{g['SCENE_R1']}/02_da3/dense/cameras.json"):
+        cam = f"{g['SCENE_R1']}/02_da3/dense/cameras.json"      # 人体全帧: 中间帧的焦距也逐帧(插出来的, 推镜头时会变)
     args = (["--dir", c.TRK, "--completion", g["OCC"], "--batch-size", g["BATCH"], "--max-occ-len", g["MAX_OCC_LEN"]]
             + (["--cam-json", cam] if cam else []))
     picked = json.load(open(f"{c.TRK}/picked.json")) if os.path.exists(f"{c.TRK}/picked.json") else {}
@@ -296,7 +332,7 @@ def s_mesh(c, dry):
         return sh(cmd(f"{c.MESH}/_part0", ids), log, dry, cwd=B4D)
     if not ids:
         raise SystemExit(f"[失败] 没有要出网格的人({c.TRK}/picked.json 不在或者一个都没留) —— 先跑 pick")
-    settings = dict(补全=g["OCC"], batch=g["BATCH"], max_occ_len=g["MAX_OCC_LEN"], 焦距=mesh_store.focal_of(cam))
+    settings = dict(补全=g["OCC"], batch=g["BATCH"], max_occ_len=g["MAX_OCC_LEN"], 焦距=mesh_store.focal_of(cam), 逐帧焦距=mesh_store.focal_sig(cam))
     want = mesh_store.stamps(c.TRK, ids, settings, B4D)
     if mesh_store.begin(c.MESH):
         print("    [库] 这个目录是 10-12 之前的写法(目录名按\"第几个勾的人\"排, 没记是拿什么算的): 清掉, 全部重算一次", flush=True)

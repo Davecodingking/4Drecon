@@ -226,7 +226,7 @@ def test_drive_go_passes_pin_and_switches():
 
 
 def test_indoor_child_mode_and_dry_run():
-    base = [sys.executable, f"{SAM3D}/pipeline/indoor_pipeline.py", "--chain", "obj", "--scene", "office", "--run", "r6_pillarfix"]
+    base = [sys.executable, f"{SAM3D}/pipeline/indoor_pipeline.py", "--chain", "obj", "--scene", "office", "--run", "r1_sam31"]
     r = subprocess.run(base + ["--only", "vlm,da3,up", "-n"], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-400:]
     assert [l.split()[1] for l in r.stdout.splitlines() if l.startswith("== ")] == ["vlm", "da3", "up"]

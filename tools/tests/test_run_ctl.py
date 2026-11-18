@@ -46,7 +46,8 @@ def test_new_run_writes_config_and_starts():
         _sandbox(T)
         R1 = run_ctl.new_run("outdoor", "soccer", "r1", people="1", recall="0")
         assert R1 == f"{T}/or/soccer/r1"
-        assert json.load(open(f"{R1}/00_run_config.json")) == {"类型": "outdoor", "覆盖": {"PEOPLE": "1", "RECALL": "0"}}
+        # ★ 2026-11-13 新开的一轮人体默认跟原片帧率(PEOPLE_FULL=1, 见 _common.update_run_config)
+        assert json.load(open(f"{R1}/00_run_config.json")) == {"类型": "outdoor", "覆盖": {"PEOPLE": "1", "RECALL": "0", "PEOPLE_FULL": "1"}}
         assert open(f"{T}/go_args").read().split() == ["soccer", "r1"]
         run_ctl.new_run("indoor", "office", "r7", people="0", recall="0")
         assert open(f"{T}/go_args").read().split() == ["office", "r7", "--indoor"]
@@ -61,6 +62,18 @@ def test_new_run_writes_config_and_starts():
                 pass
             else:
                 raise AssertionError(f"应该拒绝 {bad}")
+
+
+def test_old_run_config_does_not_get_people_full():
+    """已经有本轮配置的老轮次: 改别的项时不顺手加 PEOPLE_FULL(老轮次重跑结果不变); 人体帧率能在人体跟踪之前关掉。"""
+    import _common
+    with tempfile.TemporaryDirectory() as T:
+        R1 = f"{T}/r1"; os.makedirs(R1)
+        json.dump({"类型": "indoor", "覆盖": {"PEOPLE": "1", "RECALL": "0"}}, open(f"{R1}/00_run_config.json", "w"))
+        rc = _common.update_run_config(R1, "indoor", {"RECALL": "1"}, 0)
+        assert "PEOPLE_FULL" not in rc["覆盖"], rc
+        rc = _common.update_run_config(f"{T}/new", "indoor", {"PEOPLE_FULL": "0"}, 0)
+        assert rc["覆盖"]["PEOPLE_FULL"] == "0", rc
 
 
 def test_set_config_follows_segments():
@@ -150,8 +163,10 @@ def test_steps_view_for_the_wizard():
                             {"词": "ball", "实例": 3, "决定": "drop"}]}, open(f"{R1}/05_review.json", "w"))
         s = run_ctl.state("outdoor", "soccer", "r1")
         segs = s["段列表"]
-        assert segs[1]["候选决定"] == {"候选": 6, "会生成": 2, "按词": {"goal post": 1, "cone": 1}, "作废词": ["helmet"]}, \
-            segs[1]["候选决定"]
+        c = segs[1]["候选决定"]
+        assert {k: c[k] for k in ("候选", "会生成", "按词", "作废词", "不生成")} == \
+            {"候选": 6, "会生成": 2, "按词": {"goal post": 1, "cone": 1}, "作废词": ["helmet"], "不生成": {}}, c
+        assert c["待定"] and "盒子还没量" in c["待定"], c     # 第 2 道闸盒子还没量: 太矮/重复判不了, 要说出来
         assert [x["状态"] for x in segs] == ["done", "done", "waiting", "pending", "pending"], segs   # 日志里写的是老的"闸 3/6", 照样要认
         assert segs[2]["名"] == "尺度" and segs[2]["步骤"][-1] == {"步骤": "scale", "说明": segs[2]["步骤"][-1]["说明"],
                                                                 "状态": "done", "耗时": None}
@@ -263,6 +278,19 @@ def test_new_run_refuses_tag_collision():
         else:
             raise AssertionError("标签撞了应该拒绝")
         run_ctl.new_run("outdoor", "abcy", "r2", people="0", recall="0")     # 轮次不同, 标签不同, 可以
+
+
+def test_batch_couple_scenes_can_both_start_r1():
+    """室内 couplelift 和室外 coupledance 同批开跑时不能共用 mesh 标签。"""
+    with tempfile.TemporaryDirectory() as T:
+        _sandbox(T)
+        for kind, sc in (("id", "couplelift_indoor"), ("od", "coupledance_outdoor")):
+            os.makedirs(f"{T}/{kind}/{sc}")
+            open(f"{T}/{kind}/{sc}/video.mp4", "w").close()
+        run_ctl.new_run("indoor", "couplelift_indoor", "r1", people="1", recall="0")
+        run_ctl.new_run("outdoor", "coupledance_outdoor", "r1", people="1", recall="0")
+        assert run_ctl.tag_of("indoor", "couplelift_indoor", "r1") != run_ctl.tag_of("outdoor", "coupledance_outdoor", "r1")
+
 
 def _marker(R1, step=None, card=None, what=None, pid=None):
     os.makedirs(f"{R1}/logs", exist_ok=True)

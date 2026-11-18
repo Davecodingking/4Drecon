@@ -125,6 +125,32 @@ def test_low_weight_frames_count_less():
     assert b < 0.7 * a, (b, a)                                   # 实测 19 -> 12 cm。两头都有好帧的补帧段位置本来是插值的, 不会整体偏
 
 
+
+def test_exported_support_limits_false_flight_and_preserves_jump():
+    class TwoSurfaces:
+        model_mesh = True
+        def height_at(self, points, vf=None):
+            return np.full(len(points), -0.18)
+        def model_h(self, points):
+            return np.zeros(len(points))
+
+    old = B.TERRAIN
+    try:
+        B.TERRAIN = TwoSurfaces()
+        h = np.full(T, -0.22)
+        h[50:80] = 0.04
+        ix = np.array([np.argmin(BODY[:, 1])])
+        def placed(height):
+            mesh = _person(height)
+            d = B.tidy_track(mesh, bis, t, np.ones(T), UP, GH,
+                             feet_ok=np.ones(T, bool), foot_indices=ix)
+            return (mesh[65][ix] + d[65])[0] @ UP
+        assert abs(placed(h)) < 0.02
+        h[50:80] = 0.65 * np.sin(np.linspace(0, np.pi, 30))
+        assert placed(h) > 0.40
+    finally:
+        B.TERRAIN = old
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_") and callable(f):

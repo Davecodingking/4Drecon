@@ -23,7 +23,8 @@ FR   = os.environ.get("FR", "/home/jincheng/sam3d/data/outdoor/dataset/timesquar
 CKPT = os.path.expanduser("~/sam3d/sam3/checkpoints/sam3.pt")
 OUT  = f"{ROOT}/03_masks"; os.makedirs(OUT, exist_ok=True)
 SEG  = int(os.environ.get("SEG", "60"))          # 三级: 每段多少帧
-MULTI    = os.environ.get("MULTIWORD", "1") == "1"
+SAM3_VERSION = os.environ.get("SAM3_VERSION", "sam3")   # "sam3" | "sam3.1", 见 indoor_pipeline CFG 的注释
+MULTI    = os.environ.get("MULTIWORD", "1") == "1" and SAM3_VERSION == "sam3"   # 多词 hook 只在 sam3 上验过
 MW_GROUP = int(os.environ.get("MW_GROUP", "8"))  # 多词模式一批几个词(检测爆显存会自动拆小)
 VOCAB= json.load(open(f"{ROOT}/01_vlm_vocab.json"))["vocab"]
 # 附加词, 逗号分隔。给"建筑模式"用: 列词的 prompt 明确让 VLM 跳过建筑立面, 所以词表里
@@ -125,7 +126,22 @@ def save(word, res):
         meta=np.array(recs, dtype=[("oid","i4"),("frame","i4"),("area","i8"),("edge","f4")]),
         counts=np.array(rles, dtype=object), hw=np.array([H,W]), word=word, allow_pickle=True)
 
-pred = build_sam3_video_predictor(checkpoint_path=CKPT)
+if SAM3_VERSION == "sam3.1":
+    import inspect
+    from sam3.model_builder import build_sam3_multiplex_video_predictor
+    # 3090 是 Ampere, 不支持 FlashAttention 3
+    pred = build_sam3_multiplex_video_predictor(
+        checkpoint_path=os.path.expanduser("~/sam3d/sam3/checkpoints/sam3.1_multiplex.pt"), use_fa3=False)
+    # 上游 bug(本机 sam3 仓库 8 月版): Sam3BasePredictor.start_session 无条件把 offload_state_to_cpu 传给
+    # model.init_state, multiplex 的 init_state 没这个参数 -> TypeError。不改共用仓库, 在这里滤掉不认的参数。
+    _orig_init = pred.model.init_state
+    _init_ok = set(inspect.signature(_orig_init).parameters)
+    pred.model.init_state = lambda **kw: _orig_init(**{k: v for k, v in kw.items() if k in _init_ok})
+    # 默认 16 帧一批过检测器, 3090(24G) 1080p 第一个词就 OOM(差 1.27G); 8 帧一批峰值约 18G
+    pred.model.batched_grounding_batch_size = int(os.environ.get("SAM31_GROUNDING_BATCH", "8"))
+    print(f"[info] SAM 3.1 multiplex, 检测批 {pred.model.batched_grounding_batch_size} 帧", flush=True)
+else:
+    pred = build_sam3_video_predictor(checkpoint_path=CKPT)
 if MULTI: mw.install_hooks(pred)
 print(f"[info] {NF} 帧 {W}x{H}, {len(VOCAB)} 个词, 分段大小 {SEG}, "
       f"多词模式 {'开, 每批 %d 词' % MW_GROUP if MULTI else '关'}", flush=True)

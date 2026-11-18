@@ -1,0 +1,354 @@
+diff --git a/pick_mask_5090.py b/pick_mask_5090.py
+new file mode 100644
+index 0000000..1c64366
+--- /dev/null
++++ b/pick_mask_5090.py
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python
++"""按框选候选: SAM3 文字提示出全部候选 mask, 取与给定框 IoU 最高者 (置信度只当次要排序)."""
++import argparse, os, sys
++import numpy as np, torch, cv2
++from PIL import Image, ImageOps
++ap = argparse.ArgumentParser()
++ap.add_argument("--image", required=True); ap.add_argument("--text", required=True)
++ap.add_argument("--box", required=True); ap.add_argument("--out", required=True)
++a = ap.parse_args()
++CKPT = os.path.expanduser("~/sam3d/sam3/checkpoints/sam3.pt")
++from sam3.model_builder import build_sam3_image_model
++from sam3.model.sam3_image_processor import Sam3Processor
++pil = ImageOps.exif_transpose(Image.open(a.image)).convert("RGB"); W, H = pil.size
++model = build_sam3_image_model(checkpoint_path=CKPT, load_from_HF=False)
++proc = Sam3Processor(model)
++with torch.autocast("cuda", dtype=torch.bfloat16):
++    state = proc.set_image(pil)
++    state = proc.set_text_prompt(a.text, state)
++masks, scores = state["masks"], state["scores"]
++if len(masks) == 0: sys.exit("无候选")
++x1, y1, x2, y2 = map(float, a.box.split(","))
++bm = np.zeros((H, W), bool); bm[int(y1):int(y2), int(x1):int(x2)] = True
++mn = masks.squeeze(1).cpu().numpy().astype(bool)
++best, bi = -1, 0
++for i in range(len(mn)):
++    inter = (mn[i] & bm).sum(); union = (mn[i] | bm).sum()
++    iou = inter/max(union,1); inside = inter/max(mn[i].sum(),1)
++    v = iou * inside            # 既要重合又要别跑到框外
++    if v > best: best, bi = v, i
++print(f"候选 {len(mn)} 个, 选第 {bi} (IoU分 {best:.3f}, SAM置信度 {float(scores[bi]):.2f})")
++outd = os.path.expanduser(f"~/sam3d/sam-3d-objects/my_images/{a.out}"); os.makedirs(outd, exist_ok=True)
++img = np.array(pil)
++Image.fromarray(img).save(os.path.join(outd, "frame.png"))
++Image.fromarray((mn[bi]*255).astype(np.uint8)).save(os.path.join(outd, "mask.png"))
++ov = img.copy(); ov[mn[bi]] = (0.5*ov[mn[bi]] + 0.5*np.array([255,60,60])).astype(np.uint8)
++cv2.rectangle(ov, (int(x1),int(y1)), (int(x2),int(y2)), (60,255,60), 3)
++Image.fromarray(ov).save(os.path.join(outd, "preview.jpg"))
+diff --git a/requirements-sam3.txt b/requirements-sam3.txt
+new file mode 100644
+index 0000000..c3ad624
+--- /dev/null
++++ b/requirements-sam3.txt
+@@ -0,0 +1,24 @@
++# sam3 环境 (py3.12) 的固定依赖 — 装新包后务必确认 numpy 仍是 1.26.4
++torch==2.8.0+cu128
++torchvision==0.23.0+cu128
++-e .
++setuptools<81
++numpy==1.26.4
++opencv-python==4.10.0.84
++decord
++einops
++pillow
++matplotlib
++pycocotools
++psutil
++omegaconf
++hydra-core
++scipy
++pandas
++tensordict
++torchmetrics
++numba
++python-rapidjson
++scikit-image
++scikit-learn
++gradio==5.49.0
+diff --git a/seg.sh b/seg.sh
+new file mode 100644
+index 0000000..a051b04
+--- /dev/null
++++ b/seg.sh
+@@ -0,0 +1,22 @@
++#!/bin/bash
++# 第 1 步：用 SAM 3 标记你要的物体 → 生成 frame.png + mask.png
++# 用法：改下面变量，然后  bash seg.sh
++# 结果在 ~/sam3d/sam-3d-objects/my_images/<NAME>/ ，之后去 sam-3d-objects 里跑 run.sh 时
++#   IMAGE=my_images/<NAME>/frame.png   MASK=my_images/<NAME>/mask.png
++
++# ===== 改这里 =====
++INPUT=test_video.mp4        # 图片 (xxx.jpg/png) 或 视频 (xxx.mp4)，脚本自动判断
++TEXT="bottle"               # 要的物体，英文，如 "chair" "sofa" "red car"
++NAME=video_test             # 输出名字
++INDEX=0                     # 命中多个同类物体时取第几个（0 = 置信度/面积最大的）
++# ==================
++
++cd "$(dirname "$0")"
++source ~/sam3d/env_sam3.sh
++
++case "${INPUT,,}" in
++  *.mp4|*.mov|*.avi|*.mkv) MODE=--video ;;
++  *)                       MODE=--image ;;
++esac
++
++python segment.py $MODE "$INPUT" --text "$TEXT" --out "$NAME" --index "$INDEX" 2>&1 | grep -vE "Warning|warn|pkg_resources"
+diff --git a/segment.py b/segment.py
+new file mode 100644
+index 0000000..ab44f89
+--- /dev/null
++++ b/segment.py
+@@ -0,0 +1,247 @@
++"""
++用 SAM 3 标记"我要的物体"，输出 frame.png + mask.png 给 SAM 3D 用。
++（在 sam3 环境里跑：source ~/sam3d/env_sam3.sh）
++
++  图片 + 文字：  python segment.py --image 图.jpg --text "chair" --out chair
++  图片 + 框：    python segment.py --image 图.jpg --box 100,200,800,900 --out chair   # x1,y1,x2,y2 像素
++  视频 + 文字：  python segment.py --video 视频.mp4 --text "chair" --out chair        # 自动挑最清晰、遮挡最少的一帧
++
++输出目录：~/sam3d/sam-3d-objects/my_images/<out>/
++  frame.png   选中的那帧（视频）或原图（图片）
++  mask.png    白=物体 黑=背景
++  preview.jpg 叠加了 mask 的预览，肉眼确认选对了没
++  (视频) scores.csv 每帧的 面积/清晰度/综合分
++"""
++import argparse
++import csv
++import os
++import sys
++
++import cv2
++import numpy as np
++import torch
++from PIL import Image, ImageOps
++
++# 官方 notebook 的全局设置：bf16 混合精度 + 推理模式（不开会报 BFloat16/Float dtype 不匹配）
++torch.backends.cuda.matmul.allow_tf32 = True
++torch.backends.cudnn.allow_tf32 = True
++torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
++torch.inference_mode().__enter__()
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++CKPT = os.path.join(HERE, "checkpoints", "sam3.pt")
++OUT_ROOT = os.path.expanduser("~/sam3d/sam-3d-objects/my_images")
++
++parser = argparse.ArgumentParser()
++src = parser.add_mutually_exclusive_group(required=True)
++src.add_argument("--image", help="输入图片")
++src.add_argument("--video", help="输入视频 (mp4) 或帧文件夹")
++parser.add_argument("--text", help='文字提示，如 "chair"')
++parser.add_argument("--box", help="框提示 x1,y1,x2,y2（像素坐标，仅图片）")
++parser.add_argument("--out", required=True, help="输出名字 → my_images/<out>/")
++parser.add_argument("--index", type=int, default=0, help="文字命中多个物体时取第几个（按置信度排序，0=最高）")
++parser.add_argument("--frame", type=int, default=0, help="视频：在第几帧给提示")
++parser.add_argument("--min-area", type=float, default=0.6, help="视频：mask 面积低于最大值的这个比例视为被遮挡，丢弃")
++parser.add_argument("--scene", action="store_true",
++                    help='场景模式：--text 可用逗号给多个类别 "chair,table,cup"，保留每个类别的所有实例，'
++                         "存到 masks/0.png 1.png ...（视频则先按第一个类别挑最佳帧）")
++args = parser.parse_args()
++prompts = [t.strip() for t in (args.text or "").split(",") if t.strip()]
++if args.scene and not prompts:
++    sys.exit("错误：--scene 需要 --text")
++if not args.text and not args.box:
++    sys.exit("错误：至少给 --text 或 --box")
++
++out_dir = os.path.join(OUT_ROOT, args.out)
++os.makedirs(out_dir, exist_ok=True)
++
++
++def save_outputs(frame_rgb, mask, extra=""):
++    Image.fromarray(frame_rgb).save(os.path.join(out_dir, "frame.png"))
++    Image.fromarray((mask * 255).astype(np.uint8)).save(os.path.join(out_dir, "mask.png"))
++    overlay = frame_rgb.copy()
++    overlay[mask] = (overlay[mask] * 0.4 + np.array([255, 60, 60]) * 0.6).astype(np.uint8)
++    Image.fromarray(overlay).save(os.path.join(out_dir, "preview.jpg"), quality=85)
++    print(f"完成 {extra}\n  {out_dir}/frame.png  mask.png  preview.jpg（打开 preview 确认选中的是不是你要的）")
++    print(f"下一步（sam3d 环境）：python run.py --image my_images/{args.out}/frame.png --mask my_images/{args.out}/mask.png --hq --out {args.out}")
++
++
++def save_candidates(frame_rgb, masks_sorted, chosen_rank):
++    """把所有候选画成编号图 candidates.jpg：框 + 左上角 INDEX 号，选中的用粗框"""
++    vis = frame_rgb.copy()
++    h, w = vis.shape[:2]
++    scale = max(0.6, w / 1000)
++    rng = np.random.RandomState(0)
++    for rank, m in enumerate(masks_sorted):
++        col = tuple(int(c) for c in rng.randint(80, 255, 3))
++        vis[m] = (vis[m] * 0.55 + np.array(col) * 0.45).astype(np.uint8)
++        ys, xs = np.where(m)
++        if len(ys) == 0:
++            continue
++        x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
++        thick = 6 if rank == chosen_rank else 2
++        cv2.rectangle(vis, (x1, y1), (x2, y2), col, thick)
++        label = f"INDEX {rank}" + (" <== chosen" if rank == chosen_rank else "")   # cv2 画不了中文，用英文
++        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
++        cv2.rectangle(vis, (x1, max(0, y1 - th - 10)), (x1 + tw + 10, y1), col, -1)
++        cv2.putText(vis, label, (x1 + 5, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 2)
++    Image.fromarray(vis).save(os.path.join(out_dir, "candidates.jpg"), quality=85)
++
++
++def border_penalty(mask, margin=None):
++    """物体贴着画面边缘 = 被画面切掉了一部分，返回 0~1 的惩罚（0 = 完整在画面内）"""
++    h, w = mask.shape
++    margin = margin or max(8, int(0.015 * min(h, w)))   # 边距按分辨率定：1080 宽 → 16px
++    edge = mask[:margin].sum() + mask[-margin:].sum() + mask[:, :margin].sum() + mask[:, -margin:].sum()
++    return min(1.0, edge / max(1, 0.02 * mask.sum()))   # 边缘像素占 2% 就算完全贴边
++
++
++def segment_scene(frame_rgb):
++    """场景模式：对一帧跑所有类别，保留全部实例，写 masks/N.png + labels.txt + candidates.jpg"""
++    from sam3.model_builder import build_sam3_image_model
++    from sam3.model.sam3_image_processor import Sam3Processor
++    model = build_sam3_image_model(checkpoint_path=CKPT, load_from_HF=False)
++    proc = Sam3Processor(model)
++    pil = Image.fromarray(frame_rgb)
++    all_masks, labels = [], []
++    for p in prompts:
++        state = proc.set_image(pil)
++        state = proc.set_text_prompt(p, state)
++        ms = state["masks"].squeeze(1).cpu().numpy().astype(bool)
++        sc = state["scores"].float().cpu().numpy()   # bf16 不能直接转 numpy
++        for m, s in zip(ms, sc):
++            if m.sum() < 0.001 * m.size:      # 小于画面 0.1% 的碎片丢掉
++                continue
++            all_masks.append(m); labels.append((p, float(s)))
++        print(f"  '{p}': {len(ms)} 个")
++    if not all_masks:
++        sys.exit("场景模式：一个物体都没找到")
++    # 按面积从大到小编号，去掉互相重叠 >70% 的重复（不同类别提示可能命中同一物体）
++    order = np.argsort([-m.sum() for m in all_masks])
++    kept = []
++    for i in order:
++        if all((all_masks[i] & all_masks[j]).sum() / min(all_masks[i].sum(), all_masks[j].sum()) < 0.7 for j in kept):
++            kept.append(i)
++    mdir = os.path.join(out_dir, "masks"); os.makedirs(mdir, exist_ok=True)
++    for f in os.listdir(mdir):
++        os.remove(os.path.join(mdir, f))
++    with open(os.path.join(out_dir, "labels.txt"), "w") as f:
++        for n, i in enumerate(kept):
++            Image.fromarray((all_masks[i] * 255).astype(np.uint8)).save(os.path.join(mdir, f"{n}.png"))
++            f.write(f"{n}\t{labels[i][0]}\t{labels[i][1]:.2f}\t{all_masks[i].sum() / all_masks[i].size:.3%}\n")
++    Image.fromarray(frame_rgb).save(os.path.join(out_dir, "frame.png"))
++    save_candidates(frame_rgb, [all_masks[i] for i in kept], -1)
++    union = np.zeros_like(all_masks[0])
++    for i in kept:
++        union |= all_masks[i]
++    Image.fromarray((union * 255).astype(np.uint8)).save(os.path.join(out_dir, "mask.png"))
++    print(f"场景模式完成：{len(kept)} 个物体 → {mdir}/  编号见 candidates.jpg，类别见 labels.txt")
++    print(f"下一步：bash ~/sam3d/pipeline.sh 3d   （自动识别为场景模式，逐个重建后拼成 scene.ply）")
++
++
++def sharpness(frame_rgb, mask):
++    """物体区域的清晰度：拉普拉斯方差，越大越锐"""
++    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
++    ys, xs = np.where(mask)
++    if len(ys) < 100:
++        return 0.0
++    crop = gray[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
++    m = mask[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
++    lap = cv2.Laplacian(crop, cv2.CV_64F)
++    return float(lap[m].var())
++
++
++# ============================ 图片 ============================
++if args.image:
++    from sam3.model_builder import build_sam3_image_model
++    from sam3.model.sam3_image_processor import Sam3Processor
++
++    pil = ImageOps.exif_transpose(Image.open(args.image)).convert("RGB")
++    W, H = pil.size
++    if args.scene:
++        segment_scene(np.array(pil)); sys.exit(0)
++    model = build_sam3_image_model(checkpoint_path=CKPT, load_from_HF=False)
++    proc = Sam3Processor(model)
++    state = proc.set_image(pil)
++    if args.text:
++        state = proc.set_text_prompt(args.text, state)
++    if args.box:
++        x1, y1, x2, y2 = map(float, args.box.split(","))
++        box = [(x1 + x2) / 2 / W, (y1 + y2) / 2 / H, (x2 - x1) / W, (y2 - y1) / H]  # cxcywh 归一化
++        state = proc.add_geometric_prompt(box, True, state)
++
++    masks, scores = state["masks"], state["scores"]
++    if len(masks) == 0:
++        sys.exit("没找到任何物体：换个提示词，或调低置信度")
++    order = torch.argsort(scores, descending=True)
++    print(f"找到 {len(masks)} 个候选，置信度: {[round(float(scores[i]), 2) for i in order]}")
++    rank = min(args.index, len(order) - 1)
++    idx = order[rank]
++    masks_np = masks.squeeze(1).cpu().numpy().astype(bool)
++    save_candidates(np.array(pil), [masks_np[i] for i in order], rank)
++    save_outputs(np.array(pil), masks_np[idx], f"(INDEX={rank}，置信度 {float(scores[idx]):.2f}；全部候选见 candidates.jpg)")
++
++# ============================ 视频 ============================
++else:
++    from sam3.model_builder import build_sam3_video_predictor
++
++    predictor = build_sam3_video_predictor(checkpoint_path=CKPT)
++    sid = predictor.handle_request(dict(type="start_session", resource_path=args.video))["session_id"]
++    main_text = prompts[0] if prompts else args.text   # 视频挑帧用第一个类别
++    resp = predictor.handle_request(dict(type="add_prompt", session_id=sid, frame_index=args.frame, text=main_text))
++    ids = resp["outputs"]["out_obj_ids"]
++    if len(ids) == 0:
++        sys.exit(f"第 {args.frame} 帧没找到 '{main_text}'，换 --frame 或提示词")
++    # 追踪对象：按首帧 面积 × (1 - 贴边惩罚) 排序，取第 index 个 —— 贴着画面边缘、被切掉的物体排后面
++    masks0 = resp["outputs"]["out_binary_masks"].astype(bool)
++    rank0 = [m.sum() * (1 - border_penalty(m)) for m in masks0]
++    order0 = np.argsort(-np.array(rank0))
++    rank = min(args.index, len(ids) - 1)
++    obj = ids[order0[rank]]
++    print(f"第 {args.frame} 帧找到 {len(ids)} 个 '{main_text}'，追踪 obj_id={obj}（INDEX={rank}，全部候选见 candidates.jpg）")
++
++    # 逐帧传播，记录 面积 + 清晰度
++    per_frame = {}
++    for r in predictor.handle_stream_request(dict(type="propagate_in_video", session_id=sid)):
++        o = r["outputs"]
++        if obj in o["out_obj_ids"]:
++            m = o["out_binary_masks"][list(o["out_obj_ids"]).index(obj)].astype(bool)
++            per_frame[r["frame_index"]] = m
++    predictor.handle_request(dict(type="close_session", session_id=sid))
++    if not per_frame:
++        sys.exit("追踪失败：没有任何帧含该物体")
++
++    # 读帧（mp4 或文件夹）
++    def read_frame(i):
++        if os.path.isdir(args.video):
++            files = sorted(f for f in os.listdir(args.video) if f.lower().endswith((".jpg", ".jpeg", ".png")))
++            return np.array(Image.open(os.path.join(args.video, files[i])).convert("RGB"))
++        cap = cv2.VideoCapture(args.video); cap.set(cv2.CAP_PROP_POS_FRAMES, i)
++        ok, bgr = cap.read(); cap.release()
++        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
++
++    save_candidates(read_frame(args.frame), [masks0[i] for i in order0], rank)   # 提示帧上的全部候选编号图
++
++    rows = []
++    max_area = max(m.sum() for m in per_frame.values())
++    for i, m in sorted(per_frame.items()):
++        area = m.sum()
++        if area < args.min_area * max_area:  # 被遮挡 / 出画
++            rows.append((i, area, 0.0, 0.0)); continue
++        fr = read_frame(i)
++        sh = sharpness(fr, m) * (1 - border_penalty(m))   # 贴边（被画面切掉）的帧降权
++        rows.append((i, area, sh, 0.0))
++    valid = [r for r in rows if r[2] > 0]
++    if not valid:
++        sys.exit("所有帧都被遮挡或贴边，换 --frame / --index 试试")
++    max_sh = max(r[2] for r in valid)
++    rows = [(i, a, s, (a / max_area) * 0.4 + (s / max_sh) * 0.6 if s > 0 else 0.0) for i, a, s, _ in rows]
++    with open(os.path.join(out_dir, "scores.csv"), "w", newline="") as f:
++        w = csv.writer(f); w.writerow(["frame", "area", "sharpness", "score"]); w.writerows(rows)
++    best = max(rows, key=lambda r: r[3])
++    print(f"共 {len(rows)} 帧，{len(valid)} 帧未遮挡；最佳第 {best[0]} 帧（面积 {best[1] / max_area:.0%}，清晰度 {best[2]:.0f}）")
++    if args.scene:
++        print(f"场景模式：在第 {best[0]} 帧上标记全部类别 {prompts}")
++        segment_scene(read_frame(best[0]))
++    else:
++        save_outputs(read_frame(best[0]), per_frame[best[0]], f"(第 {best[0]} 帧)")

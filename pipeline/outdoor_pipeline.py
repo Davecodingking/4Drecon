@@ -95,6 +95,26 @@ VGGT_GEOM = f"{SAM3D}/vggt-omega/tools/vggt_omega_geom.py"
 # ------------------------------------------------------------------ 参数
 # 这些值都是调出来的, 改之前先看注释里写的"为什么是这个数"。
 CFG = dict(
+    CONTACT_REGISTER="0",  # opt in on a derived run when continuity across the edit is intended
+    # ★ 2026-11-11 物体跟踪用哪个 SAM3, 和室内同一个开关(见 indoor_pipeline CFG 的注释): 默认 "sam3.1", "sam3" = 老的。
+    #   sam3.1 时多词共用检测关掉(hook 按 sam3 写的), 一个词一个会话, 按词分卡。人的跟踪(body4d)不受影响。
+    SAM3_VERSION = "sam3.1",
+    # ★ 2026-11-11 地面怎么出: "plane" = 一个高度的平面(默认, 和以前一样) / "terrain" = 地形网格(楼梯、台阶, terrain.py),
+    #   组装那步先建地形, 网格当地面、物体落到脚下的地形上; 摆人按脚下的地形贴地(body_into_scene.clearance)。joker 起头。
+    SHOT_LEVEL  = "0",      # ★ 2026-11-12 多镜头 + terrain 时, 每个镜头先按画面竖线扶正(shot_level.py)。"1" = 开。
+                            #   joker 上楼梯从 11° 扶到 25~28°(数台阶约 30°), 往下看的镜头街和车出来了; 但主镜头 / 3 号镜头的相机
+                            #   被拼进了别的镜头的地面里(画面全灰 / 全黑), 镜头之间的对齐还没跟上, 先默认关。
+    GROUND_STYLE = "heightmap", # ★ 2026-11-12 GROUND_MODE=terrain 时交付的地面: "heightmap" = 高度表网格(老的);
+                            #   "plane_stairs" = 一个平面(主镜头相机脚下) + 一条干净的参数化台阶(往下补到平面, 实心), 人都站在它上面。
+                            #   terrain.py 直接读本轮配置(见 terrain._run_style), joker 用 plane_stairs。
+    GROUND_MODE = "plane",
+    # ★ 2026-11-11 相机轨迹时间平滑(cam_smooth.py): 镜头内高斯平滑, sigma 单位是 DA3 帧; "0" = 不平滑。默认开 ——
+    #   DA3 的相机逐帧在抖(spl 中位 6.8 cm, 比真实运动还大), 渲染 / 验收视频 / FBX 里画面跟着抖。
+    CAM_SMOOTH = "2",
+    # ★ 2026-11-11 室外也盖墙(巷子两侧, spl 起头): "1" = 组装前从点云里竖直的面检出墙线(outdoor_walls.py), 盖成和室内
+    #   房间壳一样的灰色半透明墙, 只要墙不要地板。只在真拍到墙面的地方盖(巷口、相机身后不堵)。默认 "0"。
+    OUTDOOR_SHELL = "0",
+    OUTDOOR_WALL_MODE = "auto",  # Select a single supported facade or retain the multi-wall reconstruction.
     NFR         = "8",      # VLM 扫几帧列词表。用户明确要求先用 8 帧
     MAX_FRAMES  = "180",    # DA3 用多少帧。深度帧越多, 每个实例可用的帧越多
     PROCESS_RES = "504",    # DA3 处理分辨率, 出来的深度图是 280x504
@@ -119,7 +139,7 @@ CFG = dict(
                             #   画面里有认得出的参照物。空路 + 楼这种没尺子的场景就兜不住, 错到底。
                             # ★ 室内 CFG 一直有这一项, 室外没有, 09-20 补齐。UE 那种已知镜头
                             #   可以直接填(7mm/23.76 -> 565.66)。
-    MIN_FRAMES  = "2",      # 挑生成样本的下限, 只防单帧误检
+    MIN_FRAMES  = "6",      # 挑生成样本的下限, 只防单帧误检
     BAKE_WORKERS = "2",     # 生成 mesh 时另开几个进程烘焙贴图(run.py --bake-workers); 0 = 不拆。
                             # 32G 卡实测(8 个物体): 0 -> 257s, 2 -> 165s, 3 -> 180s 且有一个显存不够要重烘
     MIN_AREA_PCT= "0.05",   # 候选实例的最小面积占比(%)
@@ -157,7 +177,7 @@ CFG = dict(
                             # ★ 2026-09-16 以前是 SOLO_TH="0.5"(%), 在 1280x720 的时代广场上调的,
                             #   到 1920x1080 的 pedestrian 等于严了 2.25 倍, beach/carpark 只好各覆盖 0.03。
     PER_INSTANCE= "tree",   # 这些类不做类内统一尺度(树高矮差太多, 统一了全变矮)
-    EXCLUDE     = "sign,billboard,pedestrian,manhole cover,bollard,awning,building",
+    EXCLUDE     = "sign,billboard,pedestrian,manhole cover,bollard,awning",
                             # 排除: 前四个是贴在墙上/地上的平面, 当独立物体摆必然出错;
                             # bollard 实际是垃圾桶误检; awning 是雨篷, 悬空没有支撑;
                             # building 走 buildings 那条支线, 不能混进物体场景 —— 一旦
@@ -180,6 +200,18 @@ CFG = dict(
     #   一般不在这里改, 在启动页 / 第 1 道闸 / drive.py --people 1 设(写进本轮的 00_run_config.json)。
     #   手工填了 BODY_RUN 的老轮次(soccer/office)不走这两步, 照旧读那个目录。
     PEOPLE      = "0",
+    # 人和原图对齐(2026-11-10 hitch 切镜头试出来的, 见 body_motion.py 的 fit_leg_length / DIST_KEEP_TOL):
+    #   LEG_FIT=1  看不到脚的站着的人按"脚落地"定腿长, 上半身不动(老办法: 整个人往下拉贴地, 头在原图上低 80~100 px)
+    #   DIST_KEEP=1  远近: 模型的距离和场景差不到 25% 就用模型的(老办法: 每帧按场景深度推远拉近, 原图上偏 23~236 px)
+    LEG_FIT     = "0",
+    DIST_KEEP   = "0",
+    FLIP_KEEP   = "",     # ★ 2026-11-13 翻转段里按人指定"这几帧是真动作、信模型"("人号:起-止[,起-止][;...]", 原视频帧号); 空 = 老做法。见 body_motion.FLIP_KEEP
+    # ★ 2026-11-11 人数上限(jw1 用户: "从头到尾就两个人"): 填了就按这个数核对身份 —— 同一帧多出来的检测(重复框 / 碎片)不要,
+    #   不同时在场、时间上挨着的人并起来, 直到不超过这个数(people_identity.cap_people)。空 = 不知道几个人, 不管。
+    #   在本轮配置里设: drive.py --people-n 2(写进 00_run_config.json 的覆盖), 摆人(people)那步之前改才生效。
+    PEOPLE_N    = "",
+    PEOPLE_FULL = "0",      # ★ 2026-11-12 1 = 人体按原视频全帧出(跟踪/网格/摆人/验收视频/FBX), 场景照旧抽帧; 中间帧的相机前后插值(dense_cams.py)。
+                            #   0 = 老做法: 人体用场景那批帧(室内 120 帧, jw4 约 6 fps, 抹鼻子这种 1 秒内的动作只剩两三帧)。人体几步慢约 5 倍
     PEOPLE_MIN_AREA = "0.1",# 人体跟踪只丢最大面积不到画面这么多 % 的(碎片/误检), 其余全列到闸口让人勾。
                             # body4d 自己的默认 1.0 是 mayday 近景调的, soccer 远处守门员 0.7% 被它静默丢了
     BODY_RUN    = "",
@@ -203,7 +235,7 @@ CFG = dict(
     BLD_CONF    = "1.0",    # 楼的深度置信度下限。楼在 100m 外, 置信度恰好等于 DA3 的
                             # 下限 1.00, 用物体那档 2.0 会一个点都剩不下
     BUILDING_WORDS = "",    # 哪些词算"楼"。空 = 这个场景没有建筑, BUILDING_MODE 自动降成 scene
-    BUILDING_MODE  = "scene",   # 楼怎么出。三选一, 见 _bmode():
+    BUILDING_MODE  = "scenewithbuilding",   # 楼怎么出。三选一, 见 _bmode():
                             #   building+scene     楼一个 glb + 场景一个 glb, 各自渲染回图
                             #   scenewithbuilding  一个 glb, 楼和物体在一起
                             #   scene              一个 glb, 没有楼(楼连生成都不生成)
@@ -218,7 +250,8 @@ CFG = dict(
 # 深度更差)多半要重调, 所以每个场景可以在这里覆盖, 不用去改 CFG 也不用每次敲环境变量。
 # ★ 没列在这里的场景标签取场景名前 3 个字母 —— nfl / nfl1 都会是 nfl_rN, 生成的 mesh 按标签存目录,
 #   撞了互相覆盖。前缀会撞的场景在这里配自己的标签(启动页开新轮次时也会查撞没撞)。
-SCENE_TAG = {"timesquare": "ts", "warpengine": "we", "beach": "be", "carpark": "cp", "nfl1": "nf1"}
+SCENE_TAG = {"demo3_moving_camera": "dm3m", "demo3_backup_backflip": "dm3b", "demo1_multi_person": "dm1", "timesquare": "ts", "warpengine": "we", "beach": "be", "carpark": "cp", "nfl1": "nf1",
+             "coupledance_outdoor": "cda"}
 
 SCENES = {
     "timesquare": {},        # 基准场景 —— CFG 的默认值就是在它上面调的
@@ -310,12 +343,16 @@ PICK_OVERRIDE_BY_SCENE = {
 class Ctx:
     def __init__(self, scene, run):
         self.scene = scene; self.run = run
-        self.tag = f"{SCENE_TAG.get(scene, scene[:3])}_{run}"     # timesquare+r1 -> ts_r1
         self.FR  = f"{SAM3D}/data/outdoor/dataset/{scene}/frames"
         self.VID = f"{SAM3D}/data/outdoor/dataset/{scene}/video.mp4"
         self.R1  = f"{SAM3D}/data/outdoor/result/{scene}/{run}"
+        self.tag = f"{SCENE_TAG.get(scene, scene[:3])}_{run}"     # timesquare+r1 -> ts_r1
+        base_tag = f"{self.R1}/.base_tag"
+        if os.path.exists(base_tag):
+            self.tag = open(base_tag).read().strip() or self.tag  # relevel runs reuse prior SAM3D meshes
         self.LOG = f"{self.R1}/logs"
         self.cfg = resolve_cfg(scene, self.R1)   # R1 要先算出来: 人工闸的决策文件在它下面
+        import _common as _cm; self.cfg["EXCLUDE"] = _cm.with_people_words(self.cfg["EXCLUDE"])   # 人的词一律不进候选
         # 人体线归不归这条流水线管; 顺带把 BODY_RUN 填成自动目录(或挑人闸一个没勾时置空)
         self.body_auto = people_decisions.resolve_body_run(self.cfg, scene, run, self.R1)
 
@@ -384,8 +421,14 @@ def s_up(c, dry):
     """定出场景真正的"天"。老代码写死"首帧相机的 -y 就是天", 街头平视成立(时代广场偏
     0.4°), 高空俯拍不成立(beach 偏 26.2°, carpark 29.2°) —— 相机低着头, 它的上方是斜的,
     整个场景连同地面一起歪掉。改成从点云最大平面拟合地面法向。
-    必须排在量盒子之前: 盒子高度是沿"天"量的, 方向错了盒子就错, 事后旋转救不回来。"""
-    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/world_up.py", dict(R1=c.R1)),
+    必须排在量盒子之前: 盒子高度是沿"天"量的, 方向错了盒子就错, 事后旋转救不回来。
+    ★ 2026-11-09 UP_WALL_BODY=1(和室内一样): 看不到地面、找到的平面像墙时, 不再直接停下要人工指定,
+      先用相机的上 + 临时高度, 到尺度那步之前用人的脚底定地面(ground_from_body.py, 方向和高度一起)。
+      看得到路面的场景(绝大多数室外)走不到这一支, 行为不变。"""
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/world_up.py", dict(R1=c.R1, UP_WALL_BODY="1")),
+       f"{c.LOG}/02_up.log", dry)
+    # 相机平滑放在定天之后、所有用相机的步骤之前(跟踪不用相机; 人体跟踪 / 量盒子 / 尺度都在后面)
+    sh(envcmd(PY["sam3d"], f"{PIPE}/cam_smooth.py", None, ["--r1", c.R1, "--sigma", c.cfg["CAM_SMOOTH"]]),
        f"{c.LOG}/02_up.log", dry)
 
 def s_track(c, dry):
@@ -394,7 +437,8 @@ def s_track(c, dry):
     防 OOM 三级都在 track_all.py 里(显存卸到 CPU / 密集词提高检出阈值 / 分段)。
     ★ 2026-09-29 按词拆分: 有几张空卡就起几份 track_all.py, 每份跟踪一部分词(fanout.fan_track)。"""
     fanout.fan_track(PY["sam3"], f"{SCRIPTS}/track_all.py",
-                     dict(FR=c.FR, R1=c.R1, EXTRA_WORDS=c.cfg["EXTRA_WORDS"]),
+                     dict(FR=c.FR, R1=c.R1, EXTRA_WORDS=c.cfg["EXTRA_WORDS"], SAM3_VERSION=c.cfg["SAM3_VERSION"],
+                          **({"MULTIWORD": "0"} if c.cfg["SAM3_VERSION"] == "sam3.1" else {})),
                      c.R1, f"{c.LOG}/03_track.log", dry)
 
 def s_dedup(c, dry):
@@ -408,6 +452,9 @@ def s_dedup(c, dry):
     排除表要和挑图那步用同一份: 排除词本来就不下游, 让它参与只会有一种坏结果 ——
     它当选了组代表, 整组物体跟着它一起被排除掉。
     boxes 那步的三维体素去重留着当兜底, 专管"两个词从来没在同一帧同时出现"的死角。"""
+    # ★ 2026-11-10 先拆跨切点的轨迹(split_cuts.py): 切镜头后 SAM3 把另一个镜头里的同类物体续进老编号,
+    #   hitch r1 的 floor lamp#0 就是两盏隔着几米的灯, 盒子量成 6.7 m。一镜到底的片子这步什么都不改。
+    sh(envcmd(PY["sam3d"], f"{SCRIPTS}/split_cuts.py", dict(R1=c.R1)), f"{c.LOG}/03_split_cuts.log", dry)
     sh(envcmd(PY["sam3d"], f"{SCRIPTS}/dedup_words.py",
               dict(R1=c.R1, EXCLUDE=_gen_excl(c),
                    DW_DUP_TH=c.cfg["DW_DUP_TH"], DW_PART_TH=c.cfg["DW_PART_TH"],
@@ -736,9 +783,16 @@ def s_meshes(c, dry):
 def s_boxes(c, dry):
     """把每个实例跨帧反投影成点云, 拟合带朝向的盒子, 再跨词去重。
     去重用三维体素占用而不是中心距 —— 中心距分不清"重复"和"部件"(树冠 vs 整个盆栽)。
-    留哪个词: 先比 mesh 形状, 形状分不开再退回优先级表(car/taxi 的 mesh 都是轿车, 形状分不出来)。"""
+    留哪个词: 先比 mesh 形状, 形状分不开再退回优先级表(car/taxi 的 mesh 都是轿车, 形状分不出来)。
+    ★ 2026-11-11 GROUND_MODE=terrain 时先跑 shot_register.py: 相机贴在主场景地面上的镜头整体竖直挪到正常离地高度
+      (joker 3 号镜头相机离台阶 0.22 m, 检查视频那段全灰)。放在量盒子之前, 后面盒子 / 地形 / 摆人都用挪过的相机。"""
+    if c.cfg["GROUND_MODE"] == "terrain":
+        # ★ 2026-11-12 先按画面竖线把每个镜头扶正(各镜头的"竖直"各歪各的, joker -15~+16°), 再对齐镜头。见 shot_level.py
+        if c.cfg.get("SHOT_LEVEL", "0") == "1":
+            sh(envcmd(PY["sam3d"], f"{PIPE}/shot_level.py", None, ["--r1", c.R1, "--frames", c.FR]), f"{c.LOG}/06_shot_level.log", dry)
+        sh(envcmd(PY["sam3d"], f"{PIPE}/shot_register.py", None, ["--r1", c.R1]), f"{c.LOG}/06_shot_register.log", dry)
     sh(envcmd(PY["sam3d"], f"{SCRIPTS}/boxes_from_masks.py",
-              dict(R1=c.R1, MIN_POINTS=c.cfg["MIN_POINTS"], CONF_MIN=c.cfg["CONF_MIN"],
+              dict(EXCLUDE=_gen_excl(c), R1=c.R1, MIN_POINTS=c.cfg["MIN_POINTS"], CONF_MIN=c.cfg["CONF_MIN"],
                    SAMPLE_FRAMES=c.cfg["SAMPLE_FRAMES"],
                    VOX=c.cfg["VOX"], DUP_TH=c.cfg["DUP_TH"], PART_TH=c.cfg["PART_TH"])),
        f"{c.LOG}/06_boxes.log", dry)
@@ -759,6 +813,8 @@ def s_vlm_sizes(c, dry):
 def _people_cmd(c, only, extra=None):
     env = dict(SCENE_R1=c.R1, BODY_OUT=people_decisions.auto_dir(c.R1),
                MIN_AREA_PCT=c.cfg["PEOPLE_MIN_AREA"], **(extra or {}))
+    if c.cfg.get("PEOPLE_FULL", "0") == "1":
+        env["FULL_FRAMES"] = c.FR                    # 人体全帧(见 CFG 的 PEOPLE_FULL)
     return envcmd(PY["sam3d"], f"{PIPE}/body4d_pipeline.py", env,
                   ["--scene", c.scene, "--run", c.run, "--only", only])
 
@@ -795,6 +851,15 @@ def s_scale(c, dry):
     把真实 0.85 m 的长椅误杀, WildDet3D 的真米盒子也接不进来。
     ★ 必须排在 boxes 之后(要拿盒子当尺子), 改完深度盒子就过期, 脚本自己会重量一遍。
     ★ 幂等靠 cameras.json 里的 metric_scale_applied, 乘过就拒绝再乘。原始数据备份在 02_da3/_prescale/。"""
+    # 看不到地面时, up 步只能用相机的上 + 临时高度; 人的网格这时已经出了, 先用脚底定地面(方向 + 高度), 再标尺度。
+    # ★ 和室内 o_scale 同一段, 改一处要改两处。
+    up_file = f"{c.R1}/02_da3/world_up.json"
+    if not dry and os.path.exists(up_file) and "待Body脚底" in json.load(open(up_file)).get("来源", ""):
+        body = _body(c, dry)
+        if not body:
+            raise SystemExit("[失败] 看不到地面, 这一轮也没有人可以拿脚底定地面; 需人工指定 02_da3/up_override.json")
+        _with_card("ground_from_body", [PY["sam3d"], f"{PIPE}/ground_from_body.py", "--r1", c.R1, "--body", body],
+                   f"{c.LOG}/02_ground_body.log", dry)
     sh(envcmd(PY["sam3d"], f"{SCRIPTS}/world_scale.py",
               dict(R1=c.R1, MIN_POINTS=c.cfg["MIN_POINTS"], CONF_MIN=c.cfg["CONF_MIN"],
                    SAMPLE_FRAMES=c.cfg["SAMPLE_FRAMES"], VOX=c.cfg["VOX"],
@@ -832,11 +897,29 @@ def s_assemble(c, dry):
         # ★ 用跟组后的集合。写死那个词的话, 去重代表一换人楼就留在主场景里, 而且不报错。
         ex += "," + ",".join(sorted(_bwords(c)))
     print(f"    [建筑模式] {_bmode(c)}")
+    extra = {}
+    if c.cfg["GROUND_MODE"] == "terrain":
+        registered = os.path.isfile(f"{c.R1}/contact_registration.json")
+        if not registered:
+            sh(envcmd(PY["sam3d"], f"{SCRIPTS}/terrain.py", None, ["--r1", c.R1]), f"{c.LOG}/07_terrain.log", dry)
+        extra["TERRAIN"] = f"{c.R1}/07_terrain.npz"
+        # ★ 2026-11-12 坏相机的帧: 相机沿天挪到人脚踩在地形上(人和相机一起挪, 投回原图不偏)。见 badcam_ground.py
+        if not registered:
+            sh(envcmd(PY["sam3d"], f"{PIPE}/badcam_ground.py", None, ["--r1", c.R1]), f"{c.LOG}/07_badcam_ground.log", dry)
+    elif c.cfg["GROUND_MODE"] != "plane":
+        raise SystemExit(f"[失败] GROUND_MODE={c.cfg['GROUND_MODE']!r} 不认识, 只能是 plane / terrain")
+    elif not dry:
+        # 换回 plane 时把上次的地形删掉 —— 摆人那步看到 07_terrain.npz 就会按它贴地
+        for f in ("07_terrain.npz", "07_terrain.json", "07_terrain_高度.jpg"):
+            if os.path.exists(f"{c.R1}/{f}"): os.remove(f"{c.R1}/{f}")
+    if c.cfg["OUTDOOR_SHELL"] == "1":
+        sh(envcmd(PY["sam3d"], f"{SCRIPTS}/outdoor_walls.py", None, ["--r1", c.R1, "--mode", c.cfg["OUTDOOR_WALL_MODE"]]), f"{c.LOG}/09_shell.log", dry)
+        extra.update(ROOM_SHELL=f"{c.R1}/09_房间壳.glb", ROOM_SHELL_FLOOR="0")
     sh(envcmd(PY["sam3d"], f"{SCRIPTS}/assemble_scene.py",
               dict(R1=c.R1, TAG=c.tag, GEN_OUT=f"{GEN}/outputs", SOLO_KEEP=c.cfg.get("SOLO_KEEP",""), EXCLUDE=ex,
                    PER_INSTANCE=c.cfg["PER_INSTANCE"],
                    BODY_RUN=c.cfg["BODY_RUN"],     # 有人就把人的身体当空气墙, 别往人身上推
-                   **_boxes_arg(c))),
+                   **_boxes_arg(c), **extra)),
        f"{c.LOG}/07_assemble.log", dry)
 
 def s_phys(c, dry):
@@ -886,9 +969,18 @@ def s_people(c, dry):
     body = _body(c, dry)
     if not body:
         return _no_people(c, dry, "people")
-    _with_card("people", envcmd(PY["sam3d"], f"{PIPE}/body_motion.py", None,
-                                ["--r1", c.R1, "--body", body, "--scene-in", "07_scene.glb"]),
-               f"{c.LOG}/10_people.log", dry)
+    command = envcmd(PY["sam3d"], f"{PIPE}/body_motion.py", None,
+                                ["--r1", c.R1, "--body", body, "--scene-in", "07_scene.glb",
+                                 "--leg-fit", "on" if c.cfg.get("LEG_FIT", "0") == "1" else "off",
+                                 "--dist-keep", "on" if c.cfg.get("DIST_KEEP", "0") == "1" else "off",
+                                 "--people-n", c.cfg.get("PEOPLE_N", "").strip() or "0"])
+    marker = f"{c.R1}/contact_registration.json"
+    _with_card("people", command, f"{c.LOG}/10_people.log", dry)
+    if c.cfg.get("CONTACT_REGISTER") == "1" and not os.path.exists(marker):
+        sh(envcmd(PY["sam3d"], f"{PIPE}/register_layer_contact.py", None, ["--r1", c.R1]),
+           f"{c.LOG}/contact_registration.log", dry)
+        s_assemble(c, dry)
+        _with_card("people", command, f"{c.LOG}/10_people.log", dry)
 
 
 def s_people_glb(c, dry):
@@ -905,6 +997,21 @@ def s_people_glb(c, dry):
               ["--r1", c.R1, "--body", body, "--scene", "07_scene_phy.glb", "--fr", c.FR]),
        f"{c.LOG}/10_people_glb.log", dry)
 
+
+def s_carry(c, dry):
+    """被人拿着的物体(闸 2 在候选页上点了 held 的): 每个求出每一帧的位姿 -> 13_carry/(carryfit/carry_step.py:
+    重跟 mask -> 找网格(没有就现生成) -> 拟合)。排在摆人之后(要人的网格和手), 导出动作之前(motion 把它们和人一起导进 FBX)。
+    组装那步已经不把它们当静物摆了(assemble_scene.py 的 HELD_NAMES)。没标的轮次清掉上一次的结果、不领卡。
+    ★ indoor_pipeline.o_carry 有一模一样的一步, 改一处要改两处。"""
+    if not review.held(c.R1) or not _body(c, dry):
+        if not dry and os.path.isdir(f"{c.R1}/13_carry"):
+            import shutil; shutil.rmtree(f"{c.R1}/13_carry")
+        print("    闸 2 没有标被人拿着的物体(或这一轮没有人), 跳过"); return
+    cmd = envcmd(PY["sam3d"], f"{SAM3D}/carryfit/carry_step.py", None, ["--r1", c.R1])
+    if dry:
+        return sh(cmd, f"{c.LOG}/13_carry.log", dry)
+    with GpuSlot("carry", 20000):           # 重跟(SAM3) / 生成网格(SAM3D) / 拟合 一个接一个, 最多的那个要 ~20 GB
+        sh(cmd, f"{c.LOG}/13_carry.log", dry)
 
 def s_motion(c, dry):
     """导出动作文件(合成之后): 摆人那步修好的关节参数 + 合成那步出的场景 -> 12_motion/:
@@ -1107,6 +1214,7 @@ STEPS = [
     ("people",   "sam3d",     "摆人: 远近/脚着地/走过的路",        s_people),
     ("phys",     "sam3d",     "落地 + 推开穿模",                  s_phys),
     ("people_glb","sam3d",    "人放进物理后的场景 + 验收视频",      s_people_glb),
+    ("carry",    "sam3d",     "被人拿着的物体: 每帧位姿(carryfit)",  s_carry),
     ("motion",   "sam3d",     "导出动作文件: 场景+人的 FBX(带骨骼)", s_motion),
     ("render",   "sam3d",     "渲染回图比对",                     s_render),
     ("building_scene","sam3d", "楼单独出 glb + 物理 + 渲染回图",    s_building_scene),
@@ -1148,6 +1256,7 @@ ARTIFACTS = {
     "people":   [],                     # 没有人的场景这步是空的, 产物不能写死
     "phys":     ["07_scene_phy.glb"],
     "people_glb": [],
+    "carry":    [],                     # 闸 2 没标 held 就跳过, 产物不能写死(有的话在 13_carry/)
     "motion":   [],                     # 同上: 没有人就跳过, 产物在 12_motion/ 底下、文件名带场景名
     "render":   ["08_render_back.jpg", "08_render_back_phy.jpg"],
     "detect":   ["12_wd_detections.json"],
@@ -1176,7 +1285,8 @@ DEPS = {
     "vlm_sizes": ["vlm"],       "scale": ["boxes", "vlm_sizes", "people_mesh"],
     "solo": ["scale"],          "assemble": ["scale", "solo", "verify", "recall_merge", "boxes"],
     "people": ["assemble", "people_mesh"],     "people_glb": ["phys", "people"],
-    "motion": ["people_glb", "people"],                  # 场景用合成那步出的 09_scene_nopeople.glb
+    "carry": ["people", "track", "da3"],                  # 要摆好的人(10_people_world.npz)和物体的 mask
+    "motion": ["people_glb", "people", "carry"],         # 场景用合成那步出的 09_scene_nopeople.glb; 被拿着的物体读 13_carry
     "phys": ["assemble", "people"],  "render": ["phys"],
     "building_scene": ["assemble"],
     # 召回不依赖盒子 —— 二维比对读的是 03_masks 的 mask。写成依赖 boxes 会把它

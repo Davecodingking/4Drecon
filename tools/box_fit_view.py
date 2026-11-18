@@ -22,7 +22,9 @@ drive.py 在闸 3/4/5 自动跑 --out off(ensure_box_view); 手动要单文件�
 ★ 反投影 / 量盒子直接执行 boxes_from_masks.py 的前半段拿 backproj / fit_box ——
   不自己再写一份, 否则这页量出来的和流水线量出来的会悄悄不一样。
 
-★ 默认会自动转正(--relevel auto): 流水线的天可能歪(office 歪了 9.45°), 页面先从点云里找真地面再画。
+★ 默认按流水线的天原样画(--relevel off): 页面要和交付的 FBX/视频一致。
+  --relevel auto 是 office 天歪 9.45° 时加的显示补丁(会自己找地面再转平); 2026-11-05 发现它在 carl 上
+  把斜穿被子的面当成地面, r1/r2 都被转歪 10~14°, 而 r2 流水线的天本来是对的, 所以默认关掉。天错了要修 world_up.py。
 
 sam3d 环境, 纯 CPU。模板在同目录 box_fit_view_template.html。
 """
@@ -46,7 +48,7 @@ ap.add_argument("--data", default=None,
                 help="数据 json(闸口网页的 3D tab 读它, tools/scene_view.py); 默认 <r1>/10_box_fit_view.json, off = 不出")
 ap.add_argument("--title", default="Box Fit View")
 ap.add_argument("--scene-glb", default="07_scene_phy.glb", help="用哪个 glb 判断\"最终进场景\"")
-ap.add_argument("--relevel", choices=["auto", "off"], default="auto",
+ap.add_argument("--relevel", choices=["auto", "off"], default="off",
                 help="auto: 从场景点云里找真地面, 歪了超过 --relevel-min 度就整体转正(见文件头); off: 按流水线的天原样画")
 ap.add_argument("--relevel-min", type=float, default=2.0)
 ap.add_argument("--body", default=None,
@@ -310,6 +312,18 @@ def find_floor(P, seed=0, iters=4000, cone=25.0, tol=0.04):
 notice = ""
 def T3(x): return np.asarray(x, float)             # 不转正时就是原样
 Ru = np.eye(3)
+_lv = None                                         # (把哪个方向(显示系)转到 +y, 平移 ty, 页面说明)
+# ★ 斜坡(2026-11-05): 06_gravity.json 启用时按竖杆的真竖直朝上显示 —— 和导出的 FBX 一个样:
+#   路面是斜的, 路灯、矮柱、人是直的。流水线内部还是地面系(地面平), 只在显示时转。
+sys.path.insert(0, SCRIPTS); import gravity_from_poles as _gp
+_g = _gp.load(R1)
+if _g is not None and a.relevel != "auto":
+    gd = np.array([_g @ X, _g @ Y, _g @ Z]); tilt = float(np.degrees(np.arccos(min(1, gd[1]))))
+    print(f"[斜坡] 按竖杆的竖直显示, 地面和它差 {tilt:.2f}°")
+    _lv = (gd, 0.0, f'      <p class="lede notice"><b>Sloped ground.</b> Static poles in the video (street lamps, bollards) say the ground '
+                    f'slopes about <b>{tilt:.1f}&deg;</b>. The scene is shown with the poles vertical, as in the exported FBX: the ground is '
+                    "tilted, and each box is rolled upright about its own centre. Inside the pipeline the ground is still treated as flat, "
+                    "so every object rests on the ground at its own spot.</p>")
 if a.relevel == "auto":
     fl = find_floor(CP)
     if fl is None:
@@ -319,30 +333,32 @@ if a.relevel == "auto":
         tilt = float(np.degrees(np.arccos(min(1, n[1]))))
         print(f"[转正] 找到地面: {nin} 个内点, 和流水线的天差 {tilt:.2f}°")
         if tilt >= a.relevel_min:
-            Rf = _rot(n, np.array([0, 1.0, 0]))
-            ty = -float((Rf @ q0)[1])
-            def T3(x): return (np.asarray(x, float) @ Rf.T) + np.array([0, ty, 0])
-            Ru = _rot(Rf @ np.array([0, 1.0, 0]), np.array([0, 1.0, 0]))   # 盒子转回立正
-            def upright(c8):
-                c8 = T3(c8); cc = c8.mean(0); return np.round((c8 - cc) @ Ru.T + cc, 3).tolist()
-            CP = T3(CP)
-            for x in insts:
-                x["box"] = upright(x["box"])
-                if x.get("pbox"): x["pbox"] = upright(x["pbox"])
-                if x["recall"]: continue
-                x["single"] = [dict(c=upright(sb["c"]), dims=sb["dims"]) for sb in x["single"]]
-                x["cent"] = np.round(T3(x["cent"]), 3).tolist()
-                P = np.frombuffer(base64.b64decode(x["pts"]), np.int16).reshape(-1, 3) / 100
-                x["pts"] = b64(np.round(T3(P) * 100).astype(np.int16))
-                ch = np.array(x["cent"])[:, [0, 2]]
-                x["spread"] = round(float(max(np.linalg.norm(p - q) for p in ch for q in ch)) if len(ch) > 1 else 0.0, 2)
-            notice = (f'      <p class="lede notice"><b>Re-levelled.</b> As exported, this scene stood <b>{tilt:.1f}&deg; off vertical</b>: '
-                      "the pipeline's world-up estimate did not lock onto the real floor, so every height was measured along a tilted "
-                      "direction. The real floor was found in the points; points, boxes and the camera path were rigidly rotated until "
-                      "it lies flat at y&nbsp;=&nbsp;0, and each box was then rolled upright about its own centre. Box sizes are "
-                      "the pipeline's own and unchanged; spreads are recomputed in the true horizontal.</p>")
+            _lv = (n, -float((_rot(n, np.array([0, 1.0, 0])) @ q0)[1]),
+                   f'      <p class="lede notice"><b>Re-levelled.</b> As exported, this scene stood <b>{tilt:.1f}&deg; off vertical</b>: '
+                   "the pipeline's world-up estimate did not lock onto the real floor, so every height was measured along a tilted "
+                   "direction. The real floor was found in the points; points, boxes and the camera path were rigidly rotated until "
+                   "it lies flat at y&nbsp;=&nbsp;0, and each box was then rolled upright about its own centre. Box sizes are "
+                   "the pipeline's own and unchanged; spreads are recomputed in the true horizontal.</p>")
         else:
             print(f"[转正] 偏差不到 {a.relevel_min}°, 不动")
+if _lv is not None:
+    Rf = _rot(_lv[0], np.array([0, 1.0, 0])); ty = _lv[1]
+    def T3(x): return (np.asarray(x, float) @ Rf.T) + np.array([0, ty, 0])
+    Ru = _rot(Rf @ np.array([0, 1.0, 0]), np.array([0, 1.0, 0]))   # 盒子转回立正
+    def upright(c8):
+        c8 = T3(c8); cc = c8.mean(0); return np.round((c8 - cc) @ Ru.T + cc, 3).tolist()
+    CP = T3(CP)
+    for x in insts:
+        x["box"] = upright(x["box"])
+        if x.get("pbox"): x["pbox"] = upright(x["pbox"])
+        if x["recall"]: continue
+        x["single"] = [dict(c=upright(sb["c"]), dims=sb["dims"]) for sb in x["single"]]
+        x["cent"] = np.round(T3(x["cent"]), 3).tolist()
+        P = np.frombuffer(base64.b64decode(x["pts"]), np.int16).reshape(-1, 3) / 100
+        x["pts"] = b64(np.round(T3(P) * 100).astype(np.int16))
+        ch = np.array(x["cent"])[:, [0, 2]]
+        x["spread"] = round(float(max(np.linalg.norm(p - q) for p in ch for q in ch)) if len(ch) > 1 else 0.0, 2)
+    notice = _lv[2]
 
 # ---- 相机: 每个相机的位置 + 视锥, 按原视频帧号排 ----
 # ★ 按原视频帧号(frame_map)而不是相机键排: 人体那边用的是原视频帧号, 两边要对到同一根时间轴上。

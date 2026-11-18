@@ -299,10 +299,10 @@ index 0000000..5e59671
 +print(f"[覆盖] " + "  ".join(f"id{i}:{cov[i]}/{N}" for i in ids))
 diff --git a/body4d_mesh_5090.py b/body4d_mesh_5090.py
 new file mode 100644
-index 0000000..9c52876
+index 0000000..0a62b39
 --- /dev/null
 +++ b/body4d_mesh_5090.py
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,277 @@
 +#!/usr/bin/env python
 +"""第二段: 拿盘上的 images/ + masks/ 出人体网格 (SAM 3D Body [+ Diffusion-VAS 补全])。
 +
@@ -500,20 +500,48 @@ index 0000000..9c52876
 +#   焦距默认是 MoGe-2 一帧一帧估的, 和场景重建的相机不是一回事。pedestrian 实测 MoGe 给
 +#   1465px、场景 1412px, 人的远近跟着差 3.8%。换成场景的焦距后, 剩下的差距只来自
 +#   "人的真实大小"那一项, 下游(body_into_scene)再用场景深度校正。
-+#   场景各帧焦距只差 1% 上下(office 626~634 @688 宽), 取中位数当常数, 按每张图的实际尺寸缩放。
++#   ★ 2026-11-10 改成**每帧用场景那一帧自己的焦距**。以前取全部帧的中位数当常数(单镜头场景各帧只差 1% 上下,
++#     office 626~634 @688 宽), 切镜头的片子各镜头焦距差得多: hitch_cuts_indoor 2.78~3.98 x 图高, 中位 3.39。
++#     远景那几段(真实 2.8)按 3.39 算, 人的远近多算 21% —— 尺度那步拿人当尺子, k 就跟着偏大
++#     (hitch r1: 人说 1.30, 家具说 1.15), 房间被放大一圈、人没跟着放大, 人显得矮。
++#   对帧: 运行目录 images/<i>.jpg 的 i -> 00_frames/frames.json 的 kept_indices[i](原视频帧号)
++#         -> 场景 frame_map.json 里同一个原视频帧号的那一帧。对不上的帧(不该有)用中位数, 并报出来。
 +if a.cam_json:
 +    _cams = json.load(open(a.cam_json))["cameras"]
-+    _fy_rel = float(np.median([np.array(v["intrinsic_3x3"])[1][1] / v["input_hw"][0] for v in _cams.values()]))
++    _fy_of = {k: float(np.array(v["intrinsic_3x3"])[1][1] / v["input_hw"][0]) for k, v in _cams.items()}
++    _fy_rel = float(np.median(list(_fy_of.values())))
++    _kept = json.load(open(f"{os.path.dirname(os.path.abspath(a.dir))}/00_frames/frames.json"))["kept_indices"]
++    _fm = json.load(open(f"{os.path.dirname(os.path.abspath(a.cam_json))}/frame_map.json"))["frames"]
++    _v2k = {int(v): k for k, v in _fm.items()}
++    _fy_img = {i: _fy_of[_v2k[int(vf)]] for i, vf in enumerate(_kept) if _v2k.get(int(vf)) in _fy_of}
++    _miss = len(_kept) - len(_fy_img)
 +
 +    class _SceneK:
-+        """替掉 MoGe-2 的 FOV 估计器: 接口和 FOVEstimator.get_cam_intrinsics 一样, 返回 (1,3,3)。"""
++        """替掉 MoGe-2 的 FOV 估计器: 接口和 FOVEstimator.get_cam_intrinsics 一样, 返回 (1,3,3)。
++        它只拿到图、不知道是第几帧 —— 由下面包过的 process_frames 按顺序告诉它(process_frames 里每张图调它一次)。"""
++        queue, n, used = [], 0, {}
 +        def get_cam_intrinsics(self, img, **kw):
 +            H, W = img.shape[:2]
-+            f = _fy_rel * H                             # 方像素, 和 MoGe 那条路一样用竖直焦距
++            if self.n >= len(self.queue):
++                raise RuntimeError(f"[焦距] 第 {self.n + 1} 次要焦距, 这一批只有 {len(self.queue)} 张图 —— 对不上帧, 不能猜")
++            i = int(os.path.basename(self.queue[self.n])[:-4]); self.n += 1
++            fr = _fy_img.get(i, _fy_rel); self.used[i] = fr
++            f = fr * H                                  # 方像素, 和 MoGe 那条路一样用竖直焦距
 +            return torch.tensor([[[f, 0.0, W / 2.0], [0.0, f, H / 2.0], [0.0, 0.0, 1.0]]])
 +
-+    app.sam3_3d_body_model.fov_estimator = _SceneK()
-+    print(f"[焦距] 用场景相机: f = {_fy_rel:.4f} x 图高 (1080 高时 {_fy_rel * 1080:.0f}px), 不用 MoGe-2")
++    _scene_k = _SceneK()
++    app.sam3_3d_body_model.fov_estimator = _scene_k
++    _pf = app.sam3_3d_body_model.process_frames
++    def _process_frames(img_list, *args, **kw):
++        if not all(isinstance(x, str) for x in img_list):
++            raise RuntimeError("[焦距] process_frames 收到的不是图片路径, 不知道是第几帧")
++        _scene_k.queue, _scene_k.n = list(img_list), 0
++        return _pf(img_list, *args, **kw)
++    app.sam3_3d_body_model.process_frames = _process_frames
++    _vals = list(_fy_img.values()) or [_fy_rel]
++    print(f"[焦距] 用场景相机, 每帧各用各的: {min(_vals):.3f}~{max(_vals):.3f} x 图高"
++          f"(中位 {_fy_rel:.4f}, 1080 高时 {_fy_rel * 1080:.0f}px), 不用 MoGe-2"
++          + (f"; ★ {_miss} 帧对不上场景帧, 用中位数" if _miss else ""))
 +print(f"[载模型] {time.time()-t0:.0f}s  显存 {torch.cuda.memory_allocated()/2**30:.1f}G")
 +
 +# ★ 2026-10-08 热身: 这个进程里**第一次**调模型算出来的东西和后面的调用不一样(office 人 4 实测: 排第一算 vs 排第二算,

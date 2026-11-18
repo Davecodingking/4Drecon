@@ -75,6 +75,46 @@ def test_fewer_than_three_frames_is_not_a_person():
     assert set(people) == {"8"} and [(x["事"], x["编号"]) for x in log] == [("不算人", "7")]
 
 
+def test_a_tenth_of_a_second_mid_clip_is_not_a_person_at_30fps():
+    """人体全帧(30 fps): 3 帧只有 0.1 秒。jw4 r4_30fps 人 8 = 一闪而过的模糊人影 + 一根棍子, 片子中间闪一下 —— 不算人。"""
+    dt = 1 / 30.0
+    tr = {"1": _track(range(0, 120), (0, 0, 0), dt), "8": _track([50, 51, 52], (4, 0, 4), dt)}
+    people, log = ID.resolve(tr)
+    assert set(people) == {"1"}, people
+    assert [(x["事"], x["编号"]) for x in log] == [("不算人", "8")], log
+
+
+def test_short_at_the_very_end_of_the_clip_is_still_a_person():
+    """片尾才进画面的人只露几帧(nfl1 人 8, 24 fps 3 帧): 是真人, 留着。"""
+    dt = 1 / 24.0
+    tr = {"1": _track(range(0, 120), (0, 0, 0), dt), "8": _track([117, 118, 119], (4, 0, 4), dt)}
+    people, log = ID.resolve(tr)
+    assert set(people) == {"1", "8"}, (people, log)
+
+
+def test_three_frames_at_six_fps_is_unchanged():
+    """6 fps 左右(场景那批帧)三帧 ≈ 0.45 秒: 和以前一样留着, 老轮次结果不变。"""
+    tr = {"1": _track(range(0, 40), (0, 0, 0)), "8": _track([20, 21, 22], (4, 0, 4))}
+    assert set(ID.resolve(tr)[0]) == {"1", "8"}
+
+
+def test_an_id_that_jumps_onto_someone_already_tracked_is_not_a_second_person():
+    """jw4 r4_30fps 18.8~19.5 秒: 编号 3 中途瞬移, 跳到长发打手身上 —— 他已经有自己的编号(人 3), 于是一个人身上叠了两个人(人 7)。
+    跳过来那段大部分时间和已有的人在同一个位置 -> 是同一个人被挂了两个编号, 不算人; 编号 3 跳之前那段照旧是人。"""
+    tr = {"1": _track(range(0, 60), (0, 0, 0)),
+          "3": {**_track(range(0, 30), (3, 0, 3)), **_track(range(30, 45), (0.1, 0, 0.05))}}
+    people, log = ID.resolve(tr)
+    assert _ids(people) == {"1": ["1"], "3": ["3"]}, (people, log)
+    assert any(x["事"] == "不算人" and x["编号"] == "3" and x["帧"][0] == 30 for x in log), log
+
+
+def test_two_real_people_hugging_from_start_stay_two():
+    """jw1 两个人抱在一起扭打(骨盆常常只差 0.25 m): 各有各的编号、不是跳过来的 —— 两个人。"""
+    tr = {"1": _track(range(0, 60), (0, 0, 0)), "4": _track(range(0, 60), (0.2, 0, 0.1))}
+    people, log = ID.resolve(tr)
+    assert set(people) == {"1", "4"}, (people, log)
+
+
 def test_merging_never_joins_two_people_who_were_seen_together():
     """A、B 同时在场(两个人)。后来冒出的 C 离两人都近: 只能并给其中一个(近的那个), 不能把 A、B 连成一个人。"""
     tr = {"1": _track(range(0, 50), (3.0, 0, 3)), "2": _track(range(0, 50), (3.3, 0, 3)), "9": _track(range(70, 80), (3.25, 0, 3))}
@@ -246,6 +286,56 @@ def test_mesh_dirs_without_a_store_file_read_as_before():
         run = _fake_run(T, {"1": [0, 1, 2]})
         assert ID.raw_run(T) == run and "算于" not in ID.source_of(T)
 
+
+
+def test_a_jump_where_positions_are_unreliable_does_not_split_a_person():
+    """jw4 人 1(2026-11-11): 甄子丹坐在地上的特写, 第 62~71 帧相机被判坏, 世界位置一帧跳 4.1 m, 被切成两个人
+    (验收视频 10 秒处黄变粉)。坏相机的帧 / 隔着切点的两帧位置本身不可信, 不按瞬移切, 信跟踪的编号。
+    同样的跳发生在位置可信的帧上照旧切开(goodfellas_tray 编号串到别人身上那种)。"""
+    tr = {"1": {**_track(range(0, 10), (0, 0, 0)), **_track(range(10, 20), (4.1, 0, 0))}}
+    people, _ = ID.resolve(tr)
+    assert len(people) == 2, _ids(people)                                  # 位置可信: 切开
+    people, log = ID.resolve(tr, unreliable={10, 11, 12})
+    assert people == {"1": [("1", b) for b in range(20)]} and log == [], (people, log)
+    people, log = ID.resolve(tr, shot_of=lambda b: int(b >= 10))           # 隔着切点
+    assert people == {"1": [("1", b) for b in range(20)]} and log == [], (people, log)
+
+
+def test_one_or_two_frames_hooked_onto_someone_else_right_after_a_cut_are_dropped():
+    """jw4 编号 1(2026-11-11): 0.4 秒切点后第一帧挂到画面左边的大个子上, 下一帧回到远处的甄子丹(同镜头一跳 6.7 m)。
+    这一帧不出人; 切点前的甄子丹和后面的甄子丹还是一个人(以前这 4 帧被并给了别人)。"""
+    shot = lambda b: int(b >= 3)
+    tr = {"1": {**_track(range(0, 3), (0, 0, 0)), **_track([3], (6, 0, 0)), **_track(range(4, 30), (0.3, 0, 6.7))}}
+    people, log = ID.resolve(tr, shot_of=shot)
+    assert people == {"1": [("1", b) for b in list(range(3)) + list(range(4, 30))]}, people
+    assert [(x["事"], x["帧"]) for x in log] == [("不算人", [3])], log
+
+
+def test_a_short_stretch_after_a_cut_does_not_inherit_the_id():
+    """jw4 编号 1(2026-11-11): 11.57 秒切点后挂到前景另一个人身上 5 帧(0.75 秒)就断了 —— 不信跟踪的, 另起一个人;
+    切点后一直跟着的(够 CUT_TRUST_S)照旧信。"""
+    shot = lambda b: int(b >= 20)
+    tr = {"1": {**_track(range(0, 20), (0, 0, 0)), **_track(range(20, 25), (3, 0, 0))}}
+    people, _ = ID.resolve(tr, shot_of=shot)
+    assert len(people) == 2 and [("1", b) for b in range(20)] in people.values(), _ids(people)
+    tr = {"1": {**_track(range(0, 20), (0, 0, 0)), **_track(range(20, 40), (3, 0, 0))}}
+    people, _ = ID.resolve(tr, shot_of=shot)
+    assert people == {"1": [("1", b) for b in range(40)]}, _ids(people)
+
+
+def test_people_cap_merges_a_person_split_into_overlapping_ids():
+    """jw1(2026-11-11, 用户: 从头到尾就两个人): A 一直是编号 1; B 被跟踪拆成 2 -> 3 -> 4, 交接处各有几帧和下一个编号同时在场
+    (那一刻三个框, 多出来的是重复框)。人数上限 2: 交接处帧数少的编号那几帧不要, 2/3/4 并成一个人。不给上限照旧是 4 个人。"""
+    tr = {"1": _track(range(0, 60), (0, 0, 0)),
+          "2": _track(range(0, 22), (1, 0, 0)), "3": _track(range(18, 45), (1.2, 0, 0)), "4": _track(range(42, 60), (2.6, 0, 0))}
+    people, _ = ID.resolve(tr)
+    assert len(people) == 4, _ids(people)
+    people, log = ID.resolve(tr, max_people=2)
+    assert len(people) == 2, _ids(people)
+    other = [v for p, v in people.items() if p != "1"][0]
+    assert sorted(b for _, b in other) == list(range(60)), other              # 每帧一个, 不重复
+    assert people["1"] == [("1", b) for b in range(60)]
+    assert any(x["事"] == "不算人" and "人数上限" in x["原因"] for x in log)
 
 if __name__ == "__main__":
     for name, f in list(globals().items()):

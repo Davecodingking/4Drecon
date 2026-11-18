@@ -41,9 +41,16 @@ REST = ({k.replace(" ", "_"): v for k, v in json.load(open(REST_P)).items()}
 HUNG |= {k for k, v in REST.items() if v == "hung"}
 FREE_FALL = bool(HUNG) or bool(REST)
 LAND_MAX = float(os.environ.get("LAND_MAX", "0.15"))   # 只在给了 REST 时用: 落地最多挪这么多
+LAND_MAX_SURFACE = float(os.environ.get("LAND_MAX_SURFACE", "0.25"))
 PUSH_MAX = float(os.environ.get("PUSH_MAX", "0") or 0) # 每个物体自己最多被横推这么多; 0 = 不限(老行为)
 ITERS= int(os.environ.get("ITERS","12"))
 MARGIN=float(os.environ.get("MARGIN","0.02")) # 推开后留的缝
+# ★ 2026-11-11 贴墙的东西(组装那步已经贴到墙面上, 见 assemble_scene 的 WALL_ATTACH_WORDS)不推出墙: 下面判碰墙用的是物体半宽,
+#   1 m 宽的门会被往外推半个门宽(spl 门物理后离墙 0.45~1.1 m)。名字按节点名(空格换下划线)。
+WALL_ATTACH = {w.strip().replace(" ", "_") for w in os.environ.get("WALL_ATTACH_WORDS",
+               "door,metal door,garage door,front door,window,gate,shutter,roller shutter,poster,painting,picture,picture frame,mirror,wall clock,clock,framed picture,artwork").split(",") if w.strip()}
+# 挂墙的(海报 / 画 / 镜子 / 钟)不落地 —— 和 assemble 的 FLOAT_WORDS 同一批; 单独一个集合, 不并进 HUNG(并进去会改掉室外的 FREE_FALL)
+WALL_HANG = {w.strip().replace(" ", "_") for w in os.environ.get("WALL_HANG_WORDS", "poster,painting,picture,picture frame,mirror,wall clock,clock,framed picture,artwork").split(",") if w.strip()}
 
 SRC=os.environ.get("SCENE_IN","07_scene.glb")
 sc=trimesh.load(f"{R1}/{SRC}")
@@ -102,7 +109,7 @@ def land():
     """落一遍。室内推开之后还要再落一遍, 所以做成函数。返回 (吸附数, 落台面数, 没落的, 真挪了高度的)。"""
     snapped=onsupp=0; skipped=[]; moved=[]
     for name,g in sorted(items, key=lambda d: float(d[1].vertices[:,1].min())):
-        if cls_of(name) in HUNG: skipped.append((cls_of(name),"挂的")); continue
+        if cls_of(name) in HUNG or cls_of(name) in WALL_HANG: skipped.append((cls_of(name),"挂的")); continue
         V=g.vertices; low=float(V[:,1].min())
         lo,hi=V[:,[0,2]].min(0), V[:,[0,2]].max(0)
         target=gy; tname="地面"
@@ -225,7 +232,11 @@ def land_rest():
         if r is None: t=np.array([0.0,gy-low,0.0]); on=None; tn="地面"
         else: t=np.array([r[1][0],r[0]-low,r[1][1]]); on=r[2]; tn=cls_of(r[2])
         fall=-float(t[1])                                        # >0 = 往下落
-        if fall>LAND_MAX and not (on is None and low<gy):
+        # A surface object with a measured supporting mesh can tolerate a
+        # slightly larger depth error. Keep the strict limit for floor snaps
+        # and for objects with no supporting surface (e.g. a missing table).
+        limit = LAND_MAX_SURFACE if on is not None and REST.get(cls_of(name)) == "surface" else LAND_MAX
+        if fall>limit and not (on is None and low<gy):
             far.append((name,tn,round(fall,2))); parent[name]=None
         else:
             g.apply_translation(t); parent[name]=on
@@ -264,9 +275,12 @@ else:
 # 没给 PEOPLE 时这一段整个不生效, 行为逐位不变。
 PEOPLE=os.environ.get("PEOPLE","")
 PINNED=set(); PRINTS=[]
+if PEOPLE and os.path.exists(PEOPLE):
+    _pj0=json.load(open(PEOPLE))
+    PINNED|=set(_pj0.get("pinned_chairs", []))|set(_pj0.get("pinned_supports", []))
 if INDOOR and PEOPLE and os.path.exists(PEOPLE):
     _pj=json.load(open(PEOPLE)); _fy=float(_pj.get("floor_y", gy))
-    PINNED=set(_pj.get("pinned_chairs", []))
+    PINNED|=set(_pj.get("pinned_chairs", []))
     for _p in _pj["people"].values():
         for fp in _p["footprints"]:
             PRINTS.append(dict(c=np.asarray(fp["c"],float), ax=np.asarray(fp["ax"],float),
@@ -279,6 +293,11 @@ PILLARS={n.split("/")[-1] for n,_ in items if cls_of(n)=="pillar"} if INDOOR els
 if PILLARS:
     PINNED|=PILLARS
     print(f"[柱子] {len(PILLARS)} 根, 钉死不动, 撞上它的物体被推开")
+# ★ 2026-11-11 贴墙的门 / 窗(有墙才算贴上了)也钉死: 物体互推会把它推离墙或推进墙(spl 门 3 离墙 0.33 m、门 13 进墙 9 cm)
+_WA = {n.split("/")[-1] for n, _ in items if cls_of(n) in WALL_ATTACH} if walls else set()
+if _WA:
+    PINNED |= _WA
+    print(f"[贴墙] {len(_WA)} 个钉在墙上不动: {sorted(_WA)}")
 # ★ 人的整个身体当空气墙 (PEOPLE_BODY, 2026-09-22)。上面的脚印只管离地 0.6m 那一层, 而且桌子
 #   这类底下空的整类豁免 —— office 2 号、7 号整个人站在站立办公桌里(桌面 1.1m 在腰上), 物理
 #   一眼都没看。现在用 body_into_scene 给的"每人整段扫过的身体内芯"(表面往里收一格、不含手 ——
@@ -402,6 +421,7 @@ if INDOOR:
         OPEN_BELOW={n for n in names if low_fill(G[n], RC[n]) < LOW_FILL}
         print(f"[人] {len(OPEN_BELOW)} 个物体贴地那层是空的(桌腿之类), 人的脚能伸进去, 不因为人推它们: "
               f"{sorted(n.split('/')[-1] for n in OPEN_BELOW)}")
+    it_=-1; worst=0.0; hit=0; stacked=0      # ★ 11-12 ITERS=0(不推开, joker 物体固定在量到的位置)时循环一轮不跑, 下面打印要用
     for it_ in range(ITERS):
         worst=0.0; hit=0; stacked=0
         for i in range(len(names)):
@@ -486,13 +506,16 @@ else:
     vol=[np.prod(g.extents) for _,g in items]
     order=np.argsort(vol)[::-1]                   # 体积大的先固定
     moved=0
+    it_=-1; worst=0.0; hit=0                 # ★ 11-12 ITERS=0 时循环一轮不跑, 下面打印要用
     for it_ in range(ITERS):
         worst=0.0; hit=0
         for a in range(len(items)):
             for b in range(a+1,len(items)):
                 lo1,hi1=aabb(items[a][1]); lo2,hi2=aabb(items[b][1])
                 ov=np.minimum(hi1,hi2)-np.maximum(lo1,lo2)
-                if (ov<=0).any(): continue
+                if (ov<=0).any() or ov[1] <= 1e-4: continue  # touching support surfaces can overlap by float32 roundoff
+                pa,pb=_pin(items[a][0]),_pin(items[b][0])
+                if pa and pb: continue
                 hit+=1
                 # 只水平推: 在 x / z 里挑代价最小的方向
                 ax=0 if ov[0]<ov[2] else 2
@@ -500,6 +523,8 @@ else:
                 sign=1.0 if (items[a][1].centroid[ax] > items[b][1].centroid[ax]) else -1.0
                 va,vb=np.prod(items[a][1].extents), np.prod(items[b][1].extents)
                 wa=vb/(va+vb); wb=va/(va+vb)      # 小的多让
+                if pa: wa,wb=0.0,1.0
+                if pb: wa,wb=1.0,0.0
                 t=np.zeros(3); t[ax]=push*sign*wa; items[a][1].apply_translation(t); 
                 t=np.zeros(3); t[ax]=-push*sign*wb; items[b][1].apply_translation(t)
                 moved+=1
@@ -526,7 +551,7 @@ def push_out_of_walls_rect(n):
     cap_move(n, np.array([mv[0],0.0,mv[1]])); return True
 wall_block=[]
 if segs:
-    nw=sum(push_out_of_walls_rect(n) for n,_ in items) if INDOOR else sum(push_out_of_walls(g) for _,g in items)
+    nw=sum(push_out_of_walls_rect(n) for n,_ in items) if INDOOR else sum(push_out_of_walls(g) for n,g in items if not _pin(n) and cls_of(n) not in WALL_ATTACH and cls_of(n) != "window_base")
     print(f"[墙] {nw}/{len(items)} 个物体穿墙, 已推回屋内" + (f"; {len(wall_block)} 个推回去会压进人, 没推: {wall_block}" if wall_block else ""))
 if INDOOR and PILLARS:
     _left=[]
@@ -540,7 +565,7 @@ if INDOOR and PILLARS:
     print("[柱子] 推完还插进柱子超过 5 cm 的: " + (str(sorted(_left, key=lambda r: -r[2])) if _left else "没有"))
 if INDOOR and BODY is not None:
     _body_report()
-if INDOOR:
+if INDOOR and RC:      # 一个物体都没有(只要人的轮次, 静物整词作废)就没得统计 —— 11-10 验证集 jw1/jw4 在这里 IndexError
     dd=sorted(((float(np.linalg.norm(RC[n]["c"]-c_start[n])),n) for n in RC), reverse=True)
     print(f"[挪动] 推开+推墙后水平挪动: 中位 {np.median([x for x,_ in dd]):.2f} m, "
           f">0.3m 的 {sum(x>0.3 for x,_ in dd)} 个, 最多 {dd[0][0]:.2f} m ({dd[0][1].split('/')[-1]})")
@@ -567,6 +592,32 @@ else:
         d=float(g.vertices[:,1].min())-gy
         if abs(d)<=SNAP: g.apply_translation([0,-d,0])
 
+# ★ 2026-11-12 交付的地面是模型(terrain.py 平面 + 台阶 + 平台)时: 立在地上的物体(terrain.GROUNDED)底下的地面比它的底低
+#   0.3 m 以上 -> 按它摆好的网格的底(最低 5 cm 那圈顶点的水平范围)在下面立一根柱子到地面。joker 主楼梯两边的路灯立在台阶两侧的
+#   矮墙上, 交付的楼梯没有矮墙, 底下是 9 m 下面的路面; 按盒子范围立的柱子太粗, 穿进消防梯 4(11.6% 顶点), 所以按灯杆底立。
+_tp=os.path.join(os.environ.get("R1",""),"07_terrain.npz")
+if os.path.exists(_tp) and not walls:
+    import terrain as _tm
+    if getattr(_tm.Terrain(_tp),"model_mesh",False):
+        _ray=trimesh.ray.ray_triangle.RayMeshIntersector(ground); _cols=[]; _rep=[]
+        for name,g in items:
+            w_=name.rsplit("/",1)[-1].rsplit("_",1)[0].replace("_"," ")
+            if w_ not in _tm.GROUNDED: continue
+            V=g.vertices; lo=float(V[:,1].min()); B=V[V[:,1]<lo+0.05]
+            x0,z0=B[:,[0,2]].min(0)-0.03; x1,z1=B[:,[0,2]].max(0)+0.03; cx,cz=(x0+x1)/2,(z0+z1)/2
+            loc,_,_=_ray.intersects_location([[cx,lo+0.01,cz]],[[0,-1,0]])
+            gh=float(loc[:,1].max()) if len(loc) else gy
+            # 底下有别的物体托着(joker 路灯 7 底高 4.42 = 消防梯 4 的顶)就不立柱子: 按地面立会从消防梯里穿过去(112 个顶点在柱子里)
+            _oth=[g2 for n2,g2 in items if g2 is not g]
+            if _oth:
+                _lo2,_,_=trimesh.ray.ray_triangle.RayMeshIntersector(trimesh.util.concatenate(_oth)).intersects_location([[cx,lo+0.01,cz]],[[0,-1,0]])
+                if len(_lo2): gh=max(gh,float(_lo2[:,1].max()))
+            if lo-gh>0.3:
+                col=trimesh.creation.box(extents=[x1-x0,lo-gh,z1-z0]); col.apply_translation([cx,(lo+gh)/2,cz]); _cols.append(col)
+                _rep.append(name.rsplit("/",1)[-1]+f" {lo-gh:.2f} m")
+        if _cols:
+            _vis=ground.visual; ground=trimesh.util.concatenate([ground]+_cols); ground.visual=_vis if len(_vis.uv if hasattr(_vis,"uv") and _vis.uv is not None else [])==len(ground.vertices) else trimesh.visual.TextureVisuals(material=getattr(_vis,"material",None))
+        print(f"[底座柱] {len(_cols)} 根(按网格的底立到交付的地面): {_rep}")
 out=trimesh.Scene()
 for name,g in items: out.add_geometry(g,node_name=name)
 out.add_geometry(ground,node_name="ground" if not walls else "floor")

@@ -28,8 +28,12 @@ TOL_CM = 0.1                                                          # 自检�
 TOL_CAM_DEG, TOL_CAM_LENS = 0.01, 0.01                                # 相机朝向(度) / 焦距(%): 导出再导回只该有浮点误差
 TOL_CAM_PX = 0.01                                                     # 相机投影和流水线的投影最多差画面宽的这么多(横竖焦距取平均带来的差在 0.4% 以内)
 bad = []
+CARRY = f"{outd}/_carry.npz"                                          # 被人拿着的物体(motion_export.carry_bundle 写的), 没有就是没有
+CARRY_REF = {}                                                        # 物体名 -> 导入时网格的顶点(自检用)
 CAM_VF = z["cam_vf"]; CAM_M = CT.blender_pose(z["cam_c2w"])           # 相机: 每个场景帧一个, 帧号和人的是同一套(原视频帧号)
 CAM_LENS, CAM_SX, CAM_SY, CAM_ANISO = CT.lens(z["cam_K"], z["cam_hw"])
+_K = np.asarray(z["cam_K"], float); _ch, _cw = (float(x) for x in z["cam_hw"])
+CAM_SXF = (_cw / 2 - _K[:, 0, 2]) / _cw; CAM_SYF = (_K[:, 1, 2] - _ch / 2) / _cw   # 逐帧 shift(和 CT.lens 同一个换算), 光心各帧不同时要逐帧打关键帧
 RES = CT.render_size(z["cam_hw"], z["video_wh"])
 
 
@@ -54,6 +58,76 @@ def import_people(bone_dir="BLENDER"):
     for f in srcs:
         bpy.ops.import_scene.gltf(filepath=f, bone_heuristic=bone_dir)
 
+def import_carried():
+    """被人拿着的物体: 每个导入成一个网格(glb 里几块并成一块), 形状部分(motion_export 给的 B)烘进顶点,
+    每帧打一个关键帧(位置 + 四元数, 缩放恒为 1; 线性插值)。
+    四元数逐帧取和上一帧同号的那个 —— 关键帧隔几帧一个时, 符号一翻插值会绕远路转一圈。"""
+    if not os.path.exists(CARRY):
+        return []
+    C = np.load(CARRY, allow_pickle=True); objs = []
+    for j in range(int(C["n"])):
+        before = set(bpy.data.objects)
+        bpy.ops.import_scene.gltf(filepath=str(C[f"o{j}_mesh"]))
+        new = [o for o in bpy.data.objects if o not in before]
+        meshes = [o for o in new if o.type == "MESH"]
+        bpy.ops.object.select_all(action="DESELECT")
+        for o in meshes:
+            o.select_set(True)
+        bpy.context.view_layer.objects.active = meshes[0]
+        if len(meshes) > 1:
+            bpy.ops.object.join()
+        obj = bpy.context.view_layer.objects.active
+        obj.parent = None
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)   # 网格数据 = 导入后的 Blender 坐标
+        for o in new:
+            if o.name in bpy.data.objects and o != obj:
+                bpy.data.objects.remove(o, do_unlink=True)
+        obj.name = str(C[f"o{j}_name"]); obj.rotation_mode = "QUATERNION"
+        obj.data.transform(Matrix(C[f"o{j}_B"].tolist()))          # 形状(各轴缩放 + 归一化)烘进顶点, 关键帧只放刚体位姿
+        co = np.empty(len(obj.data.vertices) * 3); obj.data.vertices.foreach_get("co", co)
+        CARRY_REF[obj.name] = co.reshape(-1, 3)
+        prev = None
+        for v, W in zip(C[f"o{j}_vf"], C[f"o{j}_W"]):
+            loc, q, s = Matrix(W.tolist()).decompose()
+            if prev is not None and prev.dot(q) < 0:
+                q.negate()
+            prev = q
+            obj.location, obj.rotation_quaternion, obj.scale = loc, q, s
+            for path in ("location", "rotation_quaternion", "scale"):
+                obj.keyframe_insert(data_path=path, frame=int(v))
+        for fc in obj.animation_data.action.fcurves:
+            for kp in fc.keyframe_points:
+                kp.interpolation = "LINEAR"
+        objs.append(obj)
+    print(f"被人拿着的物体: {len(objs)} 个 " + ", ".join(o.name for o in objs))
+    return objs
+
+
+def check_carried(tag):
+    """被拿着的物体: 抽 5 帧, 播出来的网格(世界系包围盒) vs 流水线求的位姿套在原网格上。"""
+    if not os.path.exists(CARRY):
+        return
+    C = np.load(CARRY, allow_pickle=True); sc = bpy.context.scene
+    for j in range(int(C["n"])):
+        name = str(C[f"o{j}_name"])
+        o = next((o for o in sc.objects if o.type == "MESH" and o.name.split(".")[0] == name), None)
+        if o is None:
+            bad.append(f"{tag} 被拿着的 {name} 不在里面"); continue
+        vf, Ws, ref = C[f"o{j}_vf"], C[f"o{j}_W"], CARRY_REF[name]
+        errs = []
+        for i in np.linspace(0, len(vf) - 1, 5).astype(int):
+            sc.frame_set(int(vf[i]))
+            ev = o.evaluated_get(bpy.context.evaluated_depsgraph_get())
+            co = np.empty(len(ev.data.vertices) * 3); ev.data.vertices.foreach_get("co", co)
+            Mw = np.array(ev.matrix_world)
+            got = co.reshape(-1, 3) @ Mw[:3, :3].T + Mw[:3, 3]
+            want = ref @ Ws[i][:3, :3].T + Ws[i][:3, 3]
+            errs.append(float(np.abs(np.r_[got.min(0), got.max(0)] - np.r_[want.min(0), want.max(0)]).max()) * 100)
+        print(f"自检[{tag}] 被拿着的 {name}: 5 帧包围盒最大差 {max(errs):.3f} cm")
+        if max(errs) > TOL_CM:
+            bad.append(f"{tag} 被拿着的 {name} 差 {max(errs):.2f} cm")
+
+
 def export_fbx(path, objs, anim=True):
     bpy.ops.object.select_all(action="DESELECT")
     for o in objs:
@@ -70,7 +144,7 @@ def add_camera(sc):
     cd.sensor_fit, cd.sensor_width, cd.shift_x, cd.shift_y = "HORIZONTAL", CT.SENSOR_MM, CAM_SX, CAM_SY
     cd.clip_start, cd.clip_end = 0.05, 1000.0
     cam.rotation_mode = "QUATERNION"; prev = None
-    for f, M, mm in zip(CAM_VF, CAM_M, CAM_LENS):
+    for f, M, mm, sx, sy in zip(CAM_VF, CAM_M, CAM_LENS, CAM_SXF, CAM_SYF):
         m = Matrix(M.tolist()); q = m.to_quaternion()
         if prev is not None:
             q.make_compatible(prev)                                   # q 和 -q 是同一个朝向: 挑和上一帧同号的, 不然中间帧会绕远路
@@ -78,6 +152,8 @@ def add_camera(sc):
         cam.location, cam.rotation_quaternion, cd.lens = m.to_translation(), q, float(mm)
         cam.keyframe_insert("location", frame=int(f)); cam.keyframe_insert("rotation_quaternion", frame=int(f))
         cd.keyframe_insert("lens", frame=int(f))
+        cd.shift_x, cd.shift_y = float(sx), float(sy)
+        cd.keyframe_insert("shift_x", frame=int(f)); cd.keyframe_insert("shift_y", frame=int(f))
     for d in (cam, cd):
         for fc in d.animation_data.action.fcurves:
             for k in fc.keyframe_points:
@@ -99,7 +175,7 @@ def scene_boxes(objs):
     """场景里每个物体的世界系包围盒 (N,6), 按位置排好 —— FBX 导回来物体名可能变, 不按名字对。"""
     dg = bpy.context.evaluated_depsgraph_get(); out = []
     for o in objs:
-        if o.type != "MESH" or o.find_armature() or not len(o.data.vertices):
+        if o.type != "MESH" or o.find_armature() or not len(o.data.vertices) or o.name.startswith("carried_"):
             continue
         ev = o.evaluated_get(dg)
         P = np.array([ev.matrix_world @ v.co for v in ev.data.vertices])
@@ -129,7 +205,8 @@ export_fbx(f"{outd}/{name}_scene.fbx", scene_objs, anim=False)
 cam = add_camera(sc); lo, hi = frame_range(sc)
 print(f"相机: {len(CAM_VF)} 个关键帧(视频第 {CAM_VF[0]}~{CAM_VF[-1]} 帧), 焦距 {CAM_LENS.min():.1f}~{CAM_LENS.max():.1f} mm"
       f"(片幅宽 {CT.SENSOR_MM:.0f} mm), 画面 {RES[0]}x{RES[1]}; 横竖焦距差最多 {CAM_ANISO.max() * 100:.2f}%(取了平均)")
-export_fbx(f"{outd}/{name}_scene_people.fbx", scene_objs + people + [cam])
+carried = import_carried()
+export_fbx(f"{outd}/{name}_scene_people.fbx", scene_objs + people + [cam] + carried)
 
 # ---------- 3. 自检: 在 Blender 里播出来的 vs 目标 ----------
 def check(tag):
@@ -181,7 +258,7 @@ def check_camera(tag):
         bad.append(f"{tag} 相机 位置差 {dp:.2f} cm / 朝向差 {dr:.3f}° / 焦距差 {dl:.3f}% / 画面差 {px:.1f} 像素")
 sc = reset(); import_people(); frame_range(sc); check("glTF")
 sc = reset(); bpy.ops.import_scene.fbx(filepath=f"{outd}/{name}_scene_people.fbx", anim_offset=0.0); frame_range(sc)
-check("场景+人 FBX"); check_scene("场景+人 FBX"); check_camera("场景+人 FBX")
+check("场景+人 FBX"); check_scene("场景+人 FBX"); check_camera("场景+人 FBX"); check_carried("场景+人 FBX")
 sc = reset(); bpy.ops.import_scene.fbx(filepath=f"{outd}/{name}_scene.fbx"); check_scene("场景 FBX")
 
 # ---------- 4. .blend(只出这一份, 给人看的): 骨头连到下一个关节(四棱锥), 藏掉四肢上的辅助关节; 带相机、灯、渲染设置 ----------
@@ -190,7 +267,8 @@ sc = reset(); bpy.ops.import_scene.fbx(filepath=f"{outd}/{name}_scene.fbx"); che
 # ★ 2026-10-09 以前还另存一份"关节朝向原样"的 .blend, 两个名字只差 _view, 打开的总是梯子那份 —— 不出了。
 sc = reset(); import_people("FORTUNE"); frame_range(sc); view_bones(); check("给人看的")
 bpy.ops.import_scene.gltf(filepath=scene_glb)
-add_camera(sc); frame_range(sc); render_setup(sc); check_camera("给人看的")
+import_carried()
+add_camera(sc); frame_range(sc); render_setup(sc); check_camera("给人看的"); check_carried("给人看的")
 sc.frame_set(sc.frame_start)
 bpy.ops.wm.save_as_mainfile(filepath=f"{outd}/{name}_scene_people.blend")
 print("->", f"{outd}/{name}_scene_people.blend")

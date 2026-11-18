@@ -89,6 +89,9 @@ FRAME_FRAC = float(os.environ.get("DW_FRAME_FRAC","0.50")) # 共同帧里有这�
 # "共同帧里过半判重复"这个分数根本没有分辨力: 分母是 1, 结果只能是 0 或 1。
 # 代价实测: 三个场景全场 196 个重复对里, 共同帧 <=2 的一共只有 4 个。
 MIN_COMMON = int(  os.environ.get("DW_MIN_COMMON","3"))    # 共同帧少于它就不下结论
+# ★ 2026-11-11 组里选代表时, 存活帧数不到锚(样本分最高的实例)这个比例的实例不参选。singin r2: coat#0 只活 3 帧
+#   (SAM 那 3 帧把雨伞认成了外套), RANK 让它当了代表, 活 616 帧的 umbrella#0 被淘汰, 闸 2 作废 coat 后雨伞整个没了。
+SHORT_FRAC = float(os.environ.get("DW_SHORT_FRAC", "0.1"))
 # WORD_FRAC 已经不是闸门了, 只用来在 json 里给词对配对率打个"过没过线"的标记, 见文末。
 WORD_FRAC  = float(os.environ.get("DW_WORD_FRAC", "0.60")) # 配对率(分母取 max 实例数)
 STRIDE     = int(  os.environ.get("DW_STRIDE",    "1"))    # 抽帧比较, 只是速度旋钮
@@ -97,6 +100,8 @@ FRAME_SAT  = float(os.environ.get("FRAME_SAT",    "10"))   # 和 pick_from_masks
 # ------------------------------------------------------------------ 读盘
 # 每个词一个 npz: meta 是结构化数组(oid/frame/area/edge), counts 是逐行的 RLE, hw 是画幅。
 words = {}          # 词 -> [ (oid, frame, area, edge, rle) ... ]
+MIN_FRAMES = int(os.environ.get("MIN_FRAMES", "6"))
+SHORT_DEAD = {}     # 词 -> {活不满 MIN_FRAMES 的断轨残片 oid}
 skipped = {}        # 词 -> 跳过的原因
 HW = None
 for fn in sorted(os.listdir(MK)):
@@ -107,10 +112,19 @@ for fn in sorted(os.listdir(MK)):
     word = str(z["word"])
     if word in EXCLUDE:
         skipped[word] = "在 EXCLUDE 里"; continue
-    rows = [(int(o), int(f), int(a), float(e), counts[i])
-            for i, (o, f, a, e) in enumerate(meta) if a > 0 and int(f) % STRIDE == 0]
-    if not rows:
+    all_rows = [(int(o), int(f), int(a), float(e), counts[i])
+                for i, (o, f, a, e) in enumerate(meta) if a > 0]
+    if not all_rows:
         skipped[word] = "没有有效 mask"; continue
+    _cnt = {}
+    for o, *_ in all_rows: _cnt[o] = _cnt.get(o, 0) + 1
+    _short = {o for o, c in _cnt.items() if c < MIN_FRAMES}
+    if _short:
+        SHORT_DEAD.setdefault(word, set()).update(_short)
+    rows = [r for r in all_rows if r[0] not in _short and r[1] % STRIDE == 0]
+    if not rows:
+        words[word] = all_rows  # 全是短残片时留给 dead_out 整词淘汰
+        continue
     words[word] = rows
 print(f"[输入] {MK}  {len(words)} 个词参与比较"
       + (f", 跳过 {len(skipped)} 个 ({', '.join(sorted(skipped))})" if skipped else ""))
@@ -286,7 +300,9 @@ def rep_of(g):
     anchor = max(g, key=lambda k: (INST[k]["样本分"], k[0], k[1]))
     best = {}                                  # 同词护栏下每个词在组里只有一个实例
     for k in g:
-        if comparable(k[0], anchor[0]): best[k[0]] = k
+        # ★ 只活了几帧的实例(锚的 SHORT_FRAC 都不到)不当代表: 那是几帧的误认, 见文件里 SHORT_FRAC 的注释
+        if comparable(k[0], anchor[0]) and (k == anchor or INST[k]["活帧数"] >= SHORT_FRAC * INST[anchor]["活帧数"]):
+            best[k[0]] = k
     w = min(best, key=lambda w: (rank(w), -n_inst[w], w))
     return best[w], anchor, [k for k in g if k[0] not in best]
 
@@ -322,7 +338,9 @@ print(f"[自检] {len(out_groups)} 组里同词冲突 {len(bad)} 组" + (f" ★ 
 
 # ------------------------------------------------------------------ 淘汰名单
 # 名单按实例发, 不按词发 —— 见上面并查集那段。
-inst_of = {w: sorted({o for o, *_ in rows}) for w, rows in words.items()}
+for _w, _s in SHORT_DEAD.items():
+    dead.setdefault(_w, set()).update(_s)
+inst_of = {w: sorted({o for o, *_ in rows} | SHORT_DEAD.get(w, set())) for w, rows in words.items()}
 dead_out = {w: sorted(v) for w, v in sorted(dead.items()) if v}
 # 淘汰词只在"这个词一个实例都不剩"时才留着: 下游拿它做整词短路(不必读 npz, 日志里也一眼
 # 看得出是哪个词整个没了)。部分淘汰的词必须照常往下走, 只是少几个实例 —— 所以不能进这个表。

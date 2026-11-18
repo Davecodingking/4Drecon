@@ -1,11 +1,11 @@
 #!/bin/bash
 # 闸口 + 3D tab 的整链: 懒加载、/3d 三条路、数据不在时灰掉。office r6 上跑, 服务起在 8799。
 set -e
-PY=~/miniforge3/envs/sam3d/bin/python; R1=~/sam3d/data/indoorOutput/office/r6_pillarfix
+PY=~/miniforge3/envs/sam3d/bin/python; R1=~/sam3d/data/indoorOutput/office/r1_sam31
 SP=/tmp/claude-1004/-home-jincheng/92d1614a-64e3-41aa-9d0b-8592d431f8f9/scratchpad; mkdir -p $SP
-U="http://127.0.0.1:8799"; Q="s=office&r=r6_pillarfix&i=1"
+U="http://127.0.0.1:8799"; Q="s=office&r=r1_sam31&i=1"
 test -e $R1/10_box_fit_view.json || $PY ~/sam3d/tools/box_fit_view.py --r1 $R1 --out off > /dev/null
-$PY ~/sam3d/tools/gate_ui.py --scene office --run r6_pillarfix --indoor --port 8799 > $SP/gate3d.log 2>&1 &
+$PY ~/sam3d/tools/gate_ui.py --scene office --run r1_sam31 --indoor --port 8799 > $SP/gate3d.log 2>&1 &
 PID=$!
 # 收尾: 关服务、把藏起来的数据文件放回去。★ trap 里 set -e 照样生效, 文件已经放回时 mv 失败会把
 #   整个脚本的退出码变成 1(明明全过) —— 所以先关掉 set -e, 再判文件在不在。

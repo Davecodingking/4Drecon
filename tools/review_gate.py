@@ -102,6 +102,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath
                                 "data", "outdoor", "scripts"))
 from solo_gate import min_px                                         # noqa: E402
 SOLO_MIN_PX = min_px()
+MIN_FRAMES = int(os.environ.get("MIN_FRAMES", "6"))
 SOLO_CFG = os.environ.get("SOLO", "")
 KEEP     = {w.strip() for w in os.environ.get("SOLO_KEEP","").split(",") if w.strip()}
 EXCL     = {w.strip() for w in os.environ.get("EXCLUDE","").split(",") if w.strip()}
@@ -144,7 +145,7 @@ if SOLO_CFG:
         for o, (sc, a, fi) in sorted(per.items()):
             if o in _dead_inst.get(w, ()): continue      # 这个实例由同组另一个词代表
             pct = 100*a/(int(H)*int(W))
-            if a < SOLO_MIN_PX: continue
+            if a < SOLO_MIN_PX or _nfr.get(o, 0) < MIN_FRAMES: continue
             cands.append(dict(词=w, 来源="逐实例",
                               生成名=f"{TAG}_{w.replace(' ','_')}_{o}",
                               目录=None, 实例=o, 帧=fi, 面积占比=round(pct, 3), 待生成=True,
@@ -209,7 +210,7 @@ if os.path.exists(rp):
                           继承决定=_inherit,
                           待分组=sorted(_subs[w]) if w in _subs else None))
 
-if not cands:
+if not cands and not os.path.exists(DEC) and not os.path.exists(f"{R1}/05_review_applied.json"):
     raise SystemExit(f"[失败] 没找到任何待生成候选。确认 pick 跑过, 且 {IMG}/{TAG}_* 里有 frame.png")
 
 # ---------- 合并已有决策 ----------
@@ -227,7 +228,8 @@ for _q in _chain:
     if _AFTER and _q == DEC_PRE:
         print(f"[打底] 先读闸 2 那份 {os.path.basename(_q)} ({len(_prev['候选'])} 个候选)")
     for r in _prev["候选"]:
-        old[r["生成名"]] = {k: r[k] for k in ("决定", "改用", "备注", "复用组", "改类别", "VLM放行") if k in r}
+        # 不拿着: 系统建议"人拿着"、人在闸口点了当静物/不要。下游不读, 只为界面下次别再默认成跟手 —— 所以也要跟着表走。
+        old[r["生成名"]] = {k: r[k] for k in ("决定", "改用", "备注", "复用组", "改类别", "VLM放行", "拿着", "不拿着") if k in r}
         _wmap[r["生成名"]] = (r["词"], r["实例"])
     HIST.update(_prev.get("历史决定") or {})
 # pre 比 post 新 = 人回头改过闸 2 那份。上面的叠加保证"只在 pre 里的行"不丢,
@@ -247,7 +249,7 @@ if _prev:
     _w = _wmap
     for k, v in old.items():
         _live = (v.get("决定", "keep") != "keep" or v.get("改用")
-                 or v.get("复用组") or v.get("改类别") or v.get("VLM放行"))
+                 or v.get("复用组") or v.get("改类别") or v.get("VLM放行") or v.get("拿着") or v.get("不拿着"))
         if _live:
             HIST[k] = dict(v, 词=_w.get(k, (None, None))[0], 实例=_w.get(k, (None, None))[1])
         else:
@@ -261,7 +263,7 @@ for i, c in enumerate(cands):
     # ★ 候选可能因为自己的决定退出过表(标了 shared 就不在逐实例清单里), 回来时
     #   如果不把历史决定贴回去, 它会显示成默认的 keep, 而实际决定还在别处生效, 两边打架。
     _d = old.get(c["生成名"]) or {k: v for k, v in HIST.get(c["生成名"], {}).items()
-                                  if k in ("决定", "改用", "备注", "复用组", "改类别", "VLM放行")}
+                                  if k in ("决定", "改用", "备注", "复用组", "改类别", "VLM放行", "拿着", "不拿着")}
     r.update(_d)
     # ★ 已经落地的"共用词"要反映回表上。派生子类(umbrella~1)是上一次 --apply 展开出来的
     #   新词, 它的行是这一次才第一次出现 —— 不回写的话会显示成默认 keep, 而实际已经在
@@ -449,9 +451,18 @@ if "--apply" in sys.argv:
     # VLM 说"不是它"、人看过还是要的。drop 掉的不算(人最后的决定是不要)。
     vlm_release = sorted(r["生成名"] for r in saved
                          if r.get("VLM放行") and r["决定"] not in ("drop", "drop-word"))
+    # 被人拿着的: 不当静物摆(组装那步按生成名挡), carry 步求每帧位姿。drop 掉的不算(人最后的决定是不要)。
+    # ★ 搬了类别的不支持: 搬家会重编实例号, 这里记的词/实例号就对不上 mask 了。
+    _hm = [r["生成名"] for r in saved if r.get("拿着") and (r.get("改类别") or r.get("复用组"))]
+    if _hm:
+        raise SystemExit(f"[失败] 这几行同时标了\"拿着\"和\"改类别/复用组\": {', '.join(_hm)}\n"
+                         f"       搬家会重编实例号, carry 步按词和实例号找 mask, 会找错。先只搬家跑一轮, 再在新表上标拿着。")
+    held = sorted((dict(生成名=r["生成名"], 词=r["词"], 实例=int(r["实例"])) for r in saved
+                   if r.get("拿着") and r["决定"] not in ("drop", "drop-word") and r["词"] not in drop_word),
+                  key=lambda x: x["生成名"])
     out = dict(排除词=drop_word, 逐实例词=solo_word, 共用词=shared_word,
                不生成=drop_one, 指定样本=override, 改类别={**relabel, **relabel_extra},
-               VLM放行=vlm_release)
+               VLM放行=vlm_release, 拿着的=held)
     json.dump(out, open(f"{R1}/05_review_applied.json", "w"), ensure_ascii=False, indent=1)
     print(f"[决策] 共 {len(saved)} 个候选")
     print(f"  整个词作废 : {drop_word or '无'}")
@@ -463,6 +474,7 @@ if "--apply" in sys.argv:
     if relabel: print(f"  挪类别     : {relabel}")
     print(f"  换候选     : {override or '无'}")
     print(f"  VLM放行    : {vlm_release or '无'}")
+    print(f"  被人拿着   : {', '.join(h['词'] + '#' + str(h['实例']) for h in held) or '无'}")
     print(f"\n下游用这些环境变量:")
     if drop_word: print(f"  EXCLUDE=\"$EXCLUDE,{','.join(drop_word)}\"")
     if solo_word: print(f"  SOLO=\"{','.join(solo_word)}\"")

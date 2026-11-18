@@ -178,7 +178,7 @@ def test_drive_init_run_config():
     with tempfile.TemporaryDirectory() as R1:
         drive.init_run_config(R1, "outdoor", people="1", recall=None, done=0)
         d = json.load(open(f"{R1}/00_run_config.json"))
-        assert d["类型"] == "outdoor" and d["覆盖"] == {"PEOPLE": "1"}
+        assert d["类型"] == "outdoor" and d["覆盖"] == {"PEOPLE": "1", "PEOPLE_FULL": "1"}   # 新开的一轮默认人体跟原片帧率(2026-11-13)
         for bad in (lambda: drive.init_run_config(R1, "indoor", None, None, 0),     # 类型对不上
                     lambda: drive.init_run_config(R1, "outdoor", "0", None, 2)):    # 过了闸 1 不许改有没有人
             try:

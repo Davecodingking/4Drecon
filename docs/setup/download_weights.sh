@@ -101,12 +101,19 @@ if want sam3d; then
   hub_repo facebookresearch_dinov2_main facebookresearch/dinov2 main "$TORCH_HOME_DEF"
   fetch https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_reg4_pretrain.pth \
         "$TORCH_HOME_DEF/hub/checkpoints/dinov2_vitl14_reg4_pretrain.pth"
+  # 2026-11-11 起摆人那步判切镜头用 DINOv2 小模型(pipeline/body_into_scene.py, 本地加载不联网; 没有就退回只用 ffmpeg scdet)
+  fetch https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth \
+        "$TORCH_HOME_DEF/hub/checkpoints/dinov2_vits14_pretrain.pth"
 fi
 
 # ------------------------------------------------------------------------------ sam3
 if want sam3; then
   log "sam3: SAM 3 (gated, 3.3G) -> $SAM3D/sam3/checkpoints/sam3.pt  (旧机器快照 3c879f3)"
   hfdl facebook/sam3 sam3.pt --local-dir "$SAM3D/sam3/checkpoints"
+  # 2026-11-11 起物体跟踪默认用 SAM 3.1(SAM3_VERSION=sam3.1, data/outdoor/scripts/track_all.py 里写死这个路径)。
+  # 仓库名和文件名取自 sam3/sam3/model_builder.py; ★ 这一行 11-18 补的, 没在新机器上跑过, gated 与否未确认。
+  log "sam3: SAM 3.1 multiplex (3.3G) -> $SAM3D/sam3/checkpoints/sam3.1_multiplex.pt"
+  hfdl facebook/sam3.1 sam3.1_multiplex.pt --local-dir "$SAM3D/sam3/checkpoints"
 fi
 
 # ------------------------------------------------------------------------------ vlm

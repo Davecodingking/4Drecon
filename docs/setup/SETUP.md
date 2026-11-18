@@ -1,5 +1,9 @@
 # 换机器重装说明（ES-MAL-GPU-011 → 新机器）
 
+> **2026-11-18 补：正文是 09-21 写的，之后流水线又加了东西。装完正文的 7 个环境后，还要做[第 12 节](#12-2026-09-21-之后新增的2026-11-18-补)，否则室内链的 `fpose` 步、导出 FBX、SAM 3.1 跟踪都跑不了。**
+> 这份文档 09-23 在一台 8×RTX 3090 的机器上照着装通过一次，当时用的脚本存在 `scripts_3090/`（见第 12.6 节）。
+> 从 GitHub 拿代码的人注意：仓库里**没有**上游模型的代码，要按第 3 节 clone 再打 `patches/` 里的补丁（正文里"代码整目录拷过去"那条路只适用于直接拷 `~/sam3d` 的情况）。
+
 2026-09-21 在旧机器上整理。旧机器要回收：代码 `~/sam3d` 带走，conda 环境（约 123G）和模型权重（约 250G）不带，到新机器上照这份文档重装。
 
 **范围（用户 09-21 拍板）**：新机器只需要撑住两条整理后的流水线：`pipeline/outdoor_pipeline.py`，以及 `pipeline/indoor_pipeline.py` 的**物体链**（`STEPS_OBJ`；1172 行往下的 `STEPS_LM`，也就是 SpatialLM 链，不要了）。另外保留 body4d（`pipeline/body4d_pipeline.py`）。为此要装的环境只有 7 个：
@@ -793,3 +797,112 @@ TCNN_CUDA_ARCHITECTURES=120 $P/bin/pip install --no-build-isolation --no-deps \
 - `segment_anything` 从 git 装：`git+https://github.com/facebookresearch/segment-anything.git@dca509fe793f601edb92606367a655c15ac00fdf`。
 - 不装 xformers；PASD 两处要改（`enable_xformers_memory_efficient_attention=False`，`is_xformers_available()` 漏括号）。
 - 权重见第 8.5 节，大头是 FLUX.1-Fill-dev（gated，32G）和 `/mnt/nvme/jincheng/layerpano3d_ckpt`（25G）。
+
+---
+
+## 12. 2026-09-21 之后新增的（2026-11-18 补）
+
+下面每一项都是现在的流水线默认会用到的。★ 这一节是照着 8×3090 那台机器上现有的东西整理的，**没有在第三台机器上从头装过一遍**，照做时遇到对不上的以实际报错为准。
+
+### 12.1 多出来的上游仓库和补丁
+
+| 目录 | 上游 | commit | 补丁 |
+|---|---|---|---|
+| `FoundationPose` | https://github.com/NVlabs/FoundationPose | `a1b694b83e633c2cb6115b9063d940a687759392` | `patches/FoundationPose@a1b694b.patch`（上游文件没改，只加了 `NOTES.md` 和 `ours/`） |
+| `sam3`（正文已有） | 同正文 | `8f0b7f4d…` | `patches/sam3@8f0b7f4.patch`（11-18 新出：我们加的 `pick_mask_5090.py` 等 4 个文件，`pipeline/indoor_pipeline.py` 里有步骤调 `pick_mask_5090.py`；以前这几个文件哪里都没版本） |
+
+`sam-body4d` 的补丁 11-18 重出过（11-10 改成每帧用场景自己的焦距），用仓库里现在这份。
+
+```bash
+cd ~/sam3d
+git clone https://github.com/NVlabs/FoundationPose FoundationPose && git -C FoundationPose checkout a1b694b83e633c2cb6115b9063d940a687759392
+for p in sam-3d-objects sam3 Depth-Anything-3 vggt-omega sam-body4d FoundationPose; do
+  f=$(ls patches/ | grep "^$p@") && git -C $p apply ../patches/$f && echo "已打 $p"
+done
+```
+
+### 12.2 fpose 环境 —— FoundationPose（室内链 `fpose` 步，定物体朝向）
+
+路径 `~/miniforge3/envs/fpose`，12G。内容 = sam3d 环境 + 三个 pip 包 + 两个 conda 包。清单在 `envs/fpose.yml`、`envs/fpose.pip.txt`。
+
+这台机器上是把 sam3d 环境整目录 `cp -a` 过来再改路径的（`conda create --clone sam3d` 会失败）。新机器上更干净的做法是**照第 6.1 节再建一遍、名字换成 fpose**，然后：
+
+```bash
+P=~/miniforge3/envs/fpose
+$P/bin/pip install --no-deps ruamel.yaml==0.19.1 transformations==2026.1.18 kornia==0.8.3 kornia_rs==0.2.0
+$P/bin/python -c "import numpy; assert numpy.__version__=='1.26.4'"        # 被顶高了就装回 1.26.4
+~/miniforge3/bin/conda install -p $P -c conda-forge --freeze-installed -y eigen libboost-devel
+cd ~/sam3d/FoundationPose && CMAKE_PREFIX_PATH=$($P/bin/python -m pybind11 --cmakedir) PATH=$P/bin:$PATH bash build_all_conda.sh   # 编 mycpp
+```
+
+权重（共 247M，官方 Google Drive，不用申请；链接在 FoundationPose 的 README 里）放成：
+
+```
+~/sam3d/FoundationPose/weights/2023-10-28-18-33-37/{config.yml,model_best.pth}     修正网络 68M
+~/sam3d/FoundationPose/weights/2024-01-11-20-02-45/{config.yml,model_best.pth}     打分网络 190M
+```
+
+自检：`cd ~/sam3d/FoundationPose && ~/miniforge3/envs/fpose/bin/python ours/selftest.py`。坑都记在 `FoundationPose/NOTES.md`（打完补丁才有）。
+不想装的话：本轮配置里写 `FP_YAW=0`，`fpose` 步就不转（朝向退回组装那步的结果）。
+
+### 12.3 `~/venvs/bpy` —— Blender 的 Python 模块（导出 FBX 必需）
+
+验收段的 `motion` 步（`pipeline/motion_export.py` → `tools/mocap/to_blender.py`）用它写 FBX 和 .blend，路径写死 `~/venvs/bpy/bin/python`。没有它就没有交付物。
+
+```bash
+~/miniforge3/envs/sam3d/bin/python -m venv ~/venvs/bpy        # 必须是 Python 3.11（bpy 4.2 只出 3.11 的轮子）
+~/venvs/bpy/bin/pip install bpy==4.2.23 numpy==2.4.6
+~/venvs/bpy/bin/python -c "import bpy; print(bpy.app.version_string)"
+```
+
+完整清单在 `envs/bpy.pip.txt`（9 个包，约 1G）。
+
+### 12.4 ffmpeg（判切镜头用）
+
+摆人那步（`pipeline/body_into_scene.py`）用 ffmpeg 的 scdet 找切镜头的位置，路径写死 `~/miniforge3/envs/cari4d/bin/ffmpeg`（这台机器上碰巧在那个环境里，版本 9.0.2）。新机器上只为这一个可执行文件建个小环境即可：
+
+```bash
+~/miniforge3/bin/conda create -n cari4d -c conda-forge -y ffmpeg
+```
+
+找不到 ffmpeg 不会报错，整段当成一镜到底处理 —— 有切镜头的片子人会被跨镜头平滑，位置会错。
+
+### 12.5 多出来的权重
+
+| 本地路径 | 大小 | 来源 | 谁用 |
+|---|---|---|---|
+| `~/sam3d/sam3/checkpoints/sam3.1_multiplex.pt` | 3.3G | HF `facebook/sam3.1` 文件 `sam3.1_multiplex.pt`（仓库名取自 `sam3/sam3/model_builder.py`；gated 与否未确认） | sam3：11-11 起物体跟踪默认用 SAM 3.1（`SAM3_VERSION=sam3.1`）。下不到就在本轮配置里写 `SAM3_VERSION=sam3` 退回老的 |
+| `~/.cache/torch/hub/checkpoints/dinov2_vits14_pretrain.pth` | 85M | `https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth` | sam3d：判切镜头的第二道判据（本地加载，不联网）；没有就退回只用 scdet |
+| `~/sam3d/FoundationPose/weights/` | 247M | 见 12.2 | fpose |
+
+前两个已经加进 `download_weights.sh` 的 `sam3`、`sam3d` 组；FoundationPose 的要手动下。
+
+### 12.6 3090 机器上实际跑过的安装脚本（`scripts_3090/`）
+
+09-23 在 8×3090 那台机器（国内网络）上建正文那 7 个环境时用的脚本，原样存档，可以直接参考或改着用：
+
+| 文件 | 是什么 |
+|---|---|
+| `envfn.sh` | 第 5 节三个函数的国内镜像版（清华 pip 源、hf-mirror；剥掉 `+cu128` 这类国内镜像没有的本地版本号） |
+| `build_envs.sh` | 按第 6 节建 7 个环境 |
+| `finish.sh` | 用修好的 `pipreq` 把 7 个环境补齐（`build_envs.sh` 第一遍有的环境 pip 包整批回滚成了空壳，这个是补救，**新机器上直接跑这个就行**） |
+| `verify.sh` | 第 9 节的验收 + 流水线自检，一条命令出通过/失败数。里面写的场景名（soccer、office）换成你盘上有的 |
+
+脚本里的路径是那台机器的（`/mnt/nvme/jincheng/...`、`TORCH_CUDA_ARCH_LIST=8.6`、`MAX_JOBS=64`），卡不是 3090 或核数少时按第 1 节改。
+
+### 12.7 验收（接在第 9 节后面）
+
+```bash
+~/miniforge3/envs/fpose/bin/python -c "import torch,kornia,nvdiffrast.torch,pytorch3d; print('fpose ok')"
+~/venvs/bpy/bin/python -c "import bpy; print('bpy', bpy.app.version_string)"
+~/miniforge3/envs/cari4d/bin/ffmpeg -version | head -1
+ls -la ~/sam3d/sam3/checkpoints/sam3.1_multiplex.pt ~/sam3d/FoundationPose/weights/*/model_best.pth
+cd ~/sam3d && bash tools/tests/run.sh          # 有几个测试要 MHR 模型文件和一轮现成的结果在盘上, 新机器上那几个会失败
+```
+
+端到端：放一个视频到 `data/outdoor/dataset/<场景>/video.mp4`，按仓库根目录 `README.md` 的"怎么跑"跑一轮。
+
+### 12.8 这台机器上有、但流水线不用的环境
+
+`duomo`、`rohm`、`flowhmr`、`omniegocap`、`pixie` 是做人体动作对比实验时装的，`pipeline/`、`tools/`、`data/outdoor/scripts/` 里的正式步骤都不调它们，**不用装**。`cari4d` 只用到里面的 ffmpeg（12.4）。
+

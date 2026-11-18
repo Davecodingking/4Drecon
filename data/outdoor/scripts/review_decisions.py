@@ -20,6 +20,7 @@
   指定样本  {"词"或"词#实例": [实例, 帧]}  换一张抠图 -> s_override / gen_per_instance
   改类别    {"词#实例": 目标词}    实例挪到别的词    -> relabel_words.py
   VLM放行   [生成名...]            VLM 说"不是它", 人看过还是要 -> gen_per_instance / 组装
+  拿着的    [{生成名, 词, 实例}...]  被人拿着、跟人一起动  -> 组装不当静物摆 / carry 步求每帧位姿
 
 ★ 人在闸口填的"分组复用"不是第七个字段 —— 它在 review_gate --apply 里就被展开成
   "改类别 + 共用词"两条已有机制了, 运行期没有第三套代码。
@@ -196,6 +197,16 @@ def skip_names(R1):
     """人工否掉的生成名集合。给组装那步用 —— 人的语义是"这东西别出现在场景里",
     不只是"别再烧这份 GPU"。盘上已经有上一轮生成的 glb 时, 光挡生成挡不住组装。"""
     return sorted(load(R1).get("不生成") or [])
+
+
+def held(R1):
+    """闸口标了"被人拿着"的实例 [{生成名, 词, 实例}]。组装那步不把它当静物摆(否则场景里会多一个不动的副本),
+    carry 步(carryfit)给它求每一帧的位姿, motion 步把它和人一起导进 FBX。"""
+    return [dict(h) for h in (load(R1).get("拿着的") or [])]
+
+
+def held_names(R1):
+    return {h["生成名"] for h in held(R1)}
 
 
 # 词内分组复用不在这里 —— 它在人工闸(review_gate --apply)里就被**展开**成

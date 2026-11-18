@@ -8,6 +8,7 @@
 !pipeline/
 !docs/
 !ROADMAP.md
+!README.md
 !.claude/
 .claude/*
 !.claude/skills/
@@ -30,3 +31,5 @@ data/outdoor/*
 # 运行时产物: 网页服务的日志、"上一次跑的是哪一轮"的记号
 tools/.last_run
 tools/*.log
+# 网页服务启动时导出的本机环境变量, 不进仓库
+tools/.gate_ui_env.sh

@@ -16,6 +16,9 @@ import glob, importlib.util, json, os, re, subprocess, sys, time
 SAM3D = os.path.expanduser("~/sam3d")
 sys.path.insert(0, f"{SAM3D}/pipeline")
 import _common, people_decisions        # noqa: E402
+import carry_decisions                  # noqa: E402
+# 逐实例生成的规则(solo_plan.py)在物体链脚本目录; 放在最后, 别让那边的同名模块盖掉 pipeline 的
+sys.path.append(f"{SAM3D}/data/outdoor/scripts")
 
 # 类型 -> (数据集根, 结果根)。和 drive.py / pipeline 的路径一致; 测试会把它指到临时目录。
 ROOTS = {"outdoor": (f"{SAM3D}/data/outdoor/dataset", f"{SAM3D}/data/outdoor/result"),
@@ -173,7 +176,8 @@ def state(kind, scene, run):
             "在跑": busy, "GPU": ",".join(t["卡"] for t in tasks) or None, "任务": tasks,
             "段列表": segments_view(kind, scene, run, seg, stop, busy, recall),
             "下一步": None if busy else next_action(kind, seg, stop, recall),
-            "能继续": not busy and seg < total and os.path.isdir(R1),
+            # 全部跑完之后在闸 5 上改了被拿着的物体: 还能点继续(只重新导出 FBX)
+            "能继续": not busy and os.path.isdir(R1) and (seg < total or carry_decisions.stale(R1)),
             "人": people_decisions.load(R1),
             "人表": people_decisions.table(R1),       # 摆人之后才有: 每个编号的去向和可疑原因(挑人卡片上也显示)
             "图": {"地基": os.path.exists(f"{R1}/02_ground_check.jpg"),
@@ -194,6 +198,7 @@ def media_paths(kind, scene, run):
             "recall2d":  (f"{R1}/95_recall_check_2d.jpg", "召回核对图"),
             "render":    (f"{R1}/08_render_back_phy.jpg", "渲染回图: 实拍 | 重建 | 叠加"),
             "people4d":  (f"{R1}/09_people_check.mp4", "带人的验收视频: 原片 | 重建+人 | 叠加"),
+            "carry":     (f"{R1}/13_carry/preview.mp4", "被人拿着的物体(闸 2 标了 held 的): 原片 | 人 + 物体 | 叠加"),
             "people4d_prev": (f"{R1}/09_people_check_prev.mp4", "上一版带人验收视频(重跑前的, 对比用)"),
             "people4d_2col": (f"{R1}/09_people_check_两列.mp4", "带人的验收视频, 两列: 原片 | 重建+人(从三列那份剪掉叠加列, 有才显示)"),
             "blender":   (f"{mo}_blender.mp4", "Blender 里从原视频的视角渲的视频(场景 + 人, 用的就是交付的那份数据)"),
@@ -203,7 +208,7 @@ def media_paths(kind, scene, run):
 
 GATE_MEDIA = {"check_ground": ["ground"], "check_picks": ["sheet", "check", "track"], "check_scale": ["overlay"],
               "check_recall": ["recall2d"],
-              "check_scene": ["render", "people4d", "people4d_2col", "people4d_prev", "blender", "fbx_scene_people", "fbx_scene"]}
+              "check_scene": ["render", "people4d", "carry", "people4d_2col", "people4d_prev", "blender", "fbx_scene_people", "fbx_scene"]}
 
 
 _PIPE_MOD = {}
@@ -315,6 +320,72 @@ def _model_heights(R1, ids):
     return out
 
 
+_PLAN_CFG = {}
+def _plan_cfg(kind, scene, run):
+    """逐实例生成那步用的配置(pipeline --dump-cfg + tag)。按本轮配置/落地决策的 mtime 缓存 —— 本轮页一直在轮询。"""
+    R1 = r1_of(kind, scene, run)
+    key = (kind, scene, run) + tuple(os.path.getmtime(f) if os.path.exists(f) else None
+                                     for f in (f"{R1}/00_run_config.json", f"{R1}/05_review_applied.json"))
+    if key not in _PLAN_CFG:
+        cfg = dict(_effective(kind, scene, run))
+        cmd = [PY, PIPES[kind], "--scene", scene, "--run", run, "--dump-cfg", "--tag-only"] + (
+            ["--chain", "obj"] if kind == "indoor" else [])
+        try:
+            cfg["TAG"] = subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout.strip()
+        except Exception:
+            cfg["TAG"] = ""
+        _PLAN_CFG.clear(); _PLAN_CFG[key] = cfg
+    return _PLAN_CFG[key]
+
+
+def _will_generate(kind, scene, run, R1, rows):
+    """按现在保存的候选决定, 会生成哪些 mesh。
+
+    ★ 逐实例那部分(哪个实例生成、为什么不生成)调 solo_plan.plan —— 和 gen_per_instance.py 真正生成用的是同一份规则。
+      11-10 以前这里只减了整词作废: hitch_cuts_indoor r1 说会生成 28 个, 生成那步还要挡 VLM 否决 6 个、太矮 3 个,
+      实际 19 个。
+    盒子还没量(第 2 道闸第一次停下时, boxes 在第 3 段): 太矮 / 太大 / 重复判不了, 只扣 VLM 否决, 在"待定"里说清楚。
+    VLM放行 和 改用 读的是现在的候选表(还没 --go 落地的也算), 和"按你现在保存的决定"这个说法一致。
+    """
+    import solo_plan
+    dead = sorted({r["词"] for r in rows if r.get("决定") == "drop-word"})
+    live = [r for r in rows if r.get("决定") not in ("drop", "drop-word") and r["词"] not in dead]
+    shared = {r["词"] for r in rows if r.get("决定") == "shared"}
+    per, names, why, pending = {}, [], {}, None
+    for w in sorted(shared & {r["词"] for r in live}):
+        per[w] = 1                                     # 共用词: 一个类 mesh
+    solo_rows = [r for r in live if r["词"] not in shared]
+    released = {r["生成名"] for r in rows if r.get("VLM放行") and r.get("生成名")}
+    if solo_rows and os.path.exists(f"{R1}/06_all_boxes.json"):
+        ov = {(r["词"], int(r["改用"][0])): int(r["改用"][1]) for r in rows
+              if isinstance(r.get("改用"), (list, tuple)) and len(r["改用"]) == 2}
+        try:
+            plan = solo_plan.plan_from_cfg(R1, _plan_cfg(kind, scene, run), released=released, ov_inst=ov,
+                                           words=sorted({r["词"] for r in solo_rows}))
+        except Exception as e:                         # 算不出来就说出来, 别退回老数法冒充
+            return {"候选": len(rows), "会生成": None, "按词": {}, "作废词": dead, "不生成": {},
+                    "生成名单": [], "待定": f"算不出会生成几个: {e}"}
+        got = {(p["词"], int(p["实例"])): p for p in plan}
+        for r in solo_rows:
+            p = got.get((r["词"], int(r.get("实例", -1))))
+            k = solo_plan.NO_MASK + "/没量出盒子" if p is None else p["类"]
+            if k is None:
+                per[r["词"]] = per.get(r["词"], 0) + 1; names.append(p["生成名"])
+            else:
+                why[k] = why.get(k, 0) + 1
+    else:
+        rej = solo_plan.vlm_rejected(R1)
+        for r in solo_rows:
+            if int(r.get("实例", -1)) in rej.get(r["词"], ()) and r.get("生成名") not in released:
+                why[solo_plan.VLM_REJ] = why.get(solo_plan.VLM_REJ, 0) + 1
+            else:
+                per[r["词"]] = per.get(r["词"], 0) + 1; names.append(r.get("生成名"))
+        if solo_rows:
+            pending = "盒子还没量(第 3 段 boxes), 太矮 / 太大 / 同一件量了两遍 现在判不了, 实际可能更少"
+    return {"候选": len(rows), "会生成": sum(per.values()), "按词": per, "作废词": dead,
+            "不生成": why, "生成名单": names, "待定": pending}
+
+
 def _gate_extra(check, kind, scene, run):
     """闸口要单独摆出来的结构化数字(报告原文之外)。"""
     R1 = r1_of(kind, scene, run)
@@ -326,13 +397,7 @@ def _gate_extra(check, kind, scene, run):
             rows = json.load(open(f"{R1}/05_review.json")).get("候选") or []
         except (OSError, ValueError):
             return {}
-        dead = sorted({r["词"] for r in rows if r.get("决定") == "drop-word"})
-        live = [r for r in rows if r.get("决定") not in ("drop", "drop-word") and r["词"] not in dead]
-        shared = {r["词"] for r in rows if r.get("决定") == "shared"}
-        per = {}
-        for r in live:
-            per[r["词"]] = 1 if r["词"] in shared else per.get(r["词"], 0) + 1
-        return {"候选决定": {"候选": len(rows), "会生成": sum(per.values()), "按词": per, "作废词": dead}}
+        return {"候选决定": _will_generate(kind, scene, run, R1, rows)}
     if check == "check_scale":
         try:
             w = json.load(open(f"{R1}/02_da3/world_scale.json"))
@@ -369,6 +434,10 @@ def _gate_extra(check, kind, scene, run):
         t = people_decisions.table(R1)
         if t:
             out["人表"] = t
+        # 被人拿着的物体(闸 2 勾了 held 的): 每个对得怎么样、进不进 FBX。按现在盘上的决定算, 改了会标"过期"
+        c = carry_decisions.table(R1)
+        if c:
+            out["拿着表"] = c
         return out
     return {}
 
@@ -452,6 +521,14 @@ def set_people(kind, scene, run, changes):
     if running(scene, run):
         raise ValueError("驱动正在跑这一轮(可能正在按旧决定出网格), 等它停在闸口再改")
     return people_decisions.save_decisions(r1_of(kind, scene, run), {int(k): v for k, v in changes.items()})
+
+
+def set_carry(kind, scene, run, changes):
+    """闸 5: 被人拿着的物体要不要进 FBX。{生成名: "keep"/"drop"}。存完点继续, 驱动只重新导出 FBX。"""
+    _check_name(scene, run)
+    if running(scene, run):
+        raise ValueError("驱动正在跑这一轮, 等它停下再改")
+    return carry_decisions.set_decisions(r1_of(kind, scene, run), changes)
 
 
 def go(kind, scene, run):

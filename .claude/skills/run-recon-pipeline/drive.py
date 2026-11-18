@@ -29,7 +29,7 @@ PY    = os.path.expanduser("~/miniforge3/envs/sam3d/bin/python")
 HERE  = os.path.dirname(os.path.abspath(__file__))
 TOOLS = f"{SAM3D}/tools"      # 闸口那几张图的脚本都在 tools/ —— 常用的放一处好找
 sys.path.insert(0, f"{SAM3D}/pipeline")
-import _common, people_decisions   # 本轮配置 00_run_config.json / 挑人决策 05_people.json, 和 pipeline 同一份实现
+import _common, people_decisions, carry_decisions   # 本轮配置 00_run_config.json / 挑人决策 05_people.json, 和 pipeline 同一份实现
 # ★ 别在这里自己抄一份 tag 表 —— pipeline 那边有 SCENE_TAG, 抄一份就会漂移
 #   (ueindoor 在 pipeline 里是 "ue", 这里按 scene[:3] 会算成 "uei", 闸口一个候选都找不到)。
 _TAG_CACHE = {}
@@ -90,7 +90,7 @@ SEGMENTS = {
         #   不值一道闸, 并进验收段; 室外从六段变五段。老轮次停在"第 6 道闸"的状态由 main() 兜住。
         # ★ 2026-10-08 motion: 导出动作文件(场景+人的 FBX), 接在合成后面; 没有人的轮次自己跳过
         ("验收",   ["recall_gen", "recall_merge", "assemble", "people", "phys",
-                    "people_glb", "motion", "render", "building_scene"],        "check_scene"),
+                    "people_glb", "carry", "motion", "render", "building_scene"],        "check_scene"),
     ],
     # 室内物体链: 多了提亮/抽帧/z朝上三步, 墙壳走 walls+shell
     "indoor": [
@@ -104,7 +104,7 @@ SEGMENTS = {
         # zup 排在 scale 之后(见 indoor_pipeline 的注释), 所以它在这一段不在地基段
         # ★ people / people_glb 以前也漏在外面 —— 室内走驱动从来没把人放进场景过。和室外同序
         ("验收",   ["recall_gen", "recall_merge", "zup", "shell",
-                    "assemble", "fpose", "people", "phys", "people_glb", "motion", "render"],   "check_scene"),
+                    "assemble", "fpose", "people", "phys", "people_glb", "carry", "motion", "render"],   "check_scene"),
     ],
 }
 
@@ -319,7 +319,7 @@ def gate_env(R1, tag, scene, kind, run):
     if r.returncode == 0:
         try:
             cfg = json.loads(r.stdout)
-            for k in ("SOLO", "SOLO_KEEP", "SOLO_MIN_PX", "EXCLUDE", "MIN_AREA_PCT"):
+            for k in ("SOLO", "SOLO_KEEP", "SOLO_MIN_PX", "EXCLUDE", "MIN_AREA_PCT", "MIN_FRAMES"):
                 if k in cfg: env[k] = str(cfg[k])
             # 门槛以前是 SOLO_TH(%, 室内键名还叫 TH), 2026-09-16 两边统一成 SOLO_MIN_PX(像素)。
             # shell 里残留老键不在这里清: 闸口脚本和流水线各步一样, 见到 SOLO_TH 直接报错(solo_gate.py)。
@@ -341,8 +341,35 @@ def check_picks(R1, tag, scene, kind="outdoor", run="r1"):
     t = subprocess.run([PY, f"{TOOLS}/reuse_table.py"], env=env, capture_output=True, text=True)
     lines += [l for l in (t.stdout + t.stderr).strip().split("\n") if l.strip()]
     lines += people_lines(R1)
+    lines += carry_hint_lines(R1)
     return lines, [f"{R1}/05_review_sheet.jpg", f"{R1}/05_reuse_table.jpg",
                    f"{people_decisions.auto_dir(R1)}/03_check.jpg"]
+
+def carry_hint_lines(R1):
+    """闸 2 的"可能被拿着"建议(carryfit/suggest.py): 又在动、又挨着人的物体。只是提示, 人在候选页上点 held 才算。
+    这一轮没有人(人体线没跑)就不算。"""
+    if not os.path.isdir(f"{R1}/body4d/02_body4d/masks"):
+        return []
+    r = subprocess.run([PY, f"{SAM3D}/carryfit/suggest.py", "--r1", R1], capture_output=True, text=True)
+    out = [l for l in (r.stdout + r.stderr).strip().split("\n") if l.startswith("[")]
+    return out if r.returncode == 0 else [f"[拿着建议] 没算出来(退出码 {r.returncode}), 不影响往下跑: " + " ".join(out[-2:])]
+
+
+def carry_lines(R1):
+    """闸 5: 被人拿着的物体(carry 步)每个对得怎么样。四段轮廓对齐任何一段低于门槛就标出来, 让人去看预览视频。"""
+    p = f"{R1}/13_carry/summary.json"
+    if not os.path.exists(p):
+        return []
+    d = json.load(open(p)); out = []
+    for r in d["物体"]:
+        if r.get("状态") != "ok":
+            out.append(f"[拿着] ★ {r['词']} #{r['实例']} 没求出来, 不进 FBX: {r.get('原因', '')[:200]}"); continue
+        q = " / ".join("-" if v is None else f"{v:.2f}" for v in r["四段"].values())
+        bad = f"  ★ 有一段低于 {d['门槛']}, 去看 13_carry/preview.mp4" if r["低的段"] else ""
+        no = "  (闸 5 点了不要, 不进 FBX)" if r["生成名"] in carry_decisions.dropped(R1) else ""
+        out.append(f"[拿着] {r['词']} #{r['实例']}: 轮廓对齐 {r['轮廓IoU']} (四段 {q}), 网格 {r['网格来源']}{bad}{no}")
+    return out
+
 
 def people_lines(R1):
     """闸 2 的"人"(文字版; 网页"人"那一栏是同一份文件)。人体线没跑过 -> []。"""
@@ -429,7 +456,8 @@ def check_scene(R1, tag, scene, kind="outdoor", run="r1"):
                 续 = False
     lines += fp_yaw_lines(R1)
     lines += placed_people_lines(R1)
-    return lines, [f"{R1}/08_render_back_phy.jpg"]
+    lines += carry_lines(R1)
+    return lines, [f"{R1}/08_render_back_phy.jpg"] + ([f"{R1}/13_carry/preview.mp4"] if os.path.exists(f"{R1}/13_carry/preview.mp4") else [])
 
 def fp_yaw_lines(R1):
     """FP 定朝向那步(室内 fpose): 转了 15° 以上的按转得多少列出来, 对比图在 07_fp_yaw/<物体>.jpg; 没转的写原因。"""
@@ -608,10 +636,10 @@ def apply_decisions(R1, tag, scene, kind, run, seg, dry):
         sys.exit(f"\n★ 说要重跑, 却一个步骤都排不出来 —— 多半是问不到 {kind} 的步骤表"
                  f"(pipeline 语法错或 import 失败)。先修好它, 决定还在文件里没丢。")
 
-def init_run_config(R1, kind, people, recall, done):
+def init_run_config(R1, kind, people, recall, done, people_n=None):
     """命令行 --people / --recall 写进本轮配置 00_run_config.json(启动页和本轮页写的也是它)。
     规则在 _common.update_run_config, 和网页同一套; 这里只把 ValueError 变成就地停。"""
-    changes = {k: v for k, v in (("PEOPLE", people), ("RECALL", recall)) if v is not None}
+    changes = {k: v for k, v in (("PEOPLE", people), ("RECALL", recall), ("PEOPLE_N", people_n)) if v is not None}
     try:
         return _common.update_run_config(R1, kind, changes, done)
     except ValueError as e:
@@ -655,6 +683,16 @@ def rerun_people(R1, kind, scene, run, dry):
         os.remove(mark)
     return todo
 
+def rerun_carry(R1, kind, scene, run, dry):
+    """闸 5 上点了某个被拿着的物体"不要"(或要回来) -> 只重新导出 FBX(motion)。别的都不动: 它本来就没摆进静态场景。
+    返回重跑了哪些步骤(没改 = [])。"""
+    if not carry_decisions.stale(R1) or not os.path.exists(f"{R1}/logs/.stamp_motion"):
+        return []
+    print(f"\n[被拿着的物体] FBX 里的({carry_decisions.exported(R1)})和闸 5 的决定({carry_decisions.want(R1)})对不上, 重新导出")
+    if run_steps(kind, scene, run, ["motion"], dry) != 0:
+        sys.exit("\n★ 重新导出失败, 闸 5 的决定没能落到 FBX 上。就地停(修好之后再点继续, 会接着重导)。")
+    return ["motion"]
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", required=True)
@@ -666,6 +704,8 @@ def main():
     ap.add_argument("-n", "--dry-run", action="store_true")
     ap.add_argument("--people", choices=["0", "1"], help="这一轮有没有人(写进 00_run_config.json, 第 1 道闸之前能改)")
     ap.add_argument("--recall", choices=["0", "1"], help="开不开召回(写进 00_run_config.json, 第 4 段之前能改)")
+    ap.add_argument("--people-n", help="这个片子一共几个人(人数上限, 写进 00_run_config.json 的 PEOPLE_N; 空串 = 不知道)。"
+                                       "摆人那步按它核对身份, 见 people_identity.cap_people")
     a = ap.parse_args()
     kind = "indoor" if a.indoor else "outdoor"
     check_segments(kind)      # 五个注册点里最容易漏的那个, 启动就核
@@ -703,9 +743,9 @@ def main():
         return
 
     # 本轮配置: 给了 --people/--recall 就写; 新开的一轮(还没跑过任何一段)也落一份, 记下类型
-    if a.people or a.recall or (s["段"] == 0 and not s["停在闸口"] and not _common.load_run_config(R1)):
+    if a.people or a.recall or a.people_n is not None or (s["段"] == 0 and not s["停在闸口"] and not _common.load_run_config(R1)):
         if not a.dry_run:
-            rc = init_run_config(R1, kind, a.people, a.recall, s["段"] + (1 if s["停在闸口"] else 0))
+            rc = init_run_config(R1, kind, a.people, a.recall, s["段"] + (1 if s["停在闸口"] else 0), people_n=a.people_n)
             print(f"[本轮配置] {_common.RUN_CONFIG}: 类型 {rc['类型']}, 覆盖 {rc['覆盖'] or '无'}")
     elif (_common.load_run_config(R1) or {}).get("类型", kind) != kind:
         sys.exit(f"[失败] 这一轮是 {_common.load_run_config(R1)['类型']}, 命令行给的是 {kind}(--indoor 对不上)")
@@ -717,12 +757,18 @@ def main():
                         last=(s["段"] == len(segs)-1)); return
         apply_decisions(R1, tag, a.scene, kind, a.run, s["段"], a.dry_run)
         redone = rerun_people(R1, kind, a.scene, a.run, a.dry_run)
+        redone += rerun_carry(R1, kind, a.scene, a.run, a.dry_run)     # 挑人重跑时 motion 已经按新决定导过, 这里就不会再导
         if redone and s["段"] == len(segs) - 1 and not a.dry_run:
             # 最后一道闸上改了挑人: 验收视频和 FBX 是刚按新的挑人重出的, 还没人看过。前面的闸改了, 后面还有闸能看到;
             # 这一道后面没有了 —— 留在这道闸, 把新的报告再摆一遍, 看过再点继续才算跑完
-            print(f"\n[挑人] 这道闸要看的东西按新的挑人重出了({' -> '.join(redone)}), 留在这道闸: 看一遍新的再继续")
+            print(f"\n[闸口决定] 这道闸要看的东西按新的决定重出了({' -> '.join(redone)}), 留在这道闸: 看一遍新的再继续")
             gate_report(s["段"], R1, tag, a.scene, kind, a.run, last=True); return
         s["段"] += 1; s["停在闸口"] = False; save_state(R1, s)
+
+    if s["段"] >= len(segs) and a.go:
+        # 全部跑完之后才在闸 5 上改了被拿着的物体: 只重新导出 FBX
+        if rerun_carry(R1, kind, a.scene, a.run, a.dry_run):
+            print("\n[被拿着的物体] 按闸 5 的决定重新导出了 FBX")
 
     while s["段"] < len(segs):
         i = s["段"]; name, steps, _ = segs[i]

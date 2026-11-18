@@ -44,6 +44,8 @@ ap.add_argument("--up", choices=["y", "z"], default="y", help="输出坐标系�
 ap.add_argument("--zup", default="", help="03_点云_z朝上.json。给了就把壳变回 DA3 世界系, "
                                           "好和 assemble_scene 的输出对齐")
 ap.add_argument("--world-up", default="", help="02_da3/world_up.json。--zup 给了才用")
+ap.add_argument("--da3", default="", help="02_da3 目录(要配 --zup)。给了就去掉相机看得穿的墙段: 隔着那段墙还看得到墙外的地面 "
+                                         "= 房间在那儿没完(jw4 结尾左边、jw1 大厅中间那几面)")
 ap.add_argument("--walls-txt", default="", help="SpatialLM 布局 txt (wall_i=Wall(...))。给了就用它的墙段"
                                                "代替点云轮廓的墙; 地板仍按点云轮廓铺")
 ap.add_argument("--boxes", default="", help="06_all_boxes_merged.json。给了就保证壳把每个量到的物体都围进去"
@@ -174,22 +176,36 @@ def _sdist(F, pts, lo_):
     i_, j_ = ij[ok, 0], ij[ok, 1]
     s_[ok] = np.where(F[j_, i_] > 0, d_in[j_, i_], -d_out[j_, i_])
     return s_
-def _push_wall(big, qp, ax, sg, r, tol):
-    """把 sg 那一侧的整面墙推到 qp(像素, 列/行) 外 r 格。哪几列算"这面墙"和物体那段同一个判据。"""
+def _push_wall(big, qp, ax, sg, r, tol, rectify=False):
+    """把相机侧整条边推到相机外；横向覆盖主体全部宽度，避免人物点云留下 T 形肩部。"""
     M = big if ax == 1 else big.T
     qq = qp if ax == 1 else qp[:, ::-1]
     rows = np.arange(M.shape[0])[:, None]
     has = M.any(0)
     edge = np.where(has, (np.where(M > 0, rows, -1).max(0) if sg > 0
                           else np.where(M > 0, rows, 10 ** 9).min(0)), -1)
-    c0 = int(np.clip(np.round(np.median(qq[:, 0])), 0, M.shape[1] - 1))
-    if not has[c0]:
-        cols = np.nonzero(has)[0]; c0 = int(cols[np.argmin(np.abs(cols - c0))])
-    e0 = int(edge[c0]); i0 = i1 = c0
-    while i0 - 1 >= 0 and edge[i0 - 1] >= 0 and abs(edge[i0 - 1] - e0) <= tol: i0 -= 1
-    while i1 + 1 < M.shape[1] and edge[i1 + 1] >= 0 and abs(edge[i1 + 1] - e0) <= tol: i1 += 1
-    i0 = int(max(0, min(i0, np.floor(qq[:, 0].min() - r))))
-    i1 = int(min(M.shape[1] - 1, max(i1, np.ceil(qq[:, 0].max() + r))))
+    cols = np.nonzero(has)[0]
+    i0, i1 = int(cols[0]), int(cols[-1])
+    c0 = int(cols[np.argmin(np.abs(cols - np.median(qq[:, 0])))])
+    e0 = int(edge[c0])
+    if rectify:
+        # 只有一面长墙、相机侧却只有人体形成的短突起时，房间宽度取真实长墙。
+        # 把墙端之外零碎的点云翼去掉，再将长墙的整个跨度延伸到相机后方。
+        back = np.where(has, (np.where(M > 0, rows, 10 ** 9).min(0) if sg > 0
+                              else np.where(M > 0, rows, -1).max(0)), -1)
+        b0 = back[cols].min() if sg > 0 else back[cols].max()
+        near_back = has & (np.abs(back - b0) <= max(2, int(.12 / a.res)))
+        ends = np.flatnonzero(np.diff(np.r_[False, near_back, False]))
+        runs = [(int(l), int(r - 1)) for l, r in zip(ends[::2], ends[1::2])]
+        w0, w1 = max(runs, key=lambda x: x[1] - x[0])
+        wall_span = w1 - w0 + 1
+        front_span = int((has & (np.abs(edge - e0) <= max(2, int(.12 / a.res)))).sum())
+        if wall_span >= .65 * (i1 - i0 + 1) and front_span < .6 * wall_span:
+            M[:, :w0] = 0
+            M[:, w1 + 1:] = 0
+            i0, i1 = w0, w1
+            print(f"[单墙] 取最长可见墙 {wall_span * a.res:.1f}m 为房间整侧，"
+                  f"忽略墙端外的点云突起")
     tgt = int(np.ceil(qq[:, 1].max() + r)) if sg > 0 else int(np.floor(qq[:, 1].min() - r))
     tgt = int(np.clip(tgt, 0, M.shape[0] - 1))
     for i in range(i0, i1 + 1):
@@ -238,7 +254,9 @@ if a.cam_margin >= 0 and a.zup:
                     ax = int(np.argmax(np.abs(v))); sg = 1 if v[ax] > 0 else -1
                     _grp.setdefault((ax, sg), []).append(k)
                 for (ax, sg), ks in _grp.items():
-                    big, wlen, dist = _push_wall(big, (_cc[ks] - lo2) / a.res, ax, sg, a.cam_margin / a.res, 1.0 / a.res)
+                    big, wlen, dist = _push_wall(big, (_cc[ks] - lo2) / a.res, ax, sg,
+                                                   a.cam_margin / a.res, 1.0 / a.res,
+                                                   rectify=bool(a.boxes and not BOX))
                     big = np.ascontiguousarray(big)
                     print(f"[相机] 第 {_ranges(ks)} 帧在{'+-'[sg < 0]}{'xy'[ax]} 那面墙外或贴着墙: "
                           f"整面墙({wlen:.1f} m 宽)外推 {dist:.1f} m")
@@ -322,6 +340,74 @@ if a.walls_txt:
     print(f"[墙] 用 SpatialLM 的墙: {len(SEGS)} 面 <- {a.walls_txt}")
 else:
     SEGS = [(XY[i], XY[(i + 1) % len(XY)], 0.0, wall_h) for i in range(len(XY))]
+
+# ---------- 3a. 去掉相机看得穿的墙段 (2026-11-11 jw4 / jw1) ----------
+# ★ 轮廓是点云足迹, 墙沿轮廓一圈围上, 不管那里是不是真有墙。足迹边上的豁口(jw4 相机旁边 0.5 m 宽、1.25 m 深)、
+#   大厅里点云没铺到的地方(jw1), 墙就立在空地上, 镜头一摇过去就是一面半透明的墙。
+#   判据: 每一帧的深度点, 落在地面高度(|z| < SEE_FLOOR_Z)、在墙线外 >= SEE_BEYOND_M、相机到它的视线(水平投影)穿过这段墙
+#   -> 这段墙后面还看得到地面, 房间在那儿没完。墙按 SEE_BIN_M 一段统计, 至少 SEE_MIN_HITS 个点、连着 SEE_MIN_RUN 段才去掉,
+#   只去掉看得穿的那几段(门洞只去门洞); 剩下不到 SEE_MIN_KEEP 的碎墙也不要。
+#   真墙后面的地面看不见; 楼上的玻璃幕墙外面是楼下的街(不在地面高度), 不受影响(office 10 面墙一面没动)。
+SEE_BEYOND_M, SEE_FLOOR_Z, SEE_BIN_M, SEE_MIN_HITS, SEE_MIN_RUN, SEE_MIN_KEEP = 0.3, 0.15, 0.25, 3, 2, 0.3
+
+
+def _drop_seen_through(segs_in, stride=8, every=2):
+    zt_ = json.load(open(a.zup)); Rz = np.array(zt_["R"], float); tz = np.array(zt_["t"], float); sz = float(zt_.get("s", 1.0))
+    cams = json.load(open(f"{a.da3}/cameras.json"))["cameras"]
+    try:
+        badk = set(json.load(open(f"{a.da3}/bad_frames.json")).get("坏帧", []))
+    except (OSError, ValueError):
+        badk = set()
+    A0 = np.array([g[0] for g in segs_in], float); B0 = np.array([g[1] for g in segs_in], float)
+    Ls = np.linalg.norm(B0 - A0, axis=1); nb = np.maximum(1, np.ceil(Ls / SEE_BIN_M).astype(int))
+    hits = [np.zeros(n, int) for n in nb]
+    for k in sorted(cams)[::every]:
+        dp = f"{a.da3}/depth/{k[:-4]}_depth.npy"
+        if k in badk or not os.path.exists(dp):
+            continue
+        cm = cams[k]; E = np.array(cm["extrinsic_w2c_4x4"], float); Rw, tw = E[:3, :3], E[:3, 3]
+        C = sz * Rz @ (-Rw.T @ tw) + tz
+        d = np.load(dp); Hd, Wd = d.shape
+        K = np.array(cm["intrinsic_3x3"], float); h0, w0 = cm.get("input_hw", (Hd, Wd)); fx_, fy_ = Wd / w0, Hd / h0
+        ys, xs = np.mgrid[0:Hd:stride, 0:Wd:stride]; dd = d[::stride, ::stride].astype(np.float64)
+        Pc = np.stack([(xs - K[0, 2] * fx_) / (K[0, 0] * fx_) * dd, (ys - K[1, 2] * fy_) / (K[1, 1] * fy_) * dd, dd], -1).reshape(-1, 3)
+        Pz = (sz * (Rz @ ((Pc - tw) @ Rw).T)).T + tz
+        keep_ = np.isfinite(Pz).all(1) & (dd.reshape(-1) > 0) & (np.abs(Pz[:, 2]) < SEE_FLOOR_Z)
+        D2 = Pz[keep_, :2] - C[:2]; dist2 = np.linalg.norm(D2, axis=1)
+        for i in range(len(A0)):
+            e = B0[i] - A0[i]; w_ = A0[i] - C[:2]
+            den = D2[:, 0] * e[1] - D2[:, 1] * e[0]; ok_ = np.abs(den) > 1e-9; den = np.where(ok_, den, 1.0)
+            u = (w_[0] * e[1] - w_[1] * e[0]) / den                  # 沿视线: 0 = 相机, 1 = 深度点
+            v = (w_[0] * D2[:, 1] - w_[1] * D2[:, 0]) / den          # 沿墙: 0..1
+            beyond = ok_ & (u > 0) & (v >= 0) & (v <= 1) & ((1 - u) * dist2 >= SEE_BEYOND_M)
+            if beyond.any():
+                np.add.at(hits[i], np.minimum((v[beyond] * nb[i]).astype(int), nb[i] - 1), 1)
+    out, log = [], []
+    for i, (p0, q0, z0_, h_) in enumerate(segs_in):
+        op = hits[i] >= SEE_MIN_HITS
+        ed = np.flatnonzero(np.diff(np.r_[False, op, False])); runs = list(zip(ed[::2], ed[1::2]))
+        op[:] = False
+        for r0, r1 in runs:
+            if r1 - r0 >= SEE_MIN_RUN:
+                op[r0:r1] = True
+        if not op.any():
+            out.append((p0, q0, z0_, h_)); continue
+        ed = np.flatnonzero(np.diff(np.r_[False, ~op, False])); kept_m = 0.0
+        for r0, r1 in zip(ed[::2], ed[1::2]):
+            f0, f1 = r0 / nb[i], min(r1 / nb[i], 1.0)
+            if (f1 - f0) * Ls[i] >= SEE_MIN_KEEP:
+                out.append((p0 + f0 * (q0 - p0), p0 + f1 * (q0 - p0), z0_, h_)); kept_m += (f1 - f0) * Ls[i]
+        log.append(dict(墙=i, 长_m=round(float(Ls[i]), 2), 看得穿_m=round(float(op.sum() * Ls[i] / nb[i]), 2), 留下_m=round(kept_m, 2)))
+    return out, log
+
+
+_seen_log = []
+if a.da3 and a.zup and os.path.isdir(f"{a.da3}/depth"):
+    _n0 = len(SEGS)
+    SEGS, _seen_log = _drop_seen_through(SEGS)
+    print(f"[墙] 相机看得穿(墙后还看得到地面)的墙段去掉: {len(_seen_log)} 面墙动了"
+          + "".join(f"\n      墙 {r['墙']}: 长 {r['长_m']} m, 看得穿 {r['看得穿_m']} m, 留下 {r['留下_m']} m" for r in _seen_log)
+          + f"\n      {_n0} 段 -> {len(SEGS)} 段")
 
 walls, segs = [], []
 for p, q, z0, seg_h in SEGS:
@@ -447,6 +533,7 @@ scene.export(a.out)
 seg_out = a.seg_out or os.path.splitext(a.out)[0] + "_墙线.json"
 json.dump(dict(up=a.up, 墙高=wall_h, 厚=a.thick, 面积=float(cv2.contourArea(c) * a.res ** 2),
                轮廓=XY.tolist(), 墙线=segs, 墙来源=("spatiallm:" + a.walls_txt) if a.walls_txt else "点云轮廓",
+               看得穿去掉的墙=_seen_log,
                **({"柱子": pillar_rec} if pillar_rec else {})),
           open(seg_out, "w"), ensure_ascii=False, indent=1)
 print(f"[done] {a.out}\n       {seg_out}  (墙线在 z 朝上系, 物理那步自己转)")

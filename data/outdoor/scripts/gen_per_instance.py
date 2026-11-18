@@ -39,60 +39,43 @@ if box_guards.DEDUP_BOX:
 # "太矮"那条有个例外: 组装会先把"立在地上"的类补到地面再判(腿被挡住只量到桌面的桌子, 0.06 -> 0.74 m)。
 # 补不补由这三个设置决定, 流水线传的和传给组装的是同一份; 这三个条件和 assemble_scene.py 里开那一段的条件一样。
 _rp = os.environ.get("REST", "")
-_REST = json.load(open(_rp)) if (os.environ.get("FLOOR_EXTEND", "0") == "1" and _rp and os.path.exists(_rp)) else None
+_REST = json.load(open(_rp)) if _rp and os.path.exists(_rp) else {}
+_FLOOR_EXTEND = os.environ.get("FLOOR_EXTEND", "0") == "1"
 _HUNG = box_guards.hung_labels()
-_never = []
 OV_INST=review.overrides_inst(R1)     # {(词, 实例号): 帧号} —— 人在闸口点名换的那张抠图
 # ★ VLM 逐实例校验的否决名单(verify_picks.py 那一段写的)。
 #   以前逐实例这条路上一个机器校验都没有: 共用的词验代表那一张, solo 的词一张都不验,
 #   于是图越多越没人管。pedestrian/r2 实测 person 15 个里 3 个根本不是人。
 #   文件不在就当空的 —— 老轮次没有这份, 不该因此跑不了。
-_VP = f"{R1}/04_picks/vlm_verify_inst.json"
-VLM_REJ = ({w: set(v) for w, v in (json.load(open(_VP)).get("否决") or {}).items()}
-           if os.path.exists(_VP) else {})
+import solo_plan
+VLM_REJ = solo_plan.vlm_rejected(R1)
 RELEASE = review.vlm_released(R1)     # 人看过、VLM 说不是也照样要的
 if VLM_REJ:
     print(f"[VLM否决] {sum(len(v) for v in VLM_REJ.values())} 个实例被 VLM 否决: "
           + json.dumps({k: sorted(v) for k, v in VLM_REJ.items()}, ensure_ascii=False)
           + (f"; 其中人工放行 {sorted(RELEASE)}" if RELEASE else "; 没有人工放行的, 都不生成"))
+# ★ 2026-11-10 生不生成、用哪一帧, 规则搬到 solo_plan.py —— 本轮页"会生成几个"调的是同一份。
+#   以前那边自己数, hitch_cuts_indoor r1 上说 28 个, 这里实际生成 19 个。这里只管裁图落盘。
+_never = []
 jobs=[]
-for w in SOLO:
+for r in solo_plan.plan(R1, d, list(SOLO), tag=TAG, min_px=MIN_PX, dup=_DUPB, rest=_REST,
+                        floor_extend=_FLOOR_EXTEND, hung=_HUNG, vlm_rej=VLM_REJ, released=RELEASE, ov_inst=OV_INST):
+    w, oid = r["词"], r["实例"]
+    for t in r["提示"]: print(t)
+    if r["类"] in (solo_plan.GUARD, solo_plan.DUP):
+        _never.append((w, oid)); print(f"[不生成] {w}#{oid}: {r['原因']}")
+    if r["原因"] is not None:
+        continue
+    i,a,fi,e = r["行"]
     z=np.load(f"{R1}/03_masks/{w.replace(' ','_')}.npz",allow_pickle=True)
-    meta=z["meta"]; counts=z["counts"]; H,W=z["hw"]
-    for b in d.get(w,[]):
-        oid=b["obj_id"]
-        if oid in VLM_REJ.get(w, ()) and f"{TAG}_{w.replace(' ','_')}_{oid}" not in RELEASE:
-            continue                       # VLM 说这不是这个词, 人也没放行 -> 不生成
-        _why = box_guards.never_placed(w, b, _DUPB, may_grow=_REST is not None and box_guards.rests_on_floor(w, _REST, _HUNG))
-        if _why:
-            _never.append((w, oid)); print(f"[不生成] {w}#{oid}: {_why}"); continue
-        rows=[(i,int(a),int(f),float(e)) for i,(o,f,a,e) in enumerate(meta) if int(o)==oid and a>0]
-        if not rows: continue
-        i,a,fi,e = max(rows, key=lambda t: t[1]*(1-min(t[3]*4,0.9)))   # 面积大且不贴边
-        # ★ 人在闸口点名换帧的, 压过上面这个自动挑法。以前这一步完全不看人的决定,
-        #   而 SOLO="*" 的场景里绝大多数候选都走这条 —— 等于闸口的"改用"对它们全是空操作。
-        _want = OV_INST.get((w, oid))
-        if _want is not None:
-            _hit=[r for r in rows if r[2]==_want]
-            if _hit:
-                i,a,fi,e = _hit[0]
-                print(f"[人工指定] {w}#{oid} 改用第 {fi} 帧")
-            else:
-                # 人点的那一帧这个实例根本没被跟踪到。静默退回自动帧 = 人以为换了其实没换,
-                # 这正是这一整类问题的形状, 所以说出来。
-                print(f"[人工指定] ★ {w}#{oid} 点的第 {_want} 帧没有这个实例的 mask, "
-                      f"退回自动挑的第 {fi} 帧 —— 换个帧号重填")
-        pct=100*a/(H*W)
-        if a<MIN_PX:
-            if _want is not None:
-                print(f"[人工指定] ★ {w}#{oid} 第 {fi} 帧只有 {a} 像素 < SOLO_MIN_PX={MIN_PX}, 仍然不生成")
-            continue
-        m=mask_util.decode({"counts":counts[i],"size":[int(H),int(W)]}).astype(np.uint8)
-        name=f"{TAG}_{w.replace(' ','_')}_{oid}"
-        dd=os.path.expanduser(f"~/sam3d/sam-3d-objects/my_images/{name}"); os.makedirs(dd,exist_ok=True)
-        imwrite_stable(f"{dd}/frame.png", cv2.imread(f"{FR}/{fi:04d}.jpg"))
-        imwrite_stable(f"{dd}/mask.png", m*255)
-        jobs.append(name); print(f"[{w}#{oid}] 第{fi}帧 占{pct:.2f}% ({a}px) -> {name}")
+    counts=z["counts"]; H,W=z["hw"]
+    pct=100*a/(H*W)
+    m=mask_util.decode({"counts":counts[i],"size":[int(H),int(W)]}).astype(np.uint8)
+    name=r["生成名"]
+    dd=os.path.expanduser(f"~/sam3d/sam-3d-objects/my_images/{name}"); os.makedirs(dd,exist_ok=True)
+    imwrite_stable(f"{dd}/frame.png", cv2.imread(f"{FR}/{fi:04d}.jpg"))
+    imwrite_stable(f"{dd}/mask.png", m*255)
+    jobs.append(name); print(f"[{w}#{oid}] 第{fi}帧 占{pct:.2f}% ({a}px) -> {name}")
 if _never:
     print(f"[不生成] 共 {len(_never)} 个: 组装时一定会被扔(太矮 / 太大当成量错了, 或者同一件量了两遍), 不白生成")
 open(f"{R1}/logs/solo_jobs.txt","w").write("\n".join(jobs))

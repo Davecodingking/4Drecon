@@ -11,8 +11,9 @@ gate_ui.py 在每个请求进来时先问 handle(), 认得的路由在这里答�
   GET  /api/run/state      run_ctl.state()
   POST /api/run/config     {PEOPLE: "0"/"1", RECALL: ...}
   POST /api/run/people     {id: "keep"/"drop"}
+  POST /api/run/carry      {生成名: "keep"/"drop"}   闸 5: 被人拿着的物体进不进 FBX
   POST /api/run/go         替人敲一次 drive_go.sh
-  GET  /run/img?what=ground|check|person(&id=)   只认这几种, 不收任意路径
+  GET  /run/img?what=ground|check|person|carry(&id=)   只认这几种, 不收任意路径
   GET  /run/video          body4d 的跟踪体检视频 03_track.mp4
   GET  /run/media?what=    每道闸的图/视频(run_ctl.media_paths 的白名单)
 """
@@ -23,6 +24,7 @@ from PIL import Image
 
 import run_ctl
 import people_decisions
+import carry_decisions
 
 
 def _kind(q):
@@ -62,6 +64,46 @@ def _person_png(R1, pid):
     return cv2.resize(crop, (max(1, round(crop.shape[1] * h / crop.shape[0])), h), interpolation=cv2.INTER_AREA)
 
 
+def _carry_png(R1, name):
+    """被拿着的物体的一张小图: 重跟的 mask 里面积最大的那帧, 框住物体(绿边), 高 120。存在物体目录里, mask 变了才重画。"""
+    r = next((x for x in carry_decisions.rows(R1) if x["生成名"] == name), None)
+    if r is None:
+        return None
+    d = f"{R1}/13_carry/{r['词'].replace(' ', '_')}_{r['实例']}"
+    mp, out = f"{d}/mask.npz", f"{d}/thumb.png"
+    if not os.path.exists(mp):
+        return None
+    if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(mp):
+        return cv2.imread(out)
+    from pycocotools import mask as mu
+    md = np.load(mp, allow_pickle=True)
+    H, W = [int(x) for x in md["hw"]]
+    best, bi = -1, None
+    for i in range(len(md["counts"])):
+        a = mu.area({"counts": md["counts"][i], "size": [H, W]})
+        if a > best:
+            best, bi = a, i
+    m = mu.decode({"counts": md["counts"][bi], "size": [H, W]}).astype(np.uint8)
+    fn = int(md["meta"]["frame"][bi])                     # 帧文件名里的号(0004.jpg -> 4)
+    fm = json.load(open(f"{R1}/02_da3/frame_map.json"))
+    key = next((k for k in fm["frames"] if int(os.path.splitext(k)[0]) == fn), None)
+    img = cv2.imread(os.path.join(fm["frames_dir"], key)) if key else None
+    if img is None:
+        return None
+    if img.shape[:2] != (H, W):
+        img = cv2.resize(img, (W, H))
+    ys, xs = np.nonzero(m)
+    pad = int(0.35 * max(xs.ptp(), ys.ptp())) + 10
+    x0, x1, y0, y1 = max(0, xs.min() - pad), min(W, xs.max() + pad), max(0, ys.min() - pad), min(H, ys.max() + pad)
+    cnt, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(img, cnt, -1, (60, 220, 60), max(2, W // 400))
+    crop = img[y0:y1, x0:x1]
+    h = 120
+    crop = cv2.resize(crop, (max(1, round(crop.shape[1] * h / crop.shape[0])), h), interpolation=cv2.INTER_AREA)
+    cv2.imwrite(out, crop)
+    return crop
+
+
 def handle(h, method, path, q, body=None):
     """认得的路由答完返回 True。h 是 gate_ui 的请求处理器(用它的 _send / _json)。"""
     if path == "/new" and method == "GET":
@@ -70,7 +112,7 @@ def handle(h, method, path, q, body=None):
         h._send(200, "text/html; charset=utf-8", RUN_PAGE.encode()); return True
     if path == "/api/datasets" and method == "GET":
         h._json(run_ctl.datasets()); return True
-    if path not in ("/api/new", "/api/run/state", "/api/run/config", "/api/run/people",
+    if path not in ("/api/new", "/api/run/state", "/api/run/config", "/api/run/people", "/api/run/carry",
                     "/api/run/go", "/run/img", "/run/video", "/run/media"):
         return False
     try:
@@ -92,6 +134,10 @@ def handle(h, method, path, q, body=None):
             d = run_ctl.set_people(kind, scene, run, body or {})
             print(f"[挑人] {scene}/{run} -> 勾了 {people_decisions.keep_ids(R1)}", flush=True)
             h._json({"ok": True, "勾了": [r["id"] for r in d["人"] if r["决定"] == "keep"]}); return True
+        if path == "/api/run/carry":
+            no = run_ctl.set_carry(kind, scene, run, body or {})
+            print(f"[被拿着的物体] {scene}/{run} -> 不要 {no}", flush=True)
+            h._json({"ok": True, "不要": no, "过期": carry_decisions.stale(R1)}); return True
         if path == "/api/run/go":
             out = run_ctl.go(kind, scene, run)
             print(f"[开跑] {scene}/{run}: {out}", flush=True)
@@ -110,6 +156,11 @@ def handle(h, method, path, q, body=None):
                 h._json({"error": "no tracking video"}, 404); return True
             h._send(200, "video/mp4", open(p, "rb").read()); return True
         what = q.get("what")
+        if what == "carry":
+            png = _carry_png(R1, q.get("id", ""))
+            if png is None:
+                h._json({"error": "no such object"}, 404); return True
+            h._send(200, "image/png", cv2.imencode(".png", png)[1].tobytes()); return True
         if what == "person":
             png = _person_png(R1, q.get("id"))
             if png is None:
@@ -242,6 +293,12 @@ RUN_PAGE = """<!doctype html><meta charset=utf-8><title>本轮</title>""" + _STY
  table.kv{border-collapse:collapse;font-size:13px} table.kv td{padding:3px 14px 3px 0;border-top:1px solid var(--line)}
  .okc{color:var(--ok);font-weight:600}
  .thumb{height:64px;border-radius:4px;vertical-align:middle;margin-right:6px}
+ .cthumb{height:84px;max-width:150px;object-fit:contain;border-radius:4px;display:block}
+ .q{display:inline-block;min-width:38px;text-align:center;padding:0 5px;margin:1px 2px 1px 0;border-radius:4px;font-variant-numeric:tabular-nums;
+    background:color-mix(in srgb,var(--ok) 14%,transparent)}
+ .q.low{background:color-mix(in srgb,var(--red) 16%,transparent);color:var(--red);font-weight:600}
+ table.kv tr.off td:not(:last-child){opacity:.45}
+ video.carry{width:100%;max-width:760px;border-radius:6px;border:1px solid var(--line);display:block;background:#000;margin-top:8px}
 </style>
 <div class=wrap>
 <div class=top>
@@ -258,6 +315,8 @@ RUN_PAGE = """<!doctype html><meta charset=utf-8><title>本轮</title>""" + _STY
 <script>
 const P = new URLSearchParams(location.search), RUN = {};
 for (const k of ['s','r','i']) if (P.get(k)) RUN[k] = P.get(k);
+// 没带场景名(直接开根地址 /, 而网页默认那一轮还没有候选决定文件, 候选页把人转到这里): 去轮次列表挑一轮, 别停在空白页上
+if (!P.get('s')) location.replace('/runs');
 const U = (path, o) => path + '?' + new URLSearchParams({...RUN, ...(o||{})}).toString();
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -330,7 +389,12 @@ function render(){
   } else {
     big = '第 ' + (S.段 + 1) + ' 段没跑完就停了(多半是失败), 看日志; 点继续会重跑这一段';
   }
-  if (!S.在跑 && nx) sub = '点继续 → 跑第 ' + nx.段 + ' 段「' + nx.名 + '」: ' + nx.步骤.join(' → ') +
+  const ct = (S.段列表.find(g => g.拿着表) || {}).拿着表;
+  if (!S.在跑 && ct && ct.过期){
+    if (S.段 >= S.总段数) big = '全部跑完了, 但闸 5 上改了被拿着的物体';
+    sub = '点继续 → 只重新导出 FBX(按闸 5 上被拿着的物体的选择)' + (S.停在闸口 ? ', 然后留在这道闸再看一遍' : '');
+  }
+  else if (!S.在跑 && nx) sub = '点继续 → 跑第 ' + nx.段 + ' 段「' + nx.名 + '」: ' + nx.步骤.join(' → ') +
       ', 跑完停在第 ' + nx.停在 + ' 道闸' + (nx.停在 > nx.段 ? '(召回关, 中间的闸不停)' : '');
   $('nowbig').textContent = big; $('nowsub').textContent = sub;
   const go = $('go');
@@ -358,10 +422,13 @@ function segHTML(g){
     '</td><td class=d>' + esc(x.说明) + '</td><td class=tm>' + dur(x.耗时) + '</td></tr>').join('') + '</table>';
   if (g.候选决定){
     const c = g.候选决定, per = Object.entries(c.按词);
-    h += '<h3>按你现在保存的决定</h3><p><b>会生成 ' + c.会生成 + ' 个 mesh</b>' +
-      (per.length ? ': ' + per.map(([w, n]) => esc(w) + ' ×' + n).join(', ') : '') +
-      '<span class=dim> (共 ' + c.候选 + ' 个候选' + (c.作废词.length ? ', 整词作废: ' + c.作废词.map(esc).join(', ') : '') +
-      ')</span></p>';
+    // 会生成几个和生成那步(gen_per_instance.py)同一份规则(solo_plan.py) —— 11-10 以前只减了整词作废, hitch 上说 28 实际 19
+    const why = Object.entries(c.不生成 || {});
+    h += '<h3>按你现在保存的决定</h3><p><b>' + (c.会生成 == null ? '会生成几个 mesh 还算不出来' : '会生成 ' + c.会生成 + ' 个 mesh') + '</b>' +
+      (per.length ? ': ' + per.map(([w, n]) => esc(w) + ' ×' + n).join(', ') : '') + '</p>' +
+      '<p class=dim>共 ' + c.候选 + ' 个候选' + (c.作废词.length ? '; 整词作废: ' + c.作废词.map(esc).join(', ') : '') +
+      (why.length ? '; 留着但不生成: ' + why.map(([k, n]) => esc(k) + ' ' + n + ' 个').join(', ') : '') +
+      (c.待定 ? '<br>' + esc(c.待定) : '') + '</p>';
   }
   if (g.尺度) h += scaleHTML(g.尺度);
   if (g.报告 && g.报告.length) h += g.尺度
@@ -370,10 +437,12 @@ function segHTML(g){
       '</h3><div class=rep>' + esc(g.报告.join('\\n')) + '</div>';
 
   if (g.人表) h += peopleHTML(g.人表);
+  if (g.拿着表) h += carryHTML(g.拿着表);
   if (g.跳过的物体 && g.跳过的物体.length) h += '<h3>没摆进场景的物体</h3><table class=kv>' + g.跳过的物体.map(x =>
     '<tr><td>' + esc(x.词) + ' #' + x.实例 + '</td><td>' + esc(x.原因) + '</td><td class=dim>' +
-    (x.尺寸 ? x.尺寸.map(v => v.toFixed(1)).join(' × ') + ' m' : '') + '</td></tr>').join('') + '</table>';
-  const dl = g.产出.filter(m => m.下载), shown = g.产出.filter(m => !m.下载);
+    // 尺寸一般是 [长, 宽, 高]; "类内偏大"那条是一句话("1.94m vs 类内中位 0.26m"), 原样显示 —— 当数组处理整段页面会崩
+    (Array.isArray(x.尺寸) && x.尺寸.length ? x.尺寸.map(v => v.toFixed(1)).join(' × ') + ' m' : x.尺寸 ? esc(x.尺寸) : '') + '</td></tr>').join('') + '</table>';
+  const dl = g.产出.filter(m => m.下载), shown = g.产出.filter(m => !m.下载 && !(g.拿着表 && m.what === 'carry'));
   if (dl.length) h += '<h3>下载</h3><div class=row>' + dl.map(m =>
     '<a class=dl href="' + U('/run/media', {what:m.what}) + '" download="' + esc(m.下载) + '">⬇ ' + esc(m.说明) +
     ' <span class=dim>' + esc(m.下载) + ' · ' + m.大小MB + ' MB</span></a>').join('') + '</div>';
@@ -442,6 +511,36 @@ function peopleHTML(t){
     '<a href="#people" onclick="openPeople()">第 2 段的"人"</a>把他点成不要、保存, 再点继续 —— 会删掉他的网格(别人的不重算)、重摆、重导出 FBX。</p>';
 }
 
+// 闸 5: 被人拿着的物体(闸 2 在候选页上勾了 held 的)。点"不要"当场存; 点继续时驱动只重新导出 FBX
+function carryHTML(t){
+  const n2 = v => v == null ? '–' : v.toFixed(2);
+  const chip = v => '<span class="q' + (v != null && v < t.门槛 ? ' low' : '') + '">' + n2(v) + '</span>';
+  const vid = (S.段列表.find(g => g.拿着表) || {产出: []}).产出.some(m => m.what === 'carry');
+  let h = '<h3>被人拿着的物体(闸 2 勾了 held 的, ' + t.行.length + ' 个)</h3>';
+  if (t.过期) h += '<p class=warn>FBX 还是按上一次的选择导出的。点继续 → 只重新导出 FBX(一两分钟), 别的都不动。</p>';
+  h += '<table class=kv>' + t.行.map(r => {
+    const ok = r.状态 === 'ok', off = r.决定 === 'drop';
+    const fate = !ok ? '<b class=warn>没求出来, 不进 FBX</b>'
+      : off ? (r.在FBX里 ? '不要 <span class=dim>(FBX 里还有, 点继续去掉)</span>' : '<b>不要</b> · 不进 FBX')
+      : (r.在FBX里 === false ? '要 <span class=dim>(FBX 里还没有, 点继续加上)</span>' : '<span class=okc>进 FBX</span>');
+    return '<tr class="' + (off || !ok ? 'off' : '') + '"><td style="width:160px"><img class=cthumb src="' +
+      U('/run/img', {what:'carry', id:r.生成名}) + '" alt=""></td>' +
+      '<td><b>' + esc(r.词) + ' #' + r.实例 + '</b><br><span class=dim>网格: ' + esc(r.网格来源 || '') + '</span></td>' +
+      '<td>' + (ok ? '四段对齐 ' + Object.values(r.四段).map(chip).join('') +
+        (r.低的段.length ? '<br><span class=warn>有一段低于 ' + t.门槛 + ', 看下面视频里对应的那段</span>' : '')
+        : '<span class=warn>' + esc((r.原因 || '').slice(0, 200)) + '</span>') + '</td>' +
+      '<td style="white-space:nowrap">' + fate + '</td>' +
+      '<td>' + (ok ? '<button data-carry="' + esc(r.生成名) + '" data-v="' + (off ? 'keep' : 'drop') + '"' +
+        (S.在跑 ? ' disabled' : '') + '>' + (off ? '要回来' : '不要') + '</button>' : '') + '</td></tr>';
+  }).join('') + '</table>' +
+  (vid ? '<video class=carry controls preload=metadata src="' + U('/run/media', {what:'carry'}) + '"></video>' +
+         '<p class=note>视频: 原片 | 人 + 被拿着的物体 | 叠加。左上角写着每个物体在这一帧是拿着 / 空中 / 放着。</p>' : '') +
+  '<div class=msg id=carrymsg></div>' +
+  '<p class=note>四个数 = 视频分成四段, 每段里画出来的物体和画面上的物体重合多少(被人挡住的地方不算), 低于 ' + t.门槛 + ' 标红。' +
+  '"不要" = 不进 FBX; 它本来就没摆进静态场景, 所以就是没有了。想让它变回不动的静物, 去候选页把 held 去掉, 那要重跑后面几段。</p>';
+  return h;
+}
+
 function openPeople(){
   const d = document.querySelector('details.seg[data-seg="2"]');
   if (d){ d.open = true; setTimeout(() => d.scrollIntoView(), 50); }
@@ -471,7 +570,8 @@ function decideHTML(g){
       : '尺度这里没有要你判断的, 点继续。') +
       '<br><span class=dim>想再核对: 下面"人体网格叠回原片"的视频, 或者顶上的 3D。</span></p></div>';
   }
-  if (g.状态 === 'waiting') return '<div class=decide><h3>你要决定</h3><p>看上面的图和视频, 没问题就点继续。</p></div>';
+  if (g.状态 === 'waiting') return '<div class=decide><h3>你要决定</h3><p>看上面的图和视频, 没问题就点继续。' +
+    (g.拿着表 ? '<br>被人拿着的物体: 对得不好、又不想要的, 点它那一行的"不要"(点继续时只重新导出 FBX)。' : '') + '</p></div>';
   return '';
 }
 
@@ -484,6 +584,13 @@ function cardFate(id){
 }
 
 function wire(){
+  document.querySelectorAll('button[data-carry]').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    const r = await post('/api/run/carry', {[b.dataset.carry]: b.dataset.v});
+    if (r.error){ say('carrymsg', r.error, true); b.disabled = false; return; }
+    await load();
+    say('carrymsg', r.过期 ? '已保存。点上面的"继续"重新导出 FBX。' : '已保存, 和 FBX 里的一致, 不用重新导出。');
+  });
   document.querySelectorAll('button[data-drop]').forEach(b => b.onclick = async () => {
     b.disabled = true;
     const r = await post('/api/run/people', {[b.dataset.drop]: 'drop'});

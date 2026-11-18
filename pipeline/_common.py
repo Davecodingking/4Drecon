@@ -361,20 +361,27 @@ def save_run_config(R1, d):
 
 # 启动页 / 闸 1 网页 / drive.py 命令行能改的项, 以及"跑完第几段之后就不许改"。
 # 有没有人: people_track 在第 2 段(下标 1), 跑完 >1 段再改不会生效; 召回在第 4 段(下标 3)。
-EDITABLE_UNTIL = {"PEOPLE": 1, "RECALL": 3}
+EDITABLE_UNTIL = {"PEOPLE": 1, "RECALL": 3, "PEOPLE_N": 4,   # PEOPLE_N(人数上限)在最后一段的摆人那步用
+                  "PEOPLE_FULL": 1}                              # 人体跟不跟原片帧率: 人体跟踪(第 2 段)之前能改
+# ★ 2026-11-13 新开的一轮(还没有本轮配置文件)默认写这些: 人体跟原片帧率(PEOPLE_FULL=1, 见 indoor/outdoor_pipeline 的 CFG)。
+#   只在第一次建配置时写 —— 已经有配置的老轮次不加, 重跑结果不变。
+NEW_RUN_DEFAULTS = {"PEOPLE_FULL": "1"}
 
 
 def update_run_config(R1, kind, changes, done):
     """改本轮配置, 驱动命令行和网页共用这一套规则。done = 已经跑完的段数。
     类型开跑后锁定; 过了那一段还改的直接拒绝(改了也不会生效, 让人新开一轮)。不合规矩抛 ValueError。"""
-    rc = load_run_config(R1) or {"类型": kind, "覆盖": {}}
+    rc = load_run_config(R1) or {"类型": kind, "覆盖": dict(NEW_RUN_DEFAULTS)}
     if rc.get("类型") != kind:
         raise ValueError(f"这一轮是 {rc.get('类型')}, 这里给的是 {kind}。类型开跑后不能改, 新开一轮")
     over = rc.setdefault("覆盖", {})
     for key, val in changes.items():
         if key not in EDITABLE_UNTIL:
             raise ValueError(f"{key} 不在可改的项里: {sorted(EDITABLE_UNTIL)}")
-        if val not in ("0", "1"):
+        if key == "PEOPLE_N":
+            if not (val == "" or (val.isdigit() and 1 <= int(val) <= 99)):
+                raise ValueError(f"PEOPLE_N 是这个片子一共几个人(1~99), 空 = 不知道; 给的是 {val!r}")
+        elif val not in ("0", "1"):
             raise ValueError(f"{key} 只能是 0 或 1, 给的是 {val!r}")
         if over.get(key) == val:
             continue
@@ -505,3 +512,24 @@ def load_frame_map(da3_dir):
     mp = f"{src}/映射.json"
     sub = json.load(open(mp)) if src and os.path.exists(mp) else None
     return {n: _orig_index(n, sub) for n in c["images_used"]}
+
+
+# ★ 2026-11-11 表示人的词一律不进候选(用户定: spl 闸 2 不小心把 person 勾进去生成了一个静态的人)。
+#   人有自己的一条线(body4d), 物体链里再出一个就是场景里多一个不会动的假人。两条链在配置生效时(Ctx)把它并进 EXCLUDE,
+#   挑图 / 逐实例生成 / 量盒子 / 组装读的都是同一个 EXCLUDE, 一处生效。角色名(joker 这种)词表管不到, 闸 2 照样要人看。
+PEOPLE_WORDS = ("person", "people", "man", "men", "woman", "women", "boy", "girl", "child", "children", "kid", "baby",
+                "pedestrian", "human", "dancer", "player", "fighter", "actor", "actress", "guy", "lady", "gentleman",
+                "crowd", "worker", "soldier", "police officer", "policeman")
+
+
+# ★ 2026-11-11 穿戴在人身上的也一样(singin r2: 人作废了 shoes, 单数 shoe 漏进来, 生成了两只大皮鞋摆在地上)。
+#   被人拿在手里的道具(伞、棍子、帽子拿下来甩)不在这张表里, 走闸 2 的"拿着"。
+WORN_WORDS = ("high heel", "high heels", "heel", "heels", "shoe lace", "shoelace", "suit jacket", "suit pants", "tank top", "belt buckle", "watch", "hair", "hand", "hands", "arm", "arms", "leg", "legs", "foot", "feet", "head", "face", "shoulder bag", "handbag strap", "shoe", "shoes", "boot", "boots", "sneaker", "sneakers", "sock", "socks", "trousers", "pants", "jeans", "shorts",
+              "skirt", "dress", "shirt", "t-shirt", "blouse", "coat", "jacket", "suit", "vest", "sweater", "hoodie", "tie",
+              "necktie", "bow tie", "belt", "glove", "gloves", "scarf", "hat", "cap", "helmet", "necklace", "bracelet",
+              "earring", "earrings", "wristwatch", "sunglasses", "glasses", "mask", "costume", "uniform", "clothing", "clothes")
+
+
+def with_people_words(exclude):
+    ex = [w.strip() for w in str(exclude).split(",") if w.strip()]
+    return ",".join(ex + [w for w in PEOPLE_WORDS + WORN_WORDS if w not in ex])

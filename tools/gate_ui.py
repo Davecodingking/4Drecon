@@ -42,6 +42,15 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import numpy as np, cv2
 
 
+def held_hints(R1):
+    """闸 2 算的"可能被拿着"建议(carryfit/suggest.py 写的 05_carry_suggest.json): {生成名: {建议, 移动倍数, 挨着人, ...}}。
+    没有就是空 —— 老轮次没算过, 或这一轮没有人。只是提示, 勾不勾由人定。"""
+    try:
+        return json.load(open(f"{R1}/05_carry_suggest.json"))
+    except (OSError, ValueError):
+        return {}
+
+
 def _is_empty(v):
     """"这个字段算没填吗"。
 
@@ -367,7 +376,8 @@ class Store:
                 r["决定"] = n.get("决定", "keep")
                 # 三个可选字段: 给了就写, 给空就删 —— 留一个空值在文件里,
                 # review_gate --apply 会把它当"填了"来解析。
-                for k in ("改用", "改类别", "复用组", "VLM放行"):
+                # 不拿着 = 系统建议拿着、人点了"当静物/不要"。下游不读它, 只为下次打开页面别再默认成跟手。
+                for k in ("改用", "改类别", "复用组", "VLM放行", "拿着", "不拿着"):
                     if _is_empty(n.get(k)):
                         r.pop(k, None)
                     else:
@@ -395,7 +405,7 @@ class Store:
                                      f"「母词~N」, drop 查的还是老名字, 那个物体照样摆出来。"
                                      f"先只填分组跑一轮。")
                 row = {k: r[k] for k in ("生成名", "词", "来源", "实例", "帧",
-                                         "面积占比", "决定", "改用", "复用组", "改类别", "VLM放行")
+                                         "面积占比", "决定", "改用", "复用组", "改类别", "VLM放行", "拿着", "不拿着")
                        if not _is_empty(r.get(k))}
                 row["由界面追加"] = True
                 added.append(row)
@@ -1210,6 +1220,7 @@ def make_handler(store):
                         配置指定样本=st.pipeline_cfg().get("配置指定样本") or {},
                         组装守卫=dict(MIN_H=ASM_MIN_H, MAX_D=ASM_MAX_D),
                         场景查看=box_view_state(st.R1),
+                        拿着建议=held_hints(st.R1),
                         候选=rows))
                 if u.path == "/img/word":
                     # 只给词, 服务端自己挑"最有代表性的那个实例的代表帧" ——
@@ -1487,6 +1498,15 @@ PAGE = r"""<!doctype html>
  .iops button{padding:4px 4px;font-size:11px;min-width:0}
  .iops button:nth-child(2){margin-left:-1px}
  .iops button:nth-child(3){grid-column:1/-1;margin-top:-1px}
+ .iops button.held{grid-column:1/-1;margin-top:-1px}
+ .iops button.held.on{background:#1f6feb;color:#fff;border-color:#1f6feb}
+ .hint{color:#1f6feb;font-weight:600}
+ /* ---- 人拿着的东西(页顶那一块): 词卡的样子, 三个钮一排 ---- */
+ .wcard .row.r3{grid-template-columns:1fr 1fr 1fr}
+ .wcard .row.r3 button+button{margin-left:-1px}
+ .hcard>a{display:block}
+ .hcard .dim{padding:0 10px 8px}
+ .hcard .row.r3{margin-top:auto;padding:2px 10px 10px}
 
  /* ---------------------------------------------------------------- 帧抽屉 */
  .tray{grid-column:1/-1;background:var(--sheet);padding:14px}
@@ -1605,7 +1625,9 @@ PAGE = r"""<!doctype html>
  button.on[data-io="drop"],button.on[data-io="drop"]:not(:disabled),
  button.on[data-io="drop"]:hover:not(:disabled),
  button.on[data-rio="drop"],button.on[data-rio="drop"]:not(:disabled),
- button.on[data-rio="drop"]:hover:not(:disabled){
+ button.on[data-rio="drop"]:hover:not(:disabled),
+ button.on[data-hd="drop"],button.on[data-hd="drop"]:not(:disabled),
+ button.on[data-hd="drop"]:hover:not(:disabled){
         background:var(--red);border-color:var(--red);color:#fff}
 
  @media (prefers-reduced-motion:reduce){
@@ -1642,7 +1664,9 @@ const MODES = ["shared","solo"];   // 只有两种结果: 共用一个 / 各造�
 
 // S.行 是唯一真相(决策文件的「候选」原样)。S.词 是每次改动后重建的派生索引;
 // S.实例 是 /api/insts 的只读缓存, **永不写回文件**。
-let S = {行:[], 词:new Map(), 实例:new Map(), 待删:new Set(), meta:{}};
+// S.拿着区: 页顶「人拿着的东西」这次打开页面列过的实例(生成名 -> {词, oid})。点了当静物/不要也留在原地,
+//   人看得见自己刚点的是什么; 重新加载后不再跟手的才回到静物列表。S.默认跟手: 这次打开时按系统建议默认勾上的。
+let S = {行:[], 词:new Map(), 实例:new Map(), 待删:new Set(), meta:{}, 拿着区:new Map(), 默认跟手:new Set()};
 let dirty = false, openTray = null;   // {词, oid|null}  oid=null 表示不限实例
 // 弹层。{view:'insts'|'src', 词, oid|null, 从}  —— 沉浸式, 背景虚化
 let M = null;
@@ -1736,11 +1760,13 @@ function 最佳帧(词, oid){
   const m = ((S.实例.get(词) || {}).数据 || []).find(x => x.oid === oid);
   return m ? m.代表帧 : null;
 }
-// 分数第一的(只算现在能当样本的)
-function 自动样本(词){
+// 分数第一的(只算现在能当样本的)。除拿着 = 词卡封面用: 人拿着的不在静物列表里露面。
+// ★ 只有封面跳过拿着的; 流水线挑整类样本不看拿着(class_sample.py), 机选/预测照旧, 不然预告会和盘上打架。
+function 自动样本(词, 除拿着){
   const F = (S.网格事实 || {})[词];
   if (!F) return null;
-  const ok = F.实例.filter(r => r.挑图分 > 0 && r.挑图帧 != null && 可当样本(词, r.oid));
+  const ok = F.实例.filter(r => r.挑图分 > 0 && r.挑图帧 != null && 可当样本(词, r.oid)
+                              && !(除拿着 && 拿着了(词, r.oid)));
   if (!ok.length) return null;
   const b = ok.reduce((a, r) => r.挑图分 > a.挑图分 ? r : a);
   return {oid: b.oid, fr: b.挑图帧};
@@ -1769,15 +1795,24 @@ function 当前样本(w){
   return m ? {oid: m.oid, fr: m.fr, 来源: m.预测 ? '预测' : '机器'} : null;
 }
 // 词卡封面: 共用词就是整类样本; solo 词给分数第一的实例; 都没有 -> 面积最大的一行
+// ★ 人拿着的实例不当封面(它在页顶那一块里): 整类样本正好是它时, 换成分数第一的静物实例
 function 封面(w){
   const 词 = w.词;
   const cur = 当前样本(w);
-  if (cur) return {oid: cur.oid, fr: cur.fr, gen: genName(词),
+  if (cur && !拿着了(词, cur.oid)) return {oid: cur.oid, fr: cur.fr, gen: genName(词),
                    disk: cur.来源 === '机器', 改: cur.来源 === '人'};
-  const a = 实际模式(w) === 'solo' ? 自动样本(词) : null;
+  const a = (实际模式(w) === 'solo' || cur) ? 自动样本(词, true) : null;
   if (a) return {oid: a.oid, fr: a.fr, gen: genName(词, a.oid), disk: false, 改: false};
-  const r = w.全部.map(i => S.行[i]).filter(x => !isRecall(x))
-             .sort((x, y) => (y.面积占比 || 0) - (x.面积占比 || 0))[0] || S.行[w.全部[0]];
+  let r = w.全部.map(i => S.行[i]).filter(x => !isRecall(x) && !(x.实例 != null && 拿着了(词, x.实例)))
+             .sort((x, y) => (y.面积占比 || 0) - (x.面积占比 || 0))[0];
+  if (!r){
+    // 表里剩下的行全是人拿着的(别的实例判掉了、行没了): 拿一个不是人拿着的实例当封面, 判掉的也行
+    const o = (((S.网格事实 || {})[词] || {}).实例 || [])
+      .filter(x => !x.去重淘汰 && x.挑图帧 != null && !拿着了(词, x.oid))
+      .sort((x, y) => (y.挑图分 || 0) - (x.挑图分 || 0))[0];
+    if (o) return {oid: o.oid, fr: o.挑图帧, gen: genName(词, o.oid), disk: false, 改: false};
+    r = S.行[w.全部[0]];
+  }
   return {oid: r.实例, fr: r.帧, gen: r.生成名, disk: !r.改用, 改: !!r.改用};
 }
 
@@ -1836,6 +1871,8 @@ function 网格去向(词){
     // 先判跟人的决定无关的(点 keep/drop 都改变不了), 再判人的, 最后判 mesh
     if (r.去重淘汰)              v = {摆:false, 因:'dedup'};
     else if (模式 === 'dropped') v = {摆:false, 因:'word'};
+    // 人拿着的: 组装按生成名挡掉, 不当静物摆(review_gate --apply 的 拿着的); 它在页顶那一块里, 静物列表不数它
+    else if (拿着了(词, o))      v = {摆:false, 因:'held'};
     else if (!有盒(o))           v = {摆:false, 因:'nobox'};
     else if (e && (e[2] < S.守卫.MIN_H || Math.max(...e) > S.守卫.MAX_D))
                                  v = {摆:false, 因:'size', 尺寸:e};
@@ -1876,6 +1913,7 @@ function 去向文(v){
     switch (v.因){
       case 'dedup': return [R('NOT PLACED — dedup: another word represents it'), true];
       case 'word':  return [R('NOT PLACED — the whole word is dropped'), true];
+      case 'held':  return ['<span>人拿着: 不当静物摆, 在页顶「人拿着的东西」里</span>', false];
       case 'nobox': return [R('NOT PLACED — no 3D box (too few depth points)'+也), true];
       case 'size': {
         const e = v.尺寸, big = Math.max(...e);
@@ -1950,9 +1988,14 @@ function 重建索引(){
   for (const w of m.values()){
     const 去向 = 网格去向(w.词);
     w.去向 = 去向;
+    w.全拿着 = false;
     if (!去向) continue;
     const 摆 = [...去向.values()].filter(v => v.摆);
     w.实例数 = 摆.length;
+    // 人拿着的个数; 去重之外的实例全是人拿着的 -> 这个词在静物列表里没东西可看, 词卡不出
+    const 非淘 = [...去向.values()].filter(v => v.因 !== 'dedup');
+    const 拿 = 非淘.filter(v => v.因 === 'held').length;
+    w.全拿着 = 拿 > 0 && 拿 === 非淘.length;
     const 借 = new Map();
     let 类兜 = 0, 待 = 0;
     const 挡 = {};                      // 因 -> 个数, 只数和人的决定无关的那几种
@@ -1970,7 +2013,7 @@ function 重建索引(){
     }
     // ★ 丢 只数"因为你 drop 才不摆"的。没盒子的那几个即使你也 drop 过, 记在 挡 里 ——
     //   不管 drop 不 drop 都摆不进去, 两边都数就是同一辆车数两次(car #9/#11/#12)。
-    w.网格账 = {借, 类兜, 待, 挡, 丢};
+    w.网格账 = {借, 类兜, 待, 挡, 丢, 拿};
   }
 }
 
@@ -2070,6 +2113,11 @@ function 收尾(i){
   //   把历史那条 drop 删掉(review_gate.py:243-249), 撤销才真正落地。
   if (历史drop(r.词).includes(+r.实例)) return;
   if (r.VLM放行) return;            // 放行本身就是一个决定, 不是噪声
+  if (r.拿着) return;               // 标了"被人拿着"也是决定
+  if (r.不拿着) return;             // 系统建议拿着、人说当静物 —— 删了它下次打开又默认成跟手
+  // 历史里标过拿着的, 这行不拿着就是"撤销拿着"本身(同上面撤销 drop 的道理)
+  const h = (S.历史 || {})[r.生成名];
+  if (h && h.拿着) return;
   if (r.决定==='keep' && !r.改用 && !r.复用组 && !r.改类别){
     S.待删.add(r.生成名);
     S.行.splice(i, 1);
@@ -2077,9 +2125,140 @@ function 收尾(i){
   }
 }
 
+// ---- 被人拿着(held): 不当静物摆进场景, 流水线最后一段的 carry 步给它求每一帧的位姿, 跟人一起进 FBX ----
+// 写在这个实例自己的行上; 只对单个实例, 不对整个词 —— 同一个词常常有的拿着有的放着。三种状态:
+//   跟手    拿着: true
+//   当静物  没有拿着; 系统建议过的再记一笔 不拿着: true —— 不记的话下次打开页面又默认成跟手
+//   不要    决定: drop
+// 表里没这一行时回退查历史决定(同 人决): 共用词的实例行下一轮会从表上消失, 决定只留在历史里。
+// 页顶「人拿着的东西」列: 现在跟手的 + 这次打开页面列过的(点了当静物/不要也留在原地, 看得见自己点了什么)。
+// 静物列表(词卡数字、实例面板、封面)一律不出现跟手的实例。
+function 拿着行(词, oid){
+  const w = S.词.get(词);
+  if (w && w.实例行.has(oid)) return S.行[w.实例行.get(oid)];
+  return (S.历史 || {})[genName(词, oid)] || null;
+}
+// '跟手' | '静物' | '不要' | null(人没定过 —— 按静物算; 系统建议的打开页面时默认成跟手, 见 默认跟手)
+function 拿着态(词, oid){
+  if (人决(词, oid) === 'drop') return '不要';
+  const r = 拿着行(词, oid);
+  if (r && r.拿着) return '跟手';
+  if (r && r.不拿着) return '静物';
+  return null;
+}
+function 拿着了(词, oid){ return 拿着态(词, oid) === '跟手'; }
+// 能不能跟手: 表里有这个词、整词没作废、不是召回的、没被去重判给别的词
+function 可跟手(词, oid){
+  const w = S.词.get(词);
+  if (!w || w.模式 === 'dropped' || oid >= 10000) return false;
+  const F = (S.网格事实 || {})[词];
+  const r = F && F.实例.find(x => x.oid === oid);
+  return !(r && r.去重淘汰);
+}
+const 拿着数据文 = h => '移动距离是自身大小的 '+h.移动倍数+' 倍, '+Math.round(h.挨着人*100)+'% 的帧挨着人';
+
+// 页顶三个钮和静物面板的「人拿着 ↑」都走这里。态: '跟手' | '静物' | '不要'
+function 设拿着态(词, oid, 态){
+  const g = genName(词, oid);
+  const 建议 = !!((S.拿着建议 || {})[g] || {}).建议;
+  S.拿着区.set(g, {词, oid});
+  S.默认跟手.delete(g);
+  const i = 确保行(词, oid), r = S.行[i];
+  if (态 === '不要'){
+    if (建议) r.不拿着 = true;
+    // 撤拿着 / 撤 VLM 放行 / 撤整类样本: 和静物面板上的 drop 同一条路
+    return 设实例决定(词, oid, 'drop');
+  }
+  if (态 === '跟手'){ r.拿着 = true; delete r.不拿着; }
+  else { delete r.拿着; if (建议) r.不拿着 = true; else delete r.不拿着; }
+  // 从 drop 拿回来 = 要它: 和静物面板点 keep 一样, VLM 否掉的算人看过、放行。
+  // ★ 只改 drop。这一行上要是写着 solo/shared(没有类行的词, 词模式写在第一个实例行上), 不能冲掉。
+  if (r.决定 === 'drop'){
+    r.决定 = 'keep';
+    if (VLM否(词, oid)) r.VLM放行 = true;
+  }
+  收尾(i);
+  dirty = true; 重建索引(); render();
+}
+
+// 打开页面时: 系统建议拿着、人没定过(没跟手 / 当静物 / 不要)的, 默认跟手, 并标脏 —— 点 Save 才落盘。
+// ★ 不放在 review_gate 建表时做: 闸 2 是先建表(review_gate)、后算建议(carryfit/suggest.py 要读那张表),
+//   建表那一刻还没有建议; 共用词的实例在表里也没有行可写。界面上做, 人看得见, 点 Save 才算数。
+async function 默认跟手(){
+  const 要 = [];
+  for (const [g, h] of Object.entries(S.拿着建议 || {})){
+    if (!h || h.建议 !== true || h.实例 == null) continue;
+    const 词 = h.词, oid = +h.实例;
+    if (genName(词, oid) !== g) continue;            // 名字对不上(不是这一轮的 TAG 算的)就不碰
+    if (!可跟手(词, oid) || 拿着态(词, oid) != null) continue;
+    要.push([词, oid]);
+  }
+  if (!要.length) return;
+  // 要新建行的(共用词的实例表里没行)先把实例元数据拿回来, 确保行 才填得上代表帧/面积, 不然写 0
+  const 缺 = [...new Set(要.filter(([词, oid]) => !S.词.get(词).实例行.has(oid)).map(x => x[0]))];
+  await Promise.all(缺.map(取实例));
+  for (const [词, oid] of 要){
+    const i = 确保行(词, oid);
+    S.行[i].拿着 = true;
+    S.默认跟手.add(genName(词, oid));
+  }
+  dirty = true; 重建索引();
+}
+
+// 页顶那一块列哪些: 现在跟手的(表里的行 + 只剩在历史决定里的) + 这次打开页面列过的。返回 [[生成名, {词, oid}]]
+function 拿着清单(){
+  S.行.forEach(r => {
+    if (isInst(r) && !isRecall(r) && 拿着了(r.词, r.实例)) S.拿着区.set(r.生成名, {词: r.词, oid: r.实例});
+  });
+  for (const [g, h] of Object.entries(S.历史 || {}))
+    if (h && h.拿着 && h.实例 != null && S.词.has(h.词) && 拿着了(h.词, +h.实例))
+      S.拿着区.set(g, {词: h.词, oid: +h.实例});
+  return [...S.拿着区.entries()].filter(([, x]) => S.词.has(x.词))
+    .sort((a, b) => a[1].词 < b[1].词 ? -1 : a[1].词 > b[1].词 ? 1 : a[1].oid - b[1].oid);
+}
+
+function 拿着卡(g, 词, oid){
+  const 态 = 拿着态(词, oid) || '静物';
+  const h = (S.拿着建议 || {})[g];
+  const w = S.词.get(词);
+  const 词废 = !!(w && w.模式 === 'dropped');
+  const q = {word: 词, oid: oid};
+  const 来 = S.默认跟手.has(g) ? '系统建议, 默认跟手' : (h && h.建议) ? '系统建议' : '你标的';
+  const 钮 = [['跟手', '跟手', 'held', '跟着人动: 不摆进静态场景, 最后一步按人手逐帧求位姿, 和人一起导出 FBX'],
+             ['静物', '当静物', 'static', '不是人拿着的: 放回下面的静物列表, 当普通静态物体摆进场景'],
+             ['不要', '不要', 'drop', '这个实例不要: 既不摆进场景, 也不跟手']]
+    .map(([值, 字, k, tip]) => '<button data-hd="'+k+'" data-w="'+esc(词)+'" data-oid="'+oid+'"'+
+         ' title="'+esc(tip)+'" class="'+(态 === 值 ? 'on' : '')+'">'+字+'</button>').join('');
+  const d = document.createElement("div");
+  d.className = "wcard hcard" + (态 === '不要' || 词废 ? " dead" : "");
+  d.innerHTML =
+    '<a href="'+U('/img/frame', {...q, size:1280})+'" target="_blank" title="打开整帧, 看是谁拿着">'+
+      '<img loading="lazy" src="'+U('/img/inst', {...q, size:240})+'"></a>'+
+    '<div class="hd"><b>'+esc(词)+' #'+oid+'</b><i class="bg cls">'+来+'</i></div>'+
+    (h ? '<div class="dim">'+esc(拿着数据文(h))+'</div>' : '')+
+    (词废 ? '<div class="warn">整个词已作废(词卡上点了 drop word), 跟手不生效</div>' : '')+
+    '<div class="row r3">'+钮+'</div>';
+  return d;
+}
+
+// 静物面板上的「人拿着 ↑」: 挪到页顶那一块(跟手)。跟手的实例不在静物面板里出现, 所以这里没有选中态 ——
+// 改主意在页顶点「当静物」。
+function held钮(w, r){
+  if (r.去重淘汰 || r.召回) return '';
+  return '<button data-held="'+esc(w.词)+'" data-oid="'+r.oid+'" class="held" title="'+esc(
+      '#'+r.oid+' 是人拿着、跟着人动的: 挪到页顶「人拿着的东西」里。它不当静物摆, '+
+      '最后一步按人手逐帧求位姿, 和人一起导出 FBX')+'">人拿着 ↑</button>';
+}
+function held提示(w, r){
+  const h = (S.拿着建议 || {})[genName(w.词, r.oid)];
+  if (!h || !h.建议) return '';
+  return '<div class="dim verdict hint">系统觉得可能是人拿着的: '+esc(拿着数据文(h))+'</div>';
+}
+
 function 设实例决定(词, oid, v){
   const i = 确保行(词, oid);
   S.行[i].决定 = v;
+  if (v === 'drop') delete S.行[i].拿着;
   // VLM 否掉的: 点 keep = "我看过了, 照样要" -> 放行; 点 drop = 不要 -> 撤掉放行
   if (VLM否(词, oid)){
     if (v === 'keep') S.行[i].VLM放行 = true; else delete S.行[i].VLM放行;
@@ -2200,7 +2379,7 @@ function scRender(){
   g.innerHTML = "";
   const d = SC.state;
   document.getElementById("gate").textContent = "Gate 3 of 5 — world scale";
-  if (d && d.报告文件) document.getElementById("scene").textContent = d.场景 || "";
+  if (S.meta.场景名) document.getElementById("scene").textContent = S.meta.场景名 + ' / ' + S.meta.轮次;
   if (!d){ g.innerHTML = '<div class="empty">Loading…</div>'; scLoad(); return; }
   if (d.error){ g.innerHTML = '<div class="empty">'+esc(d.error)+'</div>'; return; }
   if (!d.报告存在 && !d.逐类.length){
@@ -2364,17 +2543,21 @@ async function boot(){
   else { v.classList.add('off'); v.removeAttribute('href'); v.title = "No 3D data yet — it appears once gate 3 (boxes) has run"; }
   S.行 = d.候选; S.待删 = new Set();
   S.历史 = d.历史决定 || {};
-  S.网格事实 = d.网格事实 || {};       // 盘上哪些 glb / 盒子在, 见后端 mesh_facts
+  S.网格事实 = d.网格事实 || {};
+  S.拿着建议 = d.拿着建议 || {};       // 闸 2 算的"可能被拿着", 见 carryfit/suggest.py       // 盘上哪些 glb / 盒子在, 见后端 mesh_facts
   S.盘上样本 = d.盘上样本 || {};       // picks.json: 共用词盘上实际在用的样本, 见后端 disk_samples
   S.配置指定样本 = d.配置指定样本 || {}; // pipeline 源码里写死的换候选
   S.暂存改用 = {};                     // 切模式时收起来的另一种模式的 改用(重新加载就清空)
   S.守卫 = d.组装守卫 || {MIN_H: 0.15, MAX_D: 15};
-  document.getElementById("scene").textContent = d.场景;
+  // 场景 is the mesh generation tag and may point to an earlier run when
+  // meshes are reused. Show the run selected in the URL instead.
+  document.getElementById("scene").textContent = d.场景名 + ' / ' + d.轮次;
   // 阶段名(pre/post)对人没意义, 它说的是"召回之前还是之后" —— 直接说那句话。
   document.getElementById("gate").textContent =
     "Gate " + d.闸 + " of 5 — " + (d.阶段 === "post" ? "after recall" : "before generating");
   写文件名(d.决策文件);
   重建索引();
+  await 默认跟手();                   // 系统建议拿着、人没定过的 -> 默认跟手(标脏, Save 才落盘)
   if (GATE === 'scale') scLoad(); else render();
   const want = new URLSearchParams(location.search).get('sel');
   if (want && GATE === 'review') 跳到实例(want);
@@ -2427,6 +2610,8 @@ function stat(){
   if (有('solo'))       尾.push(有('solo') + " per-instance");
   if (有('shared'))     尾.push(有('shared') + " shared");
   if (ov)               尾.push(ov + " re-sourced");
+  const 拿 = 拿着清单().filter(([, x]) => 拿着了(x.词, x.oid)).length;
+  if (拿)               尾.push(拿 + " 个人拿着");
   if (冲)               尾.push("⚠ " + 冲 + " mode conflict" + (冲>1?"s":""));
   document.getElementById("stat").textContent = 头 + (尾.length ? " — " + 尾.join(", ") : "");
   const b = document.getElementById("save");
@@ -2502,6 +2687,7 @@ function 网格汇总(w){
                vlmnomesh: k => k+' kept past the VLM but too small for an own mesh'};
   for (const [因, k] of Object.entries(a.挡)) 句.push('<span class="red">'+挡文[因](k)+'</span>');
   if (a.丢) 句.push(a.丢+' you dropped');      // 人的决定, 不算问题, 不标红
+  if (a.拿) 句.push(a.拿+' 个人拿着 ↑');         // 在页顶那一块, 不算进这张卡的数字
   for (const [名, k] of a.借)
     句.push('<span class="red">'+k+(k === 1 ? ' borrows ' : ' borrow ')+esc(短名(名))+'\'s mesh</span>');
   if (a.类兜) 句.push('<span class="red">'+a.类兜+(a.类兜 === 1 ? ' falls' : ' fall')+' back to the class mesh</span>');
@@ -2553,7 +2739,9 @@ function 展开面板(w){
       esc(st.说明||'')+'</span></h3>';
     return t;
   }
-  const ins = st.数据;
+  // ★ 人拿着的实例不在这里: 它们在页顶「人拿着的东西」里, 这一屏只比静物
+  const ins = st.数据.filter(r => !拿着了(w.词, r.oid));
+  const 拿数 = st.数据.length - ins.length;
   // 形状摘要: 只在"正常"的实例里看 AR 的散布, 坏 mask 不参与 —— 否则一个横躺的
   // 破 mask 会把结论带偏成"形状很多样, 该 solo"
   const 好 = ins.filter(r => !坏(r));
@@ -2585,7 +2773,7 @@ function 展开面板(w){
   //   否则卡片说 10 个、面板列 13 个, 人不知道该信哪个。
   // 有组装预告就按它的"因"记账(每个不摆的实例只记一个因, 加起来正好等于差额)
   const 因计 = {};
-  if (w.去向) for (const v of w.去向.values()) if (!v.摆) 因计[v.因] = (因计[v.因] || 0) + 1;
+  if (w.去向) for (const v of w.去向.values()) if (!v.摆 && v.因 !== 'held') 因计[v.因] = (因计[v.因] || 0) + 1;
   const 淘 = w.去向 ? (因计.dedup || 0) : ins.filter(r => r.去重淘汰).length;
   const 丢 = w.去向 ? (因计.drop || 0) : (w.已drop || 0);
   const 其他 = [['vlm', ' rejected by VLM (review them)'], ['vlmnomesh', ' kept past the VLM, too small'],
@@ -2605,6 +2793,7 @@ function 展开面板(w){
   // ★ 弹层头已经写了词名和数量(见 挂弹层 的 sub), h3 再说一遍就是 40px 内说两次。
   //   这里只留"怎么读这一屏"的说明。顺带修复 "1 instances" 的复数。
   t.innerHTML = '<h3>'+(ins.length===1?'One instance':'Largest first')+账+
+    (拿数 ? ' · 另有 '+拿数+' 个人拿着, 在页顶「人拿着的东西」里' : '')+
     '<span>'+建议+
     (坏数?'. '+坏数+' mask'+(坏数>1?'s':'')+' look wrong — those carry a ⚠ flag':'')+
     '</span></h3>'+
@@ -2612,6 +2801,9 @@ function 展开面板(w){
       'Only one can be used — click set as rep on the one you want.</div>' : '')+
     (样坏 ? '<div class="warn">The class mesh is built from #'+样.oid+', but '+样坏+
       '. Click set as rep on another instance.</div>' : '')+
+    // 整类样本正好是人拿着的那个: 流水线挑样本不看拿着, 它的抠图照样拿去建整类 mesh —— 说出来, 让人换
+    (样 && 拿着了(w.词, 样.oid) ? '<div class="warn">整类网格要拿 #'+样.oid+' 来建, 但它是人拿着的'+
+      '(在页顶)。在下面挑一个静物点 set as rep 换掉。</div>' : '')+
     (代警.length ? '<div class="warn">The class source #'+代.oid+
       ' is itself flagged ('+esc(代警.join('; '))+') — and the mesh for this whole class '+
       'is built from it.'+(自样 && 自样.oid !== 代.oid
@@ -2709,6 +2901,7 @@ function 展开面板(w){
                 r.VLM否决?'VLM rejected':'',
                 r.低于门槛?'below solo threshold':''].filter(Boolean).join('; ')+'</div>'
             : ''))+
+        held提示(w, r)+
       '</div>'+
       '<div class="iops">'+
         '<button data-io="keep" data-w="'+esc(w.词)+'" data-oid="'+r.oid+'"'+
@@ -2718,7 +2911,7 @@ function 展开面板(w){
           (行i==null && !r.去重淘汰 ? ' title="Adds a row for this instance so it can be excluded '+
                        'from the scene (assemble_scene checks instance-level names too)"' : '')+
           '>drop</button>'+
-        实例钮(w, r) +
+        实例钮(w, r) + held钮(w, r) +
       '</div>';
     box.appendChild(el);
   });
@@ -2816,7 +3009,8 @@ function render(){
   if (GATE === 'scale') return scRender();     // 闸 3 走自己那套, 共用外壳
   const g = document.getElementById("grid");
   g.innerHTML = "";
-  const 词们 = [...S.词.values()];
+  // 静物列表只放静物: 实例全是人拿着的词不出词卡(它们在页顶那一块里)
+  const 词们 = [...S.词.values()].filter(w => !w.全拿着);
   const 类 = 词们.filter(w => w.类行 != null);
   const 纯实例 = 词们.filter(w => w.类行 == null);
   类.sort((a,b) => b.实例数 - a.实例数);      // 分量最重的排最前
@@ -2824,6 +3018,18 @@ function render(){
   const sec = (t, n) => { const h=document.createElement("div");
     h.className="sec"; h.innerHTML=t+'<span>'+n+'</span>'; g.appendChild(h); };
   const emit = ws => ws.forEach(w => { g.appendChild(词卡(w)); });
+
+  // ---- 人拿着的东西: 跟着人动的, 不和静物混在一起。放最前 —— 它决定了下面的静物列表里有谁 ----
+  const 拿单 = 拿着清单();
+  if (拿单.length){
+    const 跟 = 拿单.filter(([, x]) => 拿着了(x.词, x.oid)).length;
+    const 默 = 拿单.filter(([k]) => S.默认跟手.has(k)).length;
+    sec("人拿着的东西",
+        跟+" 个跟手。跟着人动的物体不摆进静态场景, 最后一步按人手逐帧求位姿、和人一起导出 FBX。"+
+        "不是人拿着的点「当静物」, 放回下面的静物列表"+
+        (默 ? "。其中 "+默+" 个是这次按系统建议默认勾上的, 点 Save 才算数" : ""));
+    拿单.forEach(([k, x]) => g.appendChild(拿着卡(k, x.词, x.oid)));
+  }
 
   if (类.length){
     const tot = 类.reduce((s,w)=>s+w.实例数, 0);
@@ -2871,6 +3077,10 @@ function 绑事件(root){
     设样本(b.dataset.rep, +b.dataset.oid, 最佳帧(b.dataset.rep, +b.dataset.oid)));
   root.querySelectorAll("[data-io]").forEach(b => b.onclick = () =>
     设实例决定(b.dataset.w, +b.dataset.oid, b.dataset.io));
+  root.querySelectorAll("[data-held]").forEach(b => b.onclick = () =>
+    设拿着态(b.dataset.held, +b.dataset.oid, '跟手'));
+  root.querySelectorAll("[data-hd]").forEach(b => b.onclick = () =>
+    设拿着态(b.dataset.w, +b.dataset.oid, {held:'跟手', static:'静物', drop:'不要'}[b.dataset.hd]));
   root.querySelectorAll("[data-tray]").forEach(b => b.onclick = () => {
     const 词 = b.dataset.tray;
     const oid = b.dataset.toid == null ? null : +b.dataset.toid;

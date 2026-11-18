@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """同款复制: 一类一个 mesh, 按各实例的盒子摆回街上, 加地面, 导出整场景 glb.
-尺度用高度对齐(高度几乎总能看全, 长度会被遮挡截短); 朝向用盒子长轴, 180° 未解。"""
+尺度通常用高度对齐；整床用盒子三轴，床架栏杆用宽度。朝向用盒子长轴, 180° 未解。"""
 import os, sys, json, numpy as np, trimesh
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from world_frame import load_up, export_T, inverse_T
@@ -48,6 +48,7 @@ EXCLUDE=set(os.environ.get("EXCLUDE","sign,billboard,pedestrian,manhole cover").
 #   不只是"别再烧这份 GPU", 所以这里必须再挡一道。
 import review_decisions as _review
 SKIP_NAMES=set(_review.skip_names(ROOT))
+HELD_NAMES=_review.held_names(ROOT)      # 闸口标了"被人拿着"的: 不当静物摆, carry 步单独求每帧位姿
 def _gen_name(w, oid=None):
     """生成名的拼法: 类共用 = <TAG>_<词>, 实例专属 = <TAG>_<词>_<实例号>。词里的空格换成下划线。"""
     s = f"{TAG}_{w}" if oid is None else f"{TAG}_{w}_{oid}"
@@ -97,8 +98,38 @@ SNAP_GROUND=os.environ.get("SNAP_GROUND","1")=="1"   # 强制所有物体落在�
 # 旧名字兼容一轮: 只认看起来像文件的值。
 ROOM_SHELL=os.environ.get("ROOM_SHELL","") or (
     os.environ.get("SHELL","") if os.environ.get("SHELL","").endswith((".glb",".ply",".obj")) else "")
-FLOAT_WORDS=set(x for x in os.environ.get("FLOAT_WORDS","awning,traffic light,billboard,sign").split(",") if x)
+# ★ 2026-11-11 加上挂墙的(海报 / 画 / 镜子 / 钟): singin 的海报被强制落地, 躺在地上
+FLOAT_WORDS=set(x for x in os.environ.get("FLOAT_WORDS","awning,traffic light,billboard,sign,poster,painting,picture,picture frame,mirror,wall clock,clock,framed picture,artwork").split(",") if x)
+# ★ 2026-11-11 地形网格(GROUND_MODE=terrain, terrain.py 出的 07_terrain.npz): 地面不是一个高度(楼梯 / 台阶)。
+#   给了就用它的网格当地面(节点名照旧 ground), 落地的物体落到它脚下那块地形上, 不落到一个高度 best_h。
+# ★ ROOM_SHELL_FLOOR=0: 室外墙(OUTDOOR_SHELL=on)只要墙 —— 壳的地板不并进来、地面照旧(平面片或地形), 地面高度也不取壳的地板。
+# ★ 2026-11-11 贴墙的东西(门 / 窗 / 卷帘): 盒子是多帧的点合起来量的, 深度帧间抖几十厘米, 一扇 5 cm 的门量成 0.5~0.75 m 厚
+#   (spl metal door#3 / #4), 按盒子缩放后鼓出墙面、盒子中心离墙 14~36 cm。有室外墙线(outdoor_walls.py 的 09_房间壳_墙线.json,
+#   带 e1/e2)时: 0.5 m 内、方向差 15° 内有墙的 -> 转到和墙平行、厚度压到 WALL_ATTACH_THICK 以内、背面贴墙朝相机那一面。
+WALL_ATTACH_WORDS = {w.strip() for w in os.environ.get("WALL_ATTACH_WORDS",
+                     "door,metal door,garage door,front door,window,gate,shutter,roller shutter,poster,painting,picture,picture frame,mirror,wall clock,clock,framed picture,artwork").split(",") if w.strip()}
+WALL_ATTACH_THICK = float(os.environ.get("WALL_ATTACH_THICK", "0.12"))
+TERRAIN_NPZ=os.environ.get("TERRAIN","")
+SHELL_FLOOR=os.environ.get("ROOM_SHELL_FLOOR","1")=="1"
+_TER=None
+if TERRAIN_NPZ:
+    import terrain
+    _TER=terrain.Terrain(TERRAIN_NPZ)
 BOXES=os.environ.get("BOXES", f"{ROOT}/06_all_boxes.json")   # 换成 06_all_boxes_merged.json 即含召回
+
+# ---- 斜坡: 竖杆定的真竖直 (2026-11-05, 原理见 gravity_from_poles.py) ----
+# 链上照旧在"地面系"里做: UP = 地面法线, 地面是平的, 落地/物理/摆人都不用改, 每个物体自然落在它脚下那块坡上。
+# 只有物体"往哪边立"改用真竖直 GV —— 不然路灯、矮柱垂直于坡面, 跟着坡歪 2~3°(lalaland r1)。
+# 导出 FBX 时(motion_export.py)再整体转到 GV 朝上。没坡 / 没竖杆 / 竖杆不一致: GV = None, 逐位和以前一样。
+# 室内链传 GRAVITY_POLES=0: 房间地板是平的。
+GV = None
+if os.environ.get("GRAVITY_POLES", "1") == "1":
+    import gravity_from_poles
+    _gd = gravity_from_poles.estimate(ROOT, UP)
+    json.dump(_gd, open(f"{ROOT}/{gravity_from_poles.OUT_NAME}", "w"), ensure_ascii=False, indent=1)
+    print(f"[竖直] 竖杆 {len(_gd['杆子'])} 根, 和地面法线差 {_gd.get('和地面法线差')}°, "
+          f"去掉一根最多变 {_gd.get('去掉一根最多变')}° -> {'用' if _gd['用了'] else '不用'}: {_gd['原因']}")
+    if _gd["用了"]: GV = np.asarray(_gd["gravity"], float)
 boxes=json.load(open(BOXES))
 
 cache={}
@@ -117,7 +148,7 @@ for w,bs in boxes.items():
     for b in bs:
         c=np.array(b["中心"]); h=b["尺寸"][2]
         pts.append(c - UP*h/2)                          # 盒底中心
-pts=np.array(pts)
+pts=np.asarray(pts, float).reshape(-1, 3)
 # 地面必须是水平的 —— 真实的"天"已经由 up 那步从点云主平面拟合出来了(world_up.json),
 # 在这个坐标系里地面按定义就是水平面, 只剩"多高"一个未知数。
 #
@@ -138,14 +169,17 @@ pts=np.array(pts)
 #   日志只会说"用 N 个盒底拟合", 看不出这是降级。而降级的后果是整个地面高度错掉。
 _gh = _GH
 
-hh = pts @ UP                                    # 每个盒底沿"天"方向的高度
-cand = np.sort(hh)
-best_n, best_h = -1, float(np.median(hh))
-for h0 in cand:                                  # 盒底本身就是最好的候选高度
-    n_in = int((np.abs(hh - h0) < 0.5).sum())
-    if n_in > best_n: best_n, best_h = n_in, h0
-inl = np.abs(hh - best_h) < 0.5
-best_h = float(hh[inl].mean())                   # 用内点精修
+if len(pts):
+    hh = pts @ UP                                # 每个盒底沿"天"方向的高度
+    cand = np.sort(hh)
+    best_n, best_h = -1, float(np.median(hh))
+    for h0 in cand:                              # 盒底本身就是最好的候选高度
+        n_in = int((np.abs(hh - h0) < 0.5).sum())
+        if n_in > best_n: best_n, best_h = n_in, h0
+    inl = np.abs(hh - best_h) < 0.5
+    best_h = float(hh[inl].mean())               # 用内点精修
+else:
+    best_h = None                                # 没有物体时, 地面只能取壳或点云拟合值
 # ★★ 有房间壳的时候, 地面以**壳的地板**为准, 不用 ground_h。
 #   为什么翻过来(2026-09-20 office 实测):
 #     ground_h = -0.41, world_up.json 自己记着 "相机离地 0.222 m"、"内点比例 0.378"。
@@ -159,7 +193,7 @@ best_h = float(hh[inl].mean())                   # 用内点精修
 #   ★ 这只在有壳的时候成立(室内)。室外没有壳, 照旧用 ground_h ——
 #     室外马路是画面里最大的一块, 那次拟合本来就稳。
 _shell_h = None
-if ROOM_SHELL and os.path.exists(ROOM_SHELL):
+if ROOM_SHELL and SHELL_FLOOR and os.path.exists(ROOM_SHELL):
     try:
         _sh0 = trimesh.load(ROOM_SHELL, force="scene")
         for _nd in _sh0.graph.nodes_geometry:
@@ -171,14 +205,21 @@ if ROOM_SHELL and os.path.exists(ROOM_SHELL):
     except Exception as _e:
         print(f"[地面] 读不出房间壳的地板高度({_e}), 退回 ground_h")
 if _shell_h is not None:
-    print(f"[地面] 用房间壳的地板 {_shell_h:.2f} m "
-          f"(ground_h 给 {_gh:.2f} m, 但它记着相机离地只有 0.22 m、内点 38% —— 多半拟到桌面上了; "
-          f"盒底反推给 {best_h:.2f} m)")
+    if best_h is None:
+        print(f"[地面] 没有物体盒底, 用房间壳的地板 {_shell_h:.2f} m")
+    else:
+        print(f"[地面] 用房间壳的地板 {_shell_h:.2f} m "
+              f"(点云拟合 {_gh:.2f} m; 盒底反推 {best_h:.2f} m)")
     best_h = _shell_h
 elif _gh is not None:
-    print(f"[地面] 用点云拟合的高度 {_gh:.2f} m (盒底反推会给出 {best_h:.2f} m, 不用它)")
+    if best_h is None:
+        print(f"[地面] 没有物体盒底, 用点云拟合的高度 {_gh:.2f} m")
+    else:
+        print(f"[地面] 用点云拟合的高度 {_gh:.2f} m (盒底反推会给出 {best_h:.2f} m, 不用它)")
     best_h = float(_gh)
 else:
+    if best_h is None:
+        sys.exit("[失败] 没有物体盒底, 也没有房间壳地板或 world_up.ground_h, 无法确定地面高度")
     print(f"[地面] {len(pts)} 个盒底中 {int(inl.sum())} 个在地面上, "
           f"残差中位 {np.median(np.abs(hh[inl]-best_h)):.2f} m (水平面, 高度 {best_h:.2f} m)")
 
@@ -187,7 +228,8 @@ else:
 #   (office: table_0 量到 0.83~1.21 m, 厚 0.38 m, 悬在半空), 按这个高度缩 mesh 就是一张 38cm 高的
 #   迷你桌; 物理一看悬空, 整张扔到地上, 桌面从 1.2 m 掉到 0.35 m, 桌上的显示器杯子跟着掉。
 #   量到的桌面是准的(物理之前渲染回原镜头能对上), 该补的是被挡住的腿: 顶不动, 底放到地面。
-#   只补 VLM 说"立在地上"的类 (01_vlm_rest.json), 而且逐个实例再看两道:
+#   只补 VLM 说"立在地上"且类别确实可能有腿被遮挡的桌子/台面；
+#   光有落地标签不能拉长物体(挂墙衣架曾因此被拉成落地架)。逐个实例再看两道:
 #     1. 脚下已经有别的盒子托着(那个盒子的顶就在它底下 EXT_SUP_TOL 内, 它的中心落在那个盒子
 #        的水平范围里) -> 它是搁在上面的(桌上的盆栽), 不补。
 #     2. 补完的高度超过常识高度(01_vlm_sizes.json)的 EXT_MAX_RATIO 倍 -> 多半不是腿被挡住,
@@ -195,16 +237,17 @@ else:
 #   室外不给 FLOOR_EXTEND, 整段不走, 逐位不变 (室外靠 SNAP_GROUND 整体落地)。
 FLOOR_EXTEND = os.environ.get("FLOOR_EXTEND", "0") == "1"
 REST_P = os.environ.get("REST", "")
+_REST = json.load(open(REST_P)) if REST_P and os.path.exists(REST_P) else {}
+_HUNG = box_guards.hung_labels()
 # 补过地面的, 如果 mesh 自己也是照着"只看得到桌面"那张图生成的(矮桌, 高只有长的 0.24),
 # 按补完的高度等比缩会把桌面撑到 5 m 长 —— 这种改成"按量到的那截缩 + 腿往下拉到地面", 见摆放循环。
 FOOT_RATIO = float(os.environ.get("FOOT_RATIO", "1.5"))   # 等比缩完水平边超过量到的这么多倍 = mesh 是矮的
 LEG_KEEP = float(os.environ.get("LEG_KEEP", "0.2"))       # 拉腿时 mesh 顶上这一截(桌面)原样不变形
 _legged = []
-if FLOOR_EXTEND and REST_P and os.path.exists(REST_P):
+if FLOOR_EXTEND and _REST:
     EXT_MAX_RATIO = float(os.environ.get("EXT_MAX_RATIO", "2.0"))
     EXT_MIN = float(os.environ.get("EXT_MIN", "0.05"))           # 底离地不到这么多, 不用补
     EXT_SUP_TOL = float(os.environ.get("EXT_SUP_TOL", "0.15"))   # 托着它的顶面离它的底要这么近
-    _REST = json.load(open(REST_P))
     _szp = f"{ROOT}/01_vlm_sizes.json"; _REAL = json.load(open(_szp)) if os.path.exists(_szp) else {}
     _look = lambda d, w: d.get(w) if d.get(w) is not None else d.get(base_word(w))
     def _bot(b):
@@ -216,11 +259,10 @@ if FLOOR_EXTEND and REST_P and os.path.exists(REST_P):
         return c, a, np.cross(UP, a), b["尺寸"][0]/2, b["尺寸"][1]/2
     _all = [(w, b) for w, bs in boxes.items() if not (w in EXCLUDE or base_word(w) in EXCLUDE) for b in bs]
     # 人工改判成"挂着的"(HUNG_LABELS)压过 VLM: 垂到地面的灯管 VLM 会判成落地灯
-    _HUNG = box_guards.hung_labels()
     _ext, _no = [], []
     for w, b in _all:
         # ★ 哪些词算"立在地上"在 box_guards 里: 逐实例生成那步要用同一个判法决定"这个盒子量到的高度算不算数"
-        if not box_guards.rests_on_floor(w, _REST, _HUNG): continue
+        if not (box_guards.rests_on_floor(w, _REST, _HUNG) and box_guards.may_extend_legs(w)): continue
         bot = _bot(b); top = bot + b["尺寸"][2]; gap = bot - best_h
         if gap <= EXT_MIN: continue
         c0 = np.array(b["中心"], float); on = None
@@ -376,20 +418,33 @@ _snapped = []                    # 朝向被吸到房间网格上的: (词, 实�
 PICKS=json.load(open(f"{ROOT}/04_picks/picks.json"))
 # 这些类真实世界里本来就有大有小, 不统一 —— 树 0.66~4.84m 全压成 2.78m 会把大树压矮一半
 PER_INSTANCE=set(os.environ.get("PER_INSTANCE","tree").split(","))
-def one_scale(ext, me):
-    ext=np.array(ext)
-    return (np.sort(ext)[::-1][0]/max(np.sort(me)[::-1][0],1e-6)) if ext[2]<0.2 \
+ROAD_VEHICLES = {"car", "sedan", "suv", "taxi", "van", "minivan", "truck", "pickup truck", "bus", "vehicle", "automobile"}
+FOOTPRINT_SCALE_WORDS = {"bed", "bed frame"} | ROAD_VEHICLES  # 整床按占地量尺；床架可见栏杆高度不是整张床的高度
+
+def _bed_end_rail(ext, word):
+    """A thin bed-frame box measures the visible end rail, not the whole bed."""
+    ext = np.asarray(ext, float)
+    horizontal = np.sort(ext[:2])
+    return (base_word(word) == "bed frame" and horizontal[0] < 0.5
+            and horizontal[1] >= 3 * max(horizontal[0], 1e-6))
+
+def one_scale(ext, me, word=""):
+    ext=np.asarray(ext, float)
+    if _bed_end_rail(ext, word):
+        # The rail spans the bed's width. A generated whole-bed mesh has
+        # length > width > height, so match the rail to its middle extent.
+        return float(max(ext[:2]) / max(np.sort(np.asarray(me, float))[1], 1e-6))
+    return (np.sort(ext)[::-1][0]/max(np.sort(me)[::-1][0],1e-6)) if ext[2]<0.2 or base_word(word) in FOOTPRINT_SCALE_WORDS \
            else ext[2]/max(me[1],1e-6)
 
-def ruler(ext):
+def ruler(ext, word=""):
     """one_scale 实际拿哪个量去定尺寸。类内守卫必须比**这个**量, 不能比 ext.max()。
     ★ 为什么: 高度和最长边是两个量, 一个物体可以最长边只差 1.5 倍而高度差 5 倍
       (mask 横向漂移就是这个形状)。守卫要判的是"摆出来会不会大小离谱",
       那就必须比 one_scale 真正拿去算的那个量, 否则判的和发生的不是一回事。
-    ★ 注意: 守卫和中位数两处都要求 ext[2]>=0.2, 所以在守卫这条路上只会走 ext[2] 分支;
-      max 那半是给别的调用者留的(和 one_scale 保持同构)。"""
+    ★ 床架和高度不足 0.2 m 的盒子按最长边比较，和 one_scale 保持同构。"""
     ext=np.asarray(ext, float)
-    return float(np.max(ext)) if ext[2] < 0.2 else float(ext[2])
+    return float(np.max(ext)) if ext[2] < 0.2 or base_word(word) in FOOTPRINT_SCALE_WORDS else float(ext[2])
 
 # --- SAM3D 生成的 mesh 没有统一朝向 ---
 # 下面 R 的写法默认"mesh 的长轴在自己的 +Z 上", 但 SAM3D 并不保证这件事:
@@ -480,11 +535,11 @@ if YAW_SNAP:
     _GRID = _room_grid(ROOM_SHELL, UP)
 YAW_FIX    = os.environ.get("YAW_FIX","1")=="1"
 _yaw_n=[0,0]
-def yaw_to_z(m):
-    if not YAW_FIX: return np.eye(4)
+def yaw_to_z(m, *, measured_axes=False):
+    if not YAW_FIX and not measured_axes: return np.eye(4)
     V=m.vertices[:,[0,2]]                      # 只看水平面
     e=V.max(0)-V.min(0)
-    if max(e)/max(min(e),1e-6) < YAW_MIN_AR:
+    if not measured_axes and max(e)/max(min(e),1e-6) < YAW_MIN_AR:
         _yaw_n[1]+=1; return np.eye(4)         # 太方, 不动
     Q=V-V.mean(0); ev,W=np.linalg.eigh(Q.T@Q)
     a=W[:,np.argmax(ev)]                       # (x,z) 上的长轴
@@ -510,8 +565,8 @@ REL_MIN_N = int(os.environ.get("REL_MIN_N", "4"))   # 类内实例数不到这�
 #   垃圾盒子, 它们把中位数抬到 11.19 m —— 于是"和中位差 2.5 倍"判下来, 被拦掉的反而是
 #   2.89/3.35/3.98/4.01 这四根**唯一符合常识**的路灯, 12.63 那根倒留下了。方向整个是反的。
 #   剔掉垃圾之后中位变成 5.05 m, 拦的对象立刻翻转 —— 一行之差, 结论相反。
-def _abs_ok(b):
-    return box_guards.abs_ok(b["尺寸"])
+def _abs_ok(w, b):
+    return box_guards.abs_ok(b["尺寸"], min_h=box_guards.min_height_for(w, b["尺寸"], _REST, _HUNG))
 # ★ 只收 ext[2]>=0.2 的盒子进中位数。ruler 会按这个界在"最长边"和"高度"之间切换,
 #   而绝对守卫的下限是 MIN_H=0.15 —— 高度落在 [0.15,0.20) 的盒子会过绝对守卫却贡献最长边,
 #   和贡献高度的盒子混进同一个统计量, 两个量纲搅在一起。扁的那批也不判(它们本来就该被
@@ -519,7 +574,7 @@ def _abs_ok(b):
 CLASS_EXT_MED={}
 _by_base={}
 for _w,_bs in boxes.items():
-    _good=[ruler(b["尺寸"]) for b in _bs if _abs_ok(b) and b["尺寸"][2] >= 0.2]
+    _good=[ruler(b["尺寸"], _w) for b in _bs if _abs_ok(_w, b) and b["尺寸"][2] >= 0.2]
     if len(_good) >= REL_MIN_N:
         CLASS_EXT_MED[_w]=float(np.median(_good))
     _by_base.setdefault(base_word(_w), []).extend(_good)
@@ -539,7 +594,7 @@ for w,bs in boxes.items():
     mk=MESH.get(w)
     if mk is None: continue
     me=get_mesh(mk).extents
-    S=np.array([one_scale(b["尺寸"], me) for b in bs])
+    S=np.array([one_scale(b["尺寸"], me, w) for b in bs])
     keep=np.abs(np.log(S/np.median(S)))<np.log(2.0)        # 和中位差 2 倍以上 = 离群, 不参与
     dropped += int((~keep).sum())
     oid=PICKS.get(w,{}).get("obj_id")
@@ -564,6 +619,51 @@ for w,bs in boxes.items():
     print(f"  [{w:16s}] {len(bs):3d} 个 -> 统一 {CLASS_SCALE[w]*me.max():.2f} m  ({src})")
 print(f"  定基准时忽略了 {dropped} 个离群实例")
 
+_WL = None; _attached = []
+if ROOM_SHELL and WALL_ATTACH_WORDS:
+    _wj = os.path.splitext(ROOM_SHELL)[0] + "_墙线.json"
+    if os.path.exists(_wj):
+        _wd = json.load(open(_wj))
+        if "e1" in _wd:                                  # 只认 outdoor_walls.py 的格式(DA3 系的水平基); 室内房间壳的墙线在 z 朝上系, 不走这里
+            _WL = _wd
+            _cc = json.load(open(f"{ROOT}/02_da3/cameras.json"))["cameras"].values()
+            _CUV = np.array([[(-np.array(c["extrinsic_w2c_4x4"])[:3, :3].T @ np.array(c["extrinsic_w2c_4x4"])[:3, 3]) @ np.array(_wd[k]) for k in ("e1", "e2")] for c in _cc])
+
+
+def _wall_attach(m, w, b):
+    if _WL is None or w not in WALL_ATTACH_WORDS:
+        return m
+    e1, e2, up = (np.array(_WL[k], float) for k in ("e1", "e2", "up"))
+    ctr = m.bounds.mean(0); uv = np.array([ctr @ e1, ctr @ e2])
+    best = None
+    for sg in _WL["墙线"]:
+        a, q = np.array(sg["a"], float), np.array(sg["b"], float); L = float(np.linalg.norm(q - a)); d = (q - a) / L; n = np.array([-d[1], d[0]])
+        t = (uv - a) @ d
+        if -0.3 < t < L + 0.3:
+            off = float((uv - a) @ n)
+            if abs(off) <= 0.5 and (best is None or abs(off) < abs(best[0])): best = (off, a, d, n, sg)
+    if best is None:
+        return m
+    off0, a, d, n, sg = best
+    V = m.vertices; P2 = np.c_[V @ e1, V @ e2]
+    pc = np.linalg.svd(P2 - P2.mean(0), full_matrices=False)[2][0]
+    dd = d if pc @ d >= 0 else -d
+    ang = float(np.degrees(np.arctan2(pc[0] * dd[1] - pc[1] * dd[0], pc @ dd)))
+    if abs(ang) > 15:
+        return m
+    m.apply_transform(trimesh.transformations.rotation_matrix(np.radians(ang), up, point=ctr))
+    s = float(np.sign(np.median((_CUV - a) @ n)) or 1.0)                # 相机在墙的哪一侧: 门贴在这一侧
+    n3 = n[0] * e1 + n[1] * e2
+    o = (m.vertices - ctr) @ n3; th = float(o.max() - o.min())
+    if th > WALL_ATTACH_THICK:
+        m.vertices = m.vertices - np.outer(o * (1 - WALL_ATTACH_THICK / th), n3)
+    offv = (np.c_[m.vertices @ e1, m.vertices @ e2] - a) @ n
+    shift = sg["thick"] / 2 - float((s * offv).min())
+    m.apply_translation(s * shift * n3)
+    _attached.append((f"{w}#{b['obj_id']}", round(off0 * 100), round(th, 2), round(ang, 1)))
+    return m
+
+
 solo_used=0
 for w,bs in boxes.items():
     if w in EXCLUDE or base_word(w) in EXCLUDE or w in DEGENERATE: continue
@@ -571,6 +671,8 @@ for w,bs in boxes.items():
         # 人在闸口否掉的: 类名被否 = 整个词不要, 实例名被否 = 只这一个不要
         if _gen_name(w) in SKIP_NAMES or _gen_name(w, b["obj_id"]) in SKIP_NAMES:
             skipped.append((w,b["obj_id"],[],"人工否掉")); continue
+        if _gen_name(w, b["obj_id"]) in HELD_NAMES:
+            skipped.append((w,b["obj_id"],[],"被人拿着(不当静物摆, carry 步求每帧位姿)")); continue
         if (w, b["obj_id"]) in _DUP:
             skipped.append((w,b["obj_id"],[],f"重复: 和 {_DUP[(w, b['obj_id'])][0]} 是同一件")); continue
         # ★ VLM 否决只是提醒。没被人放行 -> 不摆; 放行了 -> 只许用它自己的 mesh
@@ -581,7 +683,7 @@ for w,bs in boxes.items():
         # ★ 绝对守卫只看盒子, 所以排在找 mesh 之前(2026-10-12 提上来的): 过不了它的盒子, 逐实例生成那步已经不生成了
         #   (gen_per_instance.py 用同一条规则先筛), 排在后面的话它们的原因会变成"没有 mesh", 查"为什么没进场景"时被带偏。
         ext=np.array(b["尺寸"])
-        if not box_guards.abs_ok(ext):
+        if not box_guards.abs_ok(ext, min_h=box_guards.min_height_for(w, ext, _REST, _HUNG)):
             skipped.append((w,b["obj_id"],ext.round(2).tolist(),"绝对")); continue
         mk=pick_mesh(w, b["obj_id"])
         if mk is None:
@@ -610,7 +712,7 @@ for w,bs in boxes.items():
         #   只限自缩放分支的话, 这两根照样摆进场景。
         _med=_med_of(w)
         if _med and ext[2] >= 0.2:
-            _dev = np.log(max(ruler(ext),1e-6)/_med)
+            _dev = np.log(max(ruler(ext, w),1e-6)/_med)
             # ★ 方向是不对称的, 这一点很关键:
             #   **偏大**  = mask 跨帧漂移 / 深度拖尾, 盒子被横着拉开 —— 这种盒子的中心也是错的,
             #             不管尺寸从哪来, 位置都不能要。beach 那两根 10.4 米的路灯就是:
@@ -623,12 +725,12 @@ for w,bs in boxes.items():
             if _dev > np.log(REL_N) or (_self_scaled and -_dev > np.log(REL_N)):
                 _why = "类内偏大(盒子横向拉开, 中心也不可信)" if _dev > 0 else "类内偏小"
                 skipped.append((w,b["obj_id"],
-                                f"{ruler(ext):.2f}m vs 类内中位 {_med:.2f}m", _why)); continue
+                                f"{ruler(ext, w):.2f}m vs 类内中位 {_med:.2f}m", _why)); continue
         m=get_mesh(mk); me=m.extents
         solo_used += (mk != MESH.get(w))
         me=m.extents
         if _self_scaled:                                 # 专属 mesh(8 辆车) 和树: 各按各的
-            s = one_scale(ext, me)
+            s = one_scale(ext, me, w)
         else:
             s = CLASS_SCALE.get(w)
             if s is None: continue
@@ -651,26 +753,58 @@ for w,bs in boxes.items():
         #   实测 office 2026-09-20 的 ventilation duct: 盒子 8.97x1.65x1.52(最长边 8.97 < 15,
         #   放行), 而 mesh 是根细管(归一化 0.105 x 0.087 x 1.0), 按高度 1.52 缩 = 17.5 倍,
         #   长轴被拉成 17.5 m, 飞到离场景中心 27 m 的地方, 一声不吭。
-        _placed = float(np.max(np.asarray(me, float) * s))
+        vehicle = base_word(w) in ROAD_VEHICLES
+        _placed = float(max(ext) if vehicle else np.max(np.asarray(me, float) * s))
         if _placed > MAX_D:
             skipped.append((w, b["obj_id"],
                             f"摆出来 {_placed:.1f}m > MAX_D={MAX_D} (盒子最长边才 {float(np.max(ext)):.1f}m, "
                             f"mesh 比例和盒子对不上)", "摆出来超上限")); continue
-        m.apply_scale(s)
-        m.apply_transform(yaw_to_z(m))                   # ★ 先把 mesh 自己的长轴摆到 +Z
+        if vehicle:
+            # The measured axes come from horizontal PCA, including for partially
+            # occluded vehicles. Use the same basis on the generated mesh.
+            m.apply_transform(yaw_to_z(m, measured_axes=True))
+            size = m.extents
+            if np.any(size <= 1e-6):
+                skipped.append((w,b["obj_id"],size.tolist(),"车体网格退化"))
+                continue
+            m.apply_scale(np.array([ext[1], ext[2], ext[0]]) / size)
+            m.apply_translation(-m.bounds.mean(0))
+        elif base_word(w) == "bed":
+            # 整床 mask 给出了长、宽和高度。生成的床常把纵深压短；
+            # 直接按高度等比缩会让床在地面上缩成约 1 米见方。
+            # 先把 mesh 长轴转到 Z，再按整床盒的三个尺寸校准。
+            m.apply_transform(yaw_to_z(m))
+            bed_me = np.maximum(m.extents, 1e-6)
+            bed_dims = [min(ext[:2]), ext[2], max(ext[:2])]
+            m.apply_scale(np.asarray(bed_dims) / bed_me)
+        else:
+            m.apply_scale(s)
+            m.apply_transform(yaw_to_z(m))               # ★ 先把 mesh 自己的长轴摆到 +Z
         fwd=np.array(b["长轴"]); fwd=fwd-UP*(fwd@UP); fwd/=np.linalg.norm(fwd)
         fwd, _sn = snap_yaw(fwd, w)
         if _sn > 0: _snapped.append((w, b["obj_id"], round(_sn)))
-        rgt=np.cross(UP,fwd)
-        R=np.eye(4); R[:3,0],R[:3,1],R[:3,2]=rgt,UP,fwd  # mesh X->右 Y->上 Z->前
+        _V = UP
+        if GV is not None:                               # 斜坡: 沿真竖直立, 朝向投到和它垂直的平面上
+            _V = GV; fwd = fwd - GV*(fwd@GV); fwd /= np.linalg.norm(fwd)
+        rgt=np.cross(_V,fwd)
+        R=np.eye(4); R[:3,0],R[:3,1],R[:3,2]=rgt,_V,fwd  # mesh X->右 Y->上 Z->前
         m.apply_transform(R)
         c=np.array(b["中心"])
         bottom=c-UP*ext[2]/2
         # ★ 强制落地: 盒子高度在俯视场景里量不准, 用它算出来的"底"有的悬空有的埋地。
         # 物体本来就该站在地上, 所以直接把底放到地面高度, 不信盒子自己算的。
         # 本该悬空的(雨篷/树冠/灯头)靠 FLOAT_WORDS 放过, 不参与强制落地。
-        if SNAP_GROUND and w not in FLOAT_WORDS:
-            bottom = bottom - UP*((bottom@UP) - best_h)
+        if SNAP_GROUND and w not in FLOAT_WORDS and not b.get("保留实测底高", False):
+            _gnd = float(_TER.height_at(c)[0]) if _TER is not None else best_h    # 有地形: 落到盒子正下方那块地形上
+            # ★ 2026-11-12 交付的地面是模型(平面 + 台阶 + 平台, terrain.GROUND_STYLE=plane_stairs*)时, 立在地上的物体落到这个模型上:
+            #   落到主镜头的查询高度表上和看得到的网格对不上 —— joker 路灯 3 底 2.59 m, 那里的台阶 5.42 m, 陷进去 2.8 m;
+            #   车陷进路面 0.2~0.45 m。挂在楼上的(消防梯)不在 GROUNDED 里, 照旧。
+            if _TER is not None and getattr(_TER, "model_mesh", False) and (w in terrain.GROUNDED or base_word(w) in terrain.GROUNDED):
+                # 取盒子中心 0.3 m 内交付地面的最高处: 只看中心, 路灯底座跨在两级台阶上时有 6% 的顶点插进高的那一级
+                _a = np.array(b["长轴"], float); _a = _a - UP*(_a@UP); _a /= max(np.linalg.norm(_a), 1e-9); _bb = np.cross(UP, _a)
+                _pts = np.array([c] + [c + 0.3*i*_a + 0.3*j*_bb for i in (-1, 0, 1) for j in (-1, 0, 1)])
+                _gnd = float(_TER.model_h(_pts).max())
+            bottom = bottom - UP*((bottom@UP) - _gnd)
         # 精确落地: 把 mesh 最低点对到盒底
         h_now=(m.vertices@UP); m.apply_translation(UP*((bottom@UP)-h_now.min()))
         if _legs:                                        # 拉腿: 底已在地面, 把顶拉到量到的桌面高度
@@ -681,12 +815,19 @@ for w,bs in boxes.items():
                 m.vertices=m.vertices+np.outer(nh-h, UP)
                 _legged.append((w, b["obj_id"], _legs[0], _legs[1], H0, T-lo))
         # 水平对中
-        d=c-m.bounds.mean(0); d=d-UP*(d@UP); m.apply_translation(d)
+        # Vehicle origin was centered in its measured-axis frame before rotation.
+        # A world-aligned bounding box can have a different center after yaw.
+        origin = np.zeros(3) if vehicle else m.bounds.mean(0)
+        d = c - origin
+        m.apply_translation(d - UP * (d @ UP))
         if FREE_TRIM and _fit_word(w):
             m = free_trim(m, b, w)
+        m = _wall_attach(m, w, b)
         scene.add_geometry(m, node_name=f"{w.replace(' ','_')}_{b['obj_id']}")
         n+=1
 
+if _attached:
+    print(f"[贴墙] {len(_attached)} 个贴到墙上(名字, 原来中心离墙 cm, 原厚 m, 转了度): {_attached}")
 if _trimmed:
     print(f"[按看到的空地缩] 查了 {len(_trimmed)} 个超出量到的盒子的方盒子家具 (沿它自己的 长/高/宽, 米):")
     for w, i, e0, e1, notes in _trimmed:
@@ -697,25 +838,32 @@ if _legged:
         print(f"    {w}#{i}: 等比缩会有 {f_:.2f} m 长 -> 按量到的桌面 {f0:.2f} m; 高 {h0:.2f} -> {h1:.2f} m")
 
 # --- 地面片: 覆盖所有物体的范围 (没有房间壳时才铺) ---
-allp=np.array([b["中心"] for bs in boxes.values() for b in bs])
-mn,mx=allp.min(0)-8, allp.max(0)+8
-gx=np.linspace(mn[0],mx[0],2); gz=np.linspace(mn[2],mx[2],2)
-# 平面上任取一点 = best_h*UP, 再沿两个与 UP 正交的方向铺开
-_e1 = np.array([1,0,0.]); _e1 = _e1 - UP*(_e1@UP)
-if np.linalg.norm(_e1) < 1e-6: _e1 = np.array([0,0,1.]) - UP*(np.array([0,0,1.])@UP)
-_e1 /= np.linalg.norm(_e1); _e2 = np.cross(UP,_e1)
-_ctr = allp.mean(0); _ctr = _ctr - UP*(_ctr@UP) + UP*best_h
-_r = float(np.abs((allp-_ctr) @ np.c_[_e1,_e2]).max()) + 8
-V=[_ctr + a*_r*_e1 + b*_r*_e2 for a in (-1,1) for b in (-1,1)]
-V=np.array(V); F=np.array([[0,1,3],[0,3,2]])
-ground=trimesh.Trimesh(V,F)
-# 单面渲染时法向朝哪边决定从哪边看得见。不校正的话从上往下看地面是隐形的,
-# 只有从地底下才看得见, 一眼像"没生成地面"。
-# 注意这里还在 DA3 世界系, 上 = UP = [0,-1,0], 也就是 -y;
-# 文件末尾的 FLIP 才把它翻成 glTF 约定的 +y。所以这里要让法向朝 -y。
-if float(ground.face_normals[0] @ UP) < 0: ground.faces = ground.faces[:, ::-1]
-ground.visual.face_colors=[130,130,135,255]
-if not ROOM_SHELL:
+if _TER is not None and (not ROOM_SHELL or not SHELL_FLOOR):
+    ground = _TER.mesh()
+    scene.add_geometry(ground, node_name="ground")
+    print(f"[地面] 地形网格 {len(ground.faces)} 面 <- {os.path.basename(TERRAIN_NPZ)} (不铺平面片)")
+elif not ROOM_SHELL or not SHELL_FLOOR:
+    allp=np.asarray([b["中心"] for bs in boxes.values() for b in bs], float).reshape(-1, 3)
+    if not len(allp):
+        cams=json.load(open(_cj)).get("cameras", {}) if os.path.exists(_cj) else {}
+        allp=np.asarray([c["camera_center_world"] for c in cams.values()
+                         if c.get("camera_center_world") is not None], float).reshape(-1, 3)
+        if not len(allp):
+            sys.exit("[失败] 没有物体盒子和相机中心, 无法确定地面片范围")
+        print(f"[地面] 没有物体盒子, 按 {len(allp)} 帧相机轨迹铺地面片")
+    # 平面上任取一点 = best_h*UP, 再沿两个与 UP 正交的方向铺开
+    _e1 = np.array([1,0,0.]); _e1 = _e1 - UP*(_e1@UP)
+    if np.linalg.norm(_e1) < 1e-6: _e1 = np.array([0,0,1.]) - UP*(np.array([0,0,1.])@UP)
+    _e1 /= np.linalg.norm(_e1); _e2 = np.cross(UP,_e1)
+    _ctr = allp.mean(0); _ctr = _ctr - UP*(_ctr@UP) + UP*best_h
+    _r = float(np.abs((allp-_ctr) @ np.c_[_e1,_e2]).max()) + 8
+    V=[_ctr + a*_r*_e1 + b*_r*_e2 for a in (-1,1) for b in (-1,1)]
+    V=np.array(V); F=np.array([[0,1,3],[0,3,2]])
+    ground=trimesh.Trimesh(V,F)
+    # 单面渲染时法向朝哪边决定从哪边看得见。不校正的话从上往下看地面是隐形的,
+    # 只有从地底下才看得见, 一眼像"没生成地面"。
+    if float(ground.face_normals[0] @ UP) < 0: ground.faces = ground.faces[:, ::-1]
+    ground.visual.face_colors=[130,130,135,255]
     scene.add_geometry(ground,node_name="ground")
 else:
     print(f"[地面] 用房间壳代替大方片: {os.path.basename(ROOM_SHELL)}")
@@ -735,7 +883,8 @@ else:
 from world_frame import deviation_deg
 FLIP = export_T(UP)
 print(f"[转正] 把真实的天转到 +y, 相对老写法差 {deviation_deg(UP):.1f}°")
-scene.apply_transform(FLIP)
+if scene.geometry:                           # 只有房间壳、没有物体时, 壳要在下面才并进来
+    scene.apply_transform(FLIP)
 
 # --- 房间壳: FLIP 之后并进来 (它自己已经是最终 glTF 系) ---
 nw=0; npl=0
@@ -759,7 +908,9 @@ if ROOM_SHELL:
         if node == "floor":
             _T,_gn = shl.graph[node]; _g = shl.geometry[_gn].copy(); _g.apply_transform(_T)
             _fl = float(np.median(_g.vertices[:, 1])); break
-    if _fl is None:
+    if _fl is None and not SHELL_FLOOR:
+        pass                                             # 室外墙(outdoor_walls.py)本来就没有地板, 墙已按 ground_h 盖好
+    elif _fl is None:
         print("[房间壳] ★ 壳里找不到 floor 节点, 没法对齐地面 —— 按原高度并入, "
               "物体可能悬空或陷进地板。去看 room_shell.py 的节点命名。")
     else:
@@ -770,6 +921,8 @@ if ROOM_SHELL:
         elif abs(_dy) > 1e-6:
             print(f"[房间壳] 壳整体平移 {_dy:+.2f} m: 地板 {_fl:+.2f} -> {best_h:+.2f} m (物体站的高度)")
     for node in shl.graph.nodes_geometry:
+        if node == "floor" and not SHELL_FLOOR:
+            continue                                     # 室外墙: 地板交给地面(平面片 / 地形), 壳的地板只拿来对齐高度
         T,gn=shl.graph[node]; g=shl.geometry[gn].copy(); g.apply_transform(T)
         if _dy: g.apply_translation([0.0, _dy, 0.0])
         # 节点名要保住 floor / wall_N —— 下游 scene_phys 靠名字区分"地面/静态墙/可动物体"

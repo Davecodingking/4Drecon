@@ -52,6 +52,17 @@ def focal_of(cam_json):
     return float(np.median([np.array(v["intrinsic_3x3"])[1][1] / v["input_hw"][0] for v in cams.values()]))
 
 
+def focal_sig(cam_json):
+    """逐帧焦距的指纹(2026-11-10 起出网格每帧用自己的焦距): 中位数没变、某几帧变了也算过期。没给场景相机 = None。"""
+    if not cam_json:
+        return None
+    cams = json.load(open(cam_json))["cameras"]
+    h = hashlib.blake2b(digest_size=8)
+    for k in sorted(cams):
+        v = cams[k]; h.update(f"{k}:{np.array(v['intrinsic_3x3'])[1][1] / v['input_hw'][0]:.6f};".encode())
+    return h.hexdigest()
+
+
 def code_sig(b4d):
     h = hashlib.blake2b(digest_size=8)
     for rel in CODE:

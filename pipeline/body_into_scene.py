@@ -50,13 +50,103 @@ H_MIN, H_MAX = 1.40, 2.00
 RATIO_TOL = 0.25
 
 
+# ------------------------------------------------------------------ 地面高度
+# ★ 2026-11-11 地形网格(terrain.py, GROUND_MODE=terrain): 楼梯 / 台阶上地面不是一个高度。load_scene 看到
+#   <r1>/07_terrain.npz 就装上, 之后"脚离地"一律按脚下那块地形量(clearance); 没有这个文件 = 和以前一样减 GH。
+TERRAIN = None
+WALLS = None        # 室外墙(outdoor_walls.py 的 09_房间壳_墙线.json): [(a, d, n, L, h, 厚, e1, e2, gh)], load_scene 装; 没有 = 不管墙
+
+
+def wall_push(Wf, UP, margin=0.01, band=0.6, C=None):
+    """人不穿墙: Wf (T,N,3) 每帧的人(已经摆好), 返回每帧要整体加的平移 (T,3) 和被推的帧数。
+    每面墙: 沿墙 0~L、离地 0~h 范围里, 离墙线 band 以内的顶点 -> 人在相机那一侧(C: 每帧相机中心, 拍得到人 = 人在相机这边;
+    不给 C 才退回"大多数顶点在哪侧") -> 越过近侧墙面的最深处推回来(+margin)。
+    ★ 按顶点多数定侧的版本: 人一半已经穿进去时选错边, singin 第 198 / 614 / 642 帧把人推到了墙后面。
+    只推不拉: 离墙远的帧一点不动。"""
+    T = len(Wf); push = np.zeros((T, 3)); hit = 0
+    if WALLS is None:
+        return push, 0
+    sub_ = np.asarray(Wf)[:, ::7]
+    for k in range(T):
+        V = sub_[k]
+        for a, d, n, L, h, th, e1, e2, gh in WALLS:
+            uv = np.c_[V @ e1, V @ e2]; hh = V @ UP - gh; r = uv - a; t = r @ d; o = r @ n
+            m = (t > 0) & (t < L) & (hh > 0) & (hh < h) & (np.abs(o) < band)
+            ray = None
+            if C is not None:
+                cuv = np.array([C[k] @ e1, C[k] @ e2]); oc = float((cuv - a) @ n)
+                side = 1.0 if oc >= 0 else -1.0
+                # 视线(相机 -> 人的中心)穿过这面墙吗: 两端在墙线两侧, 交点落在墙段内、墙高以内
+                pc = V.mean(0); puv = np.array([pc @ e1, pc @ e2]); op = float((puv - a) @ n)
+                if op * oc < 0:
+                    f_ = oc / (oc - op); xuv = cuv + f_ * (puv - cuv); tx = float((xuv - a) @ d)
+                    hx = float((C[k] + f_ * (pc - C[k])) @ UP - gh)
+                    if 0 < tx < L and 0 < hx < h:
+                        m = (t > 0) & (t < L) & (hh > 0) & (hh < h) & (o * side < band)   # 墙后的顶点不管多深都算
+                        ray = (C[k] - pc) / np.linalg.norm(C[k] - pc)                    # 人被挡在墙后: 沿视线拉向相机
+            else:
+                side = 1.0 if (m.any() and np.median(o[m]) >= 0) else -1.0
+            if m.sum() < 10:
+                continue
+            need = th / 2 + margin - float((o[m] * side).min())     # 近侧墙面在 side*th/2; 顶点越过它多少
+            if need > margin:
+                n3 = n[0] * e1 + n[1] * e2
+                if ray is not None and abs(float(ray @ n3)) > 0.2:
+                    push[k] += ray * need / abs(float(ray @ n3))       # 沿视线挪, 墙法向上的分量正好是 need
+                else:
+                    push[k] += side * need * n3
+                hit += 1
+    return push, hit
+
+
+def clearance(V, UP, GH, vf=None):
+    """网格 V (N,3) 离地多高: 最低处到它脚下地面的高度。没有地形 = V@UP 的最小值 - GH(老算法, 逐位不变)。
+    vf: 这一帧的原视频帧号。地形是分镜头建的(各镜头的深度对不齐, 合在一起出尖刺), 按帧号找它那个镜头的地形。"""
+    h = np.asarray(V) @ UP
+    if TERRAIN is None:
+        return float(h.min() - GH)
+    return float((h - TERRAIN.height_at(V, vf=vf)).min())
+
+
 # ------------------------------------------------------------------ 读
-def load_scene(r1):
-    """读场景这一半: 相机、天、帧号映射。"""
+_DENSE_BAD = set()     # load_scene(dense=True) 读到的插值帧里的坏相机; load_badcam 并进去
+
+
+def load_scene(r1, dense=False):
+    """读场景这一半: 相机、天、帧号映射。有 07_terrain.npz 就顺带装上地形(见 clearance)。
+    dense=True 且有 02_da3/dense/(人体全帧, 见 dense_cams.py): 相机和帧号映射用那一份(场景的键原样 + 插出来的中间帧);
+    深度、切点、天照旧读 02_da3(插出来的帧没有深度, 量远近的地方本来就跳过没深度的帧)。"""
+    global TERRAIN, _DENSE_BAD
     da3 = f"{r1}/02_da3" if os.path.isdir(f"{r1}/02_da3") else f"{r1}/02_DA3点云"
     cams = json.load(open(f"{da3}/cameras.json"))["cameras"]
+    _DENSE_BAD = set()
+    _dd = f"{da3}/dense"
+    if dense and os.path.exists(f"{_dd}/cameras.json"):
+        cams = json.load(open(f"{_dd}/cameras.json"))["cameras"]
+        _DENSE_BAD = set(json.load(open(f"{_dd}/bad_frames.json")).get("坏帧", []))
     UP, GH, _ = load_up(da3, "人体入场")
+    global WALLS
+    _wj = f"{r1}/09_房间壳_墙线.json"
+    WALLS = None
+    if os.path.exists(_wj):
+        _w = json.load(open(_wj))
+        if "e1" in _w:                                       # 只认室外墙的格式(DA3 系的水平基); 室内房间壳另有物理那步管
+            _e1, _e2 = np.array(_w["e1"], float), np.array(_w["e2"], float)
+            WALLS = []
+            for s_ in _w["墙线"]:
+                _a, _b = np.array(s_["a"], float), np.array(s_["b"], float); _L = float(np.linalg.norm(_b - _a)); _d = (_b - _a) / _L
+                WALLS.append((_a, _d, np.array([-_d[1], _d[0]]), _L, float(s_["h"]), float(s_["thick"]), _e1, _e2, float(_w["ground_h"])))
+            print(f"[墙] 摆人时人不穿墙: {len(WALLS)} 面室外墙 <- {_wj}")
+    _tp = f"{r1}/07_terrain.npz"
+    if os.path.exists(_tp):
+        import terrain
+        TERRAIN = terrain.Terrain(_tp)
+        print(f"[地形] 贴地按 {_tp} 的地形高度, 不用一个高度 {GH:.2f}")
+    else:
+        TERRAIN = None
     fmap = load_frame_map(da3)                      # {帧文件名: 原视频帧号}
+    if dense and os.path.exists(f"{_dd}/frame_map.json"):
+        fmap = json.load(open(f"{_dd}/frame_map.json"))["frames"]
     vid2key = {v: k for k, v in fmap.items()}       # 反过来: 原视频帧号 -> 相机的键
     return da3, cams, np.asarray(UP, float), float(GH), vid2key
 
@@ -93,7 +183,48 @@ FOOT_BAND = 0.6      # 走过的路线只取离地这么高以内的点: 脚和�
                      # 手臂伸到桌面上方不算占路, 否则人一靠近桌子就把桌子推走
 
 
-def identity_tracks(run, da3, cams, vid2key, kept, fps):
+def identity_depth_ratios(bis, measured, roots, cams, vid2key, kept, fps):
+    """Use the camera interpolation endpoints as depth anchors for this track."""
+    result = measured.copy()
+    anchors = {vid2key[kept[b]]: b for b in measured}
+    for b in bis:
+        info = cams[vid2key[kept[b]]].get("插值")
+        if b in measured or not info or info.get("镜头外借来的"):
+            continue
+        i, j = anchors.get(info["前"]), anchors.get(info["后"])
+        if i is None and j is None:
+            continue
+        # Either endpoint may be missing when someone enters or exits the shot.
+        i = j if i is None else i
+        j = i if j is None else j
+        if max(abs(kept[k] - kept[b]) for k in (i, j)) / fps > people_identity.GAP_S:
+            continue
+        z0, z1 = measured[i] * roots[i][2], measured[j] * roots[j][2]
+        weight = float(info["w"])
+        # Do not turn an abrupt switch between depth layers into a smooth walk.
+        elapsed = abs(kept[j] - kept[i]) / fps
+        if abs(z1 - z0) > max(people_identity.JUMP_M, people_identity.JUMP_V * elapsed):
+            weight = float(weight >= 0.5)
+        depth = (1 - weight) * z0 + weight * z1
+        if np.isfinite(depth) and depth > 0 and roots[b][2] > 0:
+            result[b] = depth / roots[b][2]
+    return result
+
+
+def isolated_mask_pair(previous, current, pid):
+    """Can a depth-only jump be checked without ambiguity about who is visible?"""
+    masks = []
+    for labels in (previous, current):
+        ids, counts = np.unique(labels, return_counts=True)
+        visible = ids[(ids != 0) & (counts >= FRAG_ABS * labels.size)]
+        if visible.tolist() != [int(pid)]:
+            return False
+        masks.append(labels == int(pid))
+    intersection = np.count_nonzero(masks[0] & masks[1])
+    return intersection > 0.5 * np.count_nonzero(masks[0] | masks[1])
+
+
+def identity_tracks(run, da3, cams, vid2key, kept, fps, depth_checks=None):
     """核对身份要的东西: 跟踪的每个编号、每个出了网格的帧在房间里的位置 {编号: {帧: (秒, 世界坐标)}}。
     位置 = 模型给的根平移按场景深度校正远近(这一帧量到了用这一帧的比例, 没量到用这个编号的中位数), 再用相机位姿放进世界。"""
     roots = load_roots(run)
@@ -107,11 +238,116 @@ def identity_tracks(run, da3, cams, vid2key, kept, fps):
     out = {}
     for pid, (bis, ratios) in todo.items():
         r_own = float(np.median(list(ratios.values()))) if ratios else r_all
+        alternate = (identity_depth_ratios(bis, ratios, roots[pid], cams, vid2key, kept, fps)
+                     if depth_checks is not None else {})
+        if depth_checks is not None:
+            depth_checks[pid] = {}
         out[pid] = {}
         for b in bis:
             c2w = np.linalg.inv(np.array(cams[vid2key[kept[b]]]["extrinsic_w2c_4x4"], float))
+            if b in alternate:
+                point = alternate[b] * roots[pid][b] @ c2w[:3, :3].T + c2w[:3, 3]
+                depth_checks[pid][b] = (point, b not in ratios)
             out[pid][b] = (kept[b] / fps, ratios.get(b, r_own) * roots[pid][b] @ c2w[:3, :3].T + c2w[:3, 3])
     return out
+
+
+FRAG_ABS = 0.001   # 一帧里这个编号的 mask 不到画面的 0.1% -> 碎片
+FRAG_REL = 0.10    # 或者不到他前后 FRAG_WIN 秒里 80 分位面积的 10% -> 被挡得只剩一条, 多半已经不是他
+FRAG_WIN = 1.0     # 秒
+# ★ 2026-11-06 goodfellas_tray 人 4 / stepup3d_scooter 人 5: 人出画或被挡住后, 跟踪把编号挂到别人身上的一小条
+#   (画面的 0.001~0.7%, 他平时 1~15%); SAM 3D Body 拿这一小条照样出一个完整的人 —— 人群里凭空站出一个人、
+#   画面边上闪一下。真人逐帧面积是慢慢变的(走远了也是), 突然缩到一成以下的帧不出人。
+
+
+def fragment_frames(run, kept, fps):
+    """每个编号里"碎片"的帧 {编号: [帧号]}(见 FRAG_*)。读 <run>/masks(像素值 = 编号)。"""
+    from PIL import Image
+    area = {}
+    for f in sorted(os.listdir(f"{run}/masks")):
+        b = int(os.path.splitext(f)[0])
+        m = np.array(Image.open(f"{run}/masks/{f}"))
+        cnt = np.bincount(m.ravel())
+        for pid in np.nonzero(cnt)[0]:
+            if pid:
+                area.setdefault(str(pid), {})[b] = cnt[pid] / m.size
+    out = {}
+    for pid, a in area.items():
+        bs = sorted(a)
+        t = np.array([kept[b] / fps if b < len(kept) else b / fps for b in bs]); v = np.array([a[b] for b in bs])
+        bad = []
+        for i, b in enumerate(bs):
+            ref = np.percentile(v[np.abs(t - t[i]) <= FRAG_WIN], 80)
+            if v[i] < FRAG_ABS or v[i] < FRAG_REL * ref:
+                bad.append(b)
+        if bad:
+            out[pid] = bad
+    return out
+
+
+TINY_MAX_FRAMES = 5   # ★ 2026-11-11 核对完的人: 帧数不超过这么多、
+TINY_MAX_S = 1.0      #   露的时间不到这么久(秒)、
+TINY_AREA = 0.005     #   掩码面积中位不到画面的这么多 -> 远处的小东西被认成了人(joker 墙头的植物 0.32%、jw4 头上的红斑 0.21%)
+#   真人里帧少的掩码都 >= 0.67%(nfl1 人 8 片尾 3 帧), 掩码小的都出现 90 帧以上(pedestrian、nfl1 远处的人)。数字见 scout_1110/问题记录_jw_1111.md
+
+
+def tiny_people(run, who, kept, fps):
+    """核对完的人里"几帧、很小"的误检 {人: 诊断}(见 TINY_*)。who: people_identity.resolve 的结果; 读 <run>/masks(像素值 = 编号)。"""
+    from PIL import Image
+    out = {}
+    for pid, items in who.items():
+        if len(items) > TINY_MAX_FRAMES:
+            continue
+        bs = [int(b) for _, b in items]
+        dur = (kept[max(bs)] - kept[min(bs)]) / fps if max(bs) < len(kept) else 0.0
+        if dur >= TINY_MAX_S:
+            continue
+        areas = []
+        for rid, b in items:
+            p = f"{run}/masks/{int(b):08d}.png"
+            if os.path.exists(p):
+                m = np.array(Image.open(p)); areas.append(float((m == int(rid)).mean()))
+        a = float(np.median(areas)) if areas else 0.0
+        if a < TINY_AREA:
+            out[pid] = dict(帧=len(items), 秒=round(dur, 2), 掩码面积中位_pct=round(a * 100, 3))
+    return out
+
+
+def feet_mask_frac(W, bis, pid, mesh_run, cams, vid2key, kept, feet_idx):
+    """每帧: 脚的顶点投到画面上, (落在画面里的比例, 落在他自己 mask(外扩 2%)上的比例)。没有 mask 文件 / mask 里没有他 = (nan, nan)。
+    feet_visible 和 body_motion.leg_offmask_runs 都用它(2026-11-11 拆出来, feet_visible 的结果逐位不变)。"""
+    import cv2
+    from PIL import Image
+    inf = np.full(len(bis), np.nan); onm = np.full(len(bis), np.nan)
+    for i, bi in enumerate(bis):
+        mp = f"{mesh_run}/masks/{bi:08d}.png"
+        if not os.path.exists(mp):
+            continue
+        own = (np.array(Image.open(mp)) == int(pid)).astype(np.uint8)
+        if not own.any():
+            continue
+        H, W_ = own.shape
+        r = max(3, int(0.02 * max(H, W_)))
+        own = cv2.dilate(own, np.ones((2 * r + 1, 2 * r + 1), np.uint8)) > 0
+        c = cams[vid2key[kept[bi]]]
+        h, w = c["input_hw"]
+        K = np.diag([W_ / w, H / h, 1.0]) @ np.array(c["intrinsic_3x3"], float)
+        w2c = np.array(c["extrinsic_w2c_4x4"], float).reshape(4, 4)
+        X = W[i][feet_idx] @ w2c[:3, :3].T + w2c[:3, 3]
+        uv = X @ K.T
+        u, v = uv[:, 0] / np.maximum(uv[:, 2], 1e-6), uv[:, 1] / np.maximum(uv[:, 2], 1e-6)
+        inside = (X[:, 2] > 0.05) & (u >= 0) & (u < W_) & (v >= 0) & (v < H)
+        hit = np.zeros(len(u), bool)
+        hit[inside] = own[v[inside].astype(int), u[inside].astype(int)]
+        inf[i], onm[i] = inside.mean(), hit.mean()
+    return inf, onm
+
+
+def feet_visible(W, bis, pid, mesh_run, cams, vid2key, kept, feet_idx, need=0.3):
+    """每帧这个人的脚在画面里看不看得到: 脚的顶点投到画面上, 至少 need 的比例落在画面里、而且落在他自己的 mask(外扩 2%)上。
+    W: 世界系顶点(和 bis 同顺序)。看不到的帧(腿出画 / 被挡)脚的位置是模型猜的, 不能拿来判腾空(见 tidy_track)。"""
+    _, onm = feet_mask_frac(W, bis, pid, mesh_run, cams, vid2key, kept, feet_idx)
+    return np.nan_to_num(onm, nan=0.0) >= need
 
 
 def load_roots(mesh_run):
@@ -221,10 +457,165 @@ def pelvis_rots(Ws):
     return [_kabsch(P["rest_pelvis"], W[P["pelvis"]]) for W in Ws]
 
 
-def flip_segments(rots, t=None, rate=FLIP_RATE, min_run=MIN_RUN_S):
+# ------------------------------------------------------------------ 切镜头 (2026-11-10)
+# ★ 摆人的时间平滑(位置 / 姿势 / 远近)以前把整段当一个连续镜头。切镜头的片子在切点两边是两个机位,
+#   平滑跨过切点就把两个镜头里的位置拉到一起: hitch_cuts_indoor r1 切点前后几帧投回原图偏 57~76 px(不切点的帧 10~30 px)。
+#   相机位姿被判坏的帧(bad_frames.json)也一样: 那几帧的相机是错的, 人在世界里的位置跟着错, 再和前后平滑就更错 ——
+#   投回原图偏 100~330 px。做法: 时间轴在切点、坏相机段的边界上拉开 SHOT_GAP 秒, 所有按时间的平滑自然不跨段;
+#   坏相机的帧再保留模型自己的结果(不平滑、不贴地), 用同一个(错的)相机投回去和原图对得上。
+FFMPEG = os.path.expanduser("~/miniforge3/envs/cari4d/bin/ffmpeg")
+SCDET_THR = 12              # 老判据(2026-11-10 起): scdet 分数 >= 12 就是切点。只剩"读老缓存"和"DINOv2 用不了时退回"两处用
+# ★ 2026-11-11 新判据(CUT_METHOD): scdet 只出候选(>= CUT_SCDET_MIN), 再用 DINOv2 比切点前后两帧画面内容像不像:
+#   切点 = (scdet >= 4, 内容差 d >= 0.10, 而且 d 是前后各 4 帧里最大那个的 3 倍以上: 孤零零的一跳)
+#        或 (scdet >= 5, d >= 0.25: 打斗里前后帧本来就乱, 不要求孤立, 但内容得真换了)。
+#   d = 1 - 两帧 DINOv2(ViT-S/14) 全图特征的余弦相似度。人眼逐个核过 20 段视频(scout_1110/jw_fix/cut_rule.py, cuts_*.jpg):
+#   老判据漏 jw1 8 个切点里的 7 个(片子调成暗青色, scdet 只有 5~9)、jw4 3 个全漏、irish 漏 2、joker 漏 6.71 s、spl 漏 15.85 s,
+#   又把 timesquare 镜头晃(9 处, d 只有 0.03~0.06)、moose 19.9 s 人快动(d 0.07)当成切点; 新判据这些全对, 其余 13 段一个没多。
+#   漏切点的后果: 相机平滑跨镜头(jw1 相机被挪 21.5 cm / 1.9°, 按真切点平滑只挪 8.5 cm / 1.0°, 人对原图偏移 8.4% -> 6.8% 身高)、
+#   摆人平滑跨镜头、核对身份拿两个镜头里对不齐的位置比。
+CUT_METHOD = "scdet4+dinov2s_1111"
+CUT_SCDET_MIN, CUT_D_MIN, CUT_ISO, CUT_SCDET_BUSY, CUT_D_BUSY = 4.0, 0.10, 3.0, 5.0, 0.25
+DINO_HUB = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov2_main")   # 本机缓存的代码 + 权重, 不联网
+SHOT_GAP = 1000.0           # 段与段之间拉开的秒数: 远大于任何平滑窗口
+
+
+def shot_cuts(da3):
+    """原视频的切点(秒, 升序)。ffmpeg scdet, 结果缓存在 <da3>/shot_cuts.json(视频路径 + 大小 + mtime 对上才用缓存)。
+    找不到视频 / ffmpeg 就返回 [](当一镜到底, 和以前一样), 并说出来。"""
+    import subprocess, re
+    try:
+        video = json.load(open(f"{da3}/frame_map.json")).get("video")
+    except (OSError, ValueError):
+        video = None
+    if not video or not os.path.exists(video) or not os.path.exists(FFMPEG):
+        print(f"  [切镜头] 找不到原视频或 ffmpeg({video}), 当一镜到底", flush=True)
+        return []
+    st = os.stat(video); key = dict(video=video, size=st.st_size, mtime=st.st_mtime)
+    cache = f"{da3}/shot_cuts.json"
+    try:
+        c = json.load(open(cache))
+        if all(c.get(k) == v for k, v in key.items()):
+            if c.get("method") == CUT_METHOD:
+                return c["cuts"]
+            if "method" not in c and c.get("thr") == SCDET_THR:     # 老判据算的缓存: 照旧认, 不悄悄改镜头划分
+                print(f"  [切镜头] 用的是老判据(scdet >= {SCDET_THR})算的切点缓存; 要按新判据重算, 删掉 {cache}", flush=True)
+                return c["cuts"]
+    except (OSError, ValueError):
+        pass
+    log = subprocess.run([FFMPEG, "-hide_banner", "-nostats", "-i", video, "-vf", f"scale=320:-2,scdet=threshold={CUT_SCDET_MIN}",
+                          "-an", "-f", "null", "-"], capture_output=True, text=True, errors="ignore").stderr
+    cand = [(float(t), float(sc)) for sc, t in re.findall(r"lavfi.scd.score: ([0-9.]+), lavfi.scd.time: ([0-9.]+)", log)]
+    try:
+        cuts, rows = _cuts_by_content(video, cand)
+        meta = dict(method=CUT_METHOD, 候选=rows)
+    except Exception as e:                                            # DINOv2 用不了: 退回老判据, 说出来
+        print(f"  [切镜头] DINOv2 复核用不了({type(e).__name__}: {e}), 退回老判据 scdet >= {SCDET_THR}", flush=True)
+        cuts = sorted(t for t, sc in cand if sc >= SCDET_THR)
+        meta = dict(thr=SCDET_THR)
+    json.dump(dict(key, cuts=cuts, **meta), open(cache, "w"), ensure_ascii=False, indent=1)
+    return cuts
+
+
+def _cuts_by_content(video, cand):
+    """scdet 候选 [(秒, 分数)] -> (切点秒列表, 每个候选的记录)。只解码候选前后各 5 帧, ViT-S 在 GPU 上一段视频几秒。"""
+    import cv2, torch
+    cap = cv2.VideoCapture(video); fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    sc = {}
+    for t, v in cand:
+        k = int(round(t * fps)); sc[k] = max(sc.get(k, 0.0), v)
+    need = {j for k in sc for j in range(k - 5, k + 5) if j >= 0}
+    frames, i = {}, 0
+    while need and i <= max(need):
+        ok, im = cap.read()
+        if not ok:
+            break
+        if i in need:
+            frames[i] = cv2.resize(cv2.cvtColor(im, cv2.COLOR_BGR2RGB), (224, 126))
+        i += 1
+    if not sc:
+        return [], []
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    m = torch.hub.load(DINO_HUB, "dinov2_vits14", source="local", verbose=False).to(dev).eval()
+    mean = torch.tensor([0.485, 0.456, 0.406], device=dev)[:, None, None]; std = torch.tensor([0.229, 0.224, 0.225], device=dev)[:, None, None]
+    ks = sorted(frames); feat = {}
+    with torch.no_grad():
+        for a in range(0, len(ks), 64):
+            b = torch.from_numpy(np.stack([frames[k] for k in ks[a:a + 64]])).to(dev).permute(0, 3, 1, 2).float() / 255
+            b = torch.nn.functional.interpolate(b, size=(224, 392), mode="bilinear", align_corners=False)
+            for k, f in zip(ks[a:a + 64], torch.nn.functional.normalize(m((b - mean) / std), dim=1).cpu().numpy()):
+                feat[k] = f
+    D = lambda k: (1.0 - float(feat[k] @ feat[k - 1])) if (k in feat and k - 1 in feat) else 0.0
+    cuts, rows = [], []
+    for k, v in sorted(sc.items()):
+        d = D(k); nb = max([D(j) for j in list(range(k - 4, k)) + list(range(k + 1, k + 5))] + [0.01])
+        yes = (v >= CUT_SCDET_MIN and d >= CUT_D_MIN and d / nb >= CUT_ISO) or (v >= CUT_SCDET_BUSY and d >= CUT_D_BUSY)
+        rows.append(dict(秒=round(k / fps, 3), scdet=round(v, 1), 内容差=round(d, 3), 孤立倍数=round(d / nb, 1), 切点=bool(yes)))
+        if yes:
+            cuts.append(round(k / fps, 6))
+    return cuts, rows
+
+
+def time_segments(vf, fps, cuts, badcam):
+    """逐帧的段号(和 vf 同顺序): 切点处换段; 坏相机的帧连成的一串单独成段。vf 原视频帧号, fps 原视频帧率。"""
+    t = np.asarray(vf, float) / fps
+    shot = np.searchsorted(np.asarray(cuts, float), t + 1e-3, side="right")
+    bad = np.asarray(badcam, bool)
+    seg = np.zeros(len(t), int)
+    for i in range(1, len(t)):
+        seg[i] = seg[i - 1] + int(shot[i] != shot[i - 1] or bad[i] != bad[i - 1])
+    return seg
+
+
+def load_badcam(da3):
+    """相机位姿被判坏的帧(相机的键, 如 0060.jpg)。没有这份文件 = 都是好的。"""
+    try:
+        return set(json.load(open(f"{da3}/bad_frames.json")).get("坏帧", [])) | _DENSE_BAD
+    except (OSError, ValueError):
+        return set(_DENSE_BAD)
+
+
+def _continues_turn(rotations, start, end):
+    """A single speed threshold crossing can occur inside a real turn.
+
+    Preserve a one-sided run when it joins its only anchor in the direction
+    of sustained rotation. Isolated flips or reversals lack this evidence.
+    """
+    from scipy.spatial.transform import Rotation
+    if (start != 0 and end != len(rotations)-1) or end-start < 2:
+        return False
+    lo = max(0, start-1)
+    hi = min(len(rotations), end+2)
+    q = Rotation.from_matrix(np.asarray(rotations[lo:hi]))
+    increments = (q[1:]*q[:-1].inv()).as_rotvec()
+    boundary, inside = (increments[-1],increments[:-1]) if start==0 else (increments[0],increments[1:])
+    total = inside.sum(axis=0)
+    path = np.linalg.norm(inside,axis=1).sum()
+    net = np.linalg.norm(total)
+    jump = np.linalg.norm(boundary)
+    return (net > np.deg2rad(15) and net > .72*path and jump < np.deg2rad(60)
+            and boundary @ total > .45*jump*net)
+
+
+def flip_segments(rots, t=None, rate=FLIP_RATE, min_run=MIN_RUN_S, segments=None):
     """rots: 按帧顺序的骨盆朝向; t: 秒(不给按 24 fps)。返回要换掉的段 [(i0, i1)](闭区间, 下标)。
-    一段够长的都没有(从头翻到尾) -> 不知道该信谁, 返回 []。"""
-    return short_runs([0.0] + [_rot_deg(rots[i - 1], rots[i]) for i in range(1, len(rots))], t, rate, min_run)
+    一段够长的都没有(从头翻到尾) -> 不知道该信谁, 返回 []。
+    segments: 可选的逐帧镜头/坏相机段号, 判定只在各段内部做; t 使用真实视频时间。"""
+    if segments is not None:
+        labels = np.asarray(segments)
+        if len(labels) != len(rots):
+            raise ValueError("segment labels must align with rotations")
+        times = None if t is None else np.asarray(t, float)
+        if times is not None and len(times) != len(rots):
+            raise ValueError("source times must align with rotations")
+        edges = [0] + (np.flatnonzero(labels[1:] != labels[:-1]) + 1).tolist() + [len(rots)]
+        out = []
+        for start, end in zip(edges[:-1], edges[1:]):
+            local_t = None if times is None else times[start:end]
+            out.extend((start + a, start + b) for a, b in
+                       flip_segments(rots[start:end], local_t, rate, min_run))
+        return out
+    candidates = short_runs([0.0] + [_rot_deg(rots[i-1],rots[i]) for i in range(1,len(rots))], t, rate, min_run)
+    return [(a,b) for a,b in candidates if not _continues_turn(rots,a,b)]
 
 
 def short_runs(step, t=None, rate=FLIP_RATE, min_run=MIN_RUN_S):
@@ -260,18 +651,24 @@ def load_focals(mesh_run):
             for pid in os.listdir(root)}
 
 
-def occ_plan(bis, segs, t, rootW, mask_root):
+def occ_plan(bis, segs, t, rootW, mask_root, segments=None):
     """每个不可信帧怎么补: {str(bi): [A, B, w, 根的世界坐标]}。照着它改参数的是 body_motion.fill_flips。
     动作 = A、B 两个好帧之间按 w 过渡; 根的位置:
       两头都有好帧 -> 按时间线性插值(1~2 秒里人基本走直线, 比被挡时的任何观测都可靠);
       只有一头(片头/片尾) -> 动作定在那个好帧(A = B), 位置跟着自己的 mask 走:
         mask_root[bi] = 沿 mask 质心那条视线、按场景深度量的距离; 减去锚点那帧"mask 质心 vs 真根"的差,
         接缝处不跳。mask 空了(整个人被挡没了)就停在上一帧。
-    一整段都不可信(没有锚) -> 不补, 返回里没有这段。"""
+    一整段都不可信(没有锚) -> 不补, 返回里没有这段。
+    segments 和 bis 对齐时, 锚点必须来自同一段; t 必须是原视频真实秒数, 不能是平滑用的虚拟时间。"""
+    labels = None if segments is None else np.asarray(segments)
+    if labels is not None and len(labels) != len(bis):
+        raise ValueError("segment labels must align with frames")
     out = {}
     for i0, i1 in segs:
-        A = bis[i0 - 1] if i0 > 0 else None
-        B = bis[i1 + 1] if i1 + 1 < len(bis) else None
+        if labels is not None and np.any(labels[i0:i1 + 1] != labels[i0]):
+            raise ValueError("pose-repair interval crosses a segment boundary")
+        A = bis[i0 - 1] if i0 > 0 and (labels is None or labels[i0 - 1] == labels[i0]) else None
+        B = bis[i1 + 1] if i1 + 1 < len(bis) and (labels is None or labels[i1 + 1] == labels[i1]) else None
         if A is None and B is None:
             continue
         seg = bis[i0:i1 + 1]
@@ -458,7 +855,7 @@ def airborne(f, t, win=AIR_WIN, pct=AIR_PCT, tol=AIR_TOL, ok=None):
     return air
 
 
-def tidy_track(W, bis, t, conf, UP, GH):
+def tidy_track(W, bis, t, conf, UP, GH, feet_ok=None, snap_ok=None, vfs=None, foot_indices=None):
     """一个人整段的位置整理(姿势已经整理完)。W: {bi: 世界系顶点}; t: 秒; conf: 每帧可信度(和 bis 同顺序)。
     返回每帧的整体平移 delta (T,3): 骨盆中心三个方向一起平滑 + 脚底贴地 + 可信的腾空留在空中。见本节开头。"""
     t, conf = np.asarray(t, float), np.asarray(conf, float)
@@ -472,10 +869,29 @@ def tidy_track(W, bis, t, conf, UP, GH):
     #   人在交界那帧跳一下(09-28 nfl1 人 3 第 58 帧往下 4.9 cm)
     sig = POS_SIGMA / np.maximum(_gauss_t(conf, t, np.full(len(t), 0.1)), CONF_SUB)
     delta = smooth_track(P, t, sigma=sig, wt=conf) - P
-    foot = np.array([float(((W[b] + d) @ UP).min() - GH) for b, d in zip(bis, delta)])
+    vfs = [None] * len(bis) if vfs is None else list(vfs)
+    foot = np.array([clearance(W[b] + d, UP, GH, vf) for b, d, vf in zip(bis, delta, vfs)])   # 有地形按脚下(本镜头)地形量
     fs = smooth_track(foot[:, None], t, wt=conf)[:, 0]
-    air = airborne(fs, t, ok=conf >= 1.0)
-    return delta - (fs - air)[:, None] * UP[None, :]
+    # ★ 2026-11-06 只有看得到脚的帧才能判腾空(feet_ok, 见 feet_visible): goodfellas_tray 人 4 贴着镜头只拍到上半身,
+    #   模型猜的腿前 1 秒比后面高 0.6~0.9 m, 被当成跳起来留在空中, 之后猜得越来越低, 看着就是"浮空、再落地"。
+    #   office 解说员的腿也一直看不到, 但整段猜得差不多, 没有"比平常高"的时候, 所以一直贴着地。
+    ok = conf >= 1.0 if feet_ok is None else (conf >= 1.0) & np.asarray(feet_ok, bool)
+    air = airborne(fs, t, ok=ok)
+    floor = fs - air
+    if foot_indices is not None and getattr(TERRAIN, "model_mesh", False):
+        # Bind observed support to the actual collider. A depressed local baseline
+        # alone cannot establish flight when the foot is already on that surface.
+        soles = [W[b][foot_indices] + d for b, d in zip(bis, delta)]
+        gaps = np.array([np.min(v @ UP - TERRAIN.model_h(v)) for v in soles])
+        smooth_gaps = smooth_track(gaps[:, None], t, wt=conf)[:, 0]
+        flight = airborne(smooth_gaps, t, ok=ok)
+        flight = np.minimum(flight, np.maximum(0., smooth_gaps - AIR_TOL))
+        floor = np.where(ok, gaps - flight, floor)
+    # ★ 2026-11-10 snap_ok(给了才用): 这些帧以外不贴地。看不到脚的帧脚是模型猜的, 腿长已经按地面定过(body_motion.fit_leg_length),
+    #   再逐帧往下拉 / 往上抬就是拿猜的脚挪整个人 —— hitch 反打镜头里 Kevin 被拉了 ±0.3 m, 原图上偏 300 px。
+    if snap_ok is not None:
+        floor = np.where(np.asarray(snap_ok, bool), floor, 0.0)
+    return delta - floor[:, None] * UP[None, :]
 
 
 # ------------------------------------------------------------------ 坐着的人
@@ -492,8 +908,21 @@ SEAT_XY_TOL = 0.35         # 骨盆离椅面中心超过这个 = 不在这把椅
 SEAT_SINK = 0.01           # 屁股压进坐垫 1cm, 免得看着悬空
 DROP_TOL = 0.05            # 选腿: 屁股到脚的落差离椅面高度这么近的帧优先 —— 坐上去脚正好着地
 FREEZE_STEP = 20.0         # 相邻帧骨盆转角的中位数超过这么多度 = 朝向估计本身不可信, 整段定住
+SEAT_STILL_M = 0.6         # ★ 2026-11-11 没坐在椅子上的"坐着"的人, 骨盆水平离开自己中心(90 分位)超过这么多 = 一直在动
+#   (蹲着打、爬), 不是坐着, 不做坐姿修正。jw4 人 2 蹲着出拳被整段定住、13 秒处一动不动。数字见 seat_spread 和 scout_1110/问题记录_jw_1111.md
 UPPER_SIGMA = 1.0          # 上身时间平滑的高斯 σ, 单位是 body4d 的帧
 _PARTS = None
+# ★ 2026-11-11 能坐的不只叫 chair: lovelynight 的长凳叫 bench_0, 以前认不出来, 两人都是"坐着 180 帧但没找到椅子",
+#   退回逐帧脚贴地 —— 女的弯腰脱鞋抬脚那 2 帧整个人被往下拉, 屁股陷进凳面 9 cm(r1/debug_1111/sink)。
+#   11-11 全盘场景里新认出来的只有 bench / park_bench / wooden_bench(lovelynight、lalaland、coupledance、jw4); office 不变。
+SEAT_WORDS = ("chair", "bench", "sofa", "couch", "stool")
+
+
+def is_seat(name):
+    """场景节点名(末尾编号去掉)是不是能坐的东西。"""
+    import re as _re
+    base = _re.sub(r"_\d+$", "", name)
+    return any(w in base for w in SEAT_WORDS)
 
 
 def load_parts():
@@ -519,7 +948,7 @@ def chair_seats(scene_glb, GH):
     out = {}
     for node in sc.graph.nodes_geometry:
         name = node.split("/")[-1]
-        if "chair" not in _re.sub(r"_\d+$", "", name):
+        if not is_seat(name):
             continue
         T, g = sc.graph[node]
         m = sc.geometry[g].copy(); m.apply_transform(T)
@@ -562,15 +991,45 @@ def _pelvis_track(X, P, UP):
     return C, R, np.unwrap(np.arctan2(f @ e2, f @ e1))
 
 
-def seat_fix(X, bis, UP, GH, FLIP, seat=None, seat_h_default=0.45):
+def seat_spread(Y, UP, use=None, cam=None):
+    """骨盆水平离开自己中心多远(米, 90 分位)。Y: (T,NV,3) 摆好位置的顶点; use: 算哪些帧(坏相机的帧位置是错的, 不算)。
+    cam: (T,3) 每帧相机中心。给了就只量和视线垂直的那部分 —— ★ 2026-11-12 人的远近是每帧估的, 误差全在视线方向上:
+      jw4 甄子丹坐地上的推镜头特写, 骨盆顺着视线前后漂 0.76 m, 被当成"一直在动"、坐着作废, 补腿给他规划走路、骨盆抬到 0.8 m,
+      对齐 0.61 -> 0.12。横着挪(跳舞、蹲着打)和视线垂直, 照样量得到。"""
+    P = load_parts()
+    C = Y[:, P["pelvis"]].mean(1)
+    if use is not None and np.asarray(use, bool).any():
+        C = C[np.asarray(use, bool)]
+        cam = None if cam is None else np.asarray(cam, float)[np.asarray(use, bool)]
+    if not len(C):
+        return 0.0
+    O = C - np.median(C, 0)
+    if cam is not None:
+        d = C - np.asarray(cam, float); d = d / np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-9)
+        O = O - (O * d).sum(1, keepdims=True) * d
+    Oh = O - np.outer(O @ UP, UP)
+    return float(np.percentile(np.linalg.norm(Oh, axis=1), 90))
+
+
+def seat_fix(X, bis, UP, GH, FLIP, seat=None, seat_h_default=0.45, legs_seen=None, bad=None):
     """坐着的人: 算整段的摆法, 返回 (可 JSON 化的 fix, 诊断)。
     X: (T,NV,3) 姿势整理完(骨头锁好、平滑过)、还没做位置整理和贴地的世界系顶点(body_motion.solve 里的 W)。
-    seat: (椅子名, 椅面离地高, 椅面中心 xz[glTF]) 或 None。"""
+    seat: (椅子名, 椅面离地高, 椅面中心 xz[glTF]) 或 None。
+    legs_seen: (T,) 这一帧腿看不看得见。★ 2026-11-11 没坐在椅子上的人(jw4 甄子丹坐在地上)从看得见腿的帧里挑腿 ——
+      以前按"屁股到脚的落差 ≈ 椅面高"挑, 坐在地上的人被挑了一帧坐椅子的腿, 骨盆抬到 0.66~0.70 m 像站着。
+    bad: (T,) 坏相机的帧。世界里的位置和朝向跟着错相机错(jw4 一帧跳 4 m), 不进平滑、不算"朝向乱翻"、不当参考帧。"""
     P = load_parts()
     T = len(X)
+    bad = np.zeros(T, bool) if bad is None else np.asarray(bad, bool)
+    good = ~bad if (~bad).any() else np.ones(T, bool)
     C, R, yaw = _pelvis_track(X, P, UP)
+    rel = X - C[:, None, :]                          # 选腿用每帧自己的骨盆做原点, 和相机对不对无关
+    if not good.all():                               # 坏相机的帧: 位置 / 朝向用前后好帧插值, 不带歪平滑
+        ii = np.arange(T)
+        C = np.stack([np.interp(ii, ii[good], C[good, k]) for k in range(3)], 1)
+        yaw = np.interp(ii, ii[good], yaw[good])
     steps = [float(np.degrees(np.arccos(np.clip((np.trace(R[i].T @ R[i + 1]) - 1) / 2, -1, 1))))
-             for i in range(T - 1)]
+             for i in range(T - 1) if good[i] and good[i + 1]]
     freeze = bool(steps and np.median(steps) > FREEZE_STEP)
     # 1) 坐哪: 骨盆在椅面正上方(水平 SEAT_XY_TOL 以内)才信这把椅子, 否则按脚着地
     on, gap = None, None
@@ -581,12 +1040,16 @@ def seat_fix(X, bis, UP, GH, FLIP, seat=None, seat_h_default=0.45):
             on = (seat[0], float(seat[1]))
     target = on[1] if on else seat_h_default
     # 2) 选腿: "屁股到脚的落差 ≈ 椅面高"的帧里, 取和其他帧最像的那一帧(中位代表)
-    rel = X - C[:, None, :]
+    #    没坐在椅子上: 看得见腿的帧里挑(坐在地上腿是伸着的, 落差不是椅面高); 一帧都看不见才退回按椅面高挑
     h = rel @ UP
     drop = h[:, P["seat"]].min(1) - h[:, P["low"]].min(1)
-    ok = np.where(np.abs(drop - target) <= DROP_TOL)[0]
+    seen = np.where(np.asarray(legs_seen, bool) & good)[0] if (legs_seen is not None and on is None) else np.array([], int)
+    if len(seen):
+        ok, how = seen, "看得见腿的帧"
+    else:
+        ok, how = np.where((np.abs(drop - target) <= DROP_TOL) & good)[0], "落差接近椅面高"
     if len(ok) == 0:
-        ok = np.array([int(np.argmin(np.abs(drop - target)))])
+        ok = np.array([int(np.argmin(np.where(good, np.abs(drop - target), np.inf)))])
     idx = np.arange(X.shape[1])[::8] if freeze else P["low"][::4]
     Z = np.stack([rel[t][idx] @ _rot_up(UP, -yaw[t]).T for t in range(T)])   # 先转到同一个朝向, 只比"腿怎么放"
     ref = int(ok[int(np.argmin([np.linalg.norm(Z - Z[s], axis=2).mean(1).sum() for s in ok]))])
@@ -602,10 +1065,36 @@ def seat_fix(X, bis, UP, GH, FLIP, seat=None, seat_h_default=0.45):
                yaw={str(int(b)): round(float(yaw_s[t] - yaw[ref]), 5) for t, b in enumerate(bis)},
                pos={str(int(b)): np.round(Pbar[t], 5).tolist() for t, b in enumerate(bis)})
     diag = dict(骨盆转角中位_度=round(float(np.median(steps)), 1) if steps else 0.0, 定住=freeze,
-                参考帧=int(bis[ref]), 候选帧=int(len(ok)), 落差=round(float(drop[ref]), 3),
+                参考帧=int(bis[ref]), 候选帧=int(len(ok)), 选腿依据=how, 坏相机帧=int(bad.sum()), 落差=round(float(drop[ref]), 3),
                 目标落差=round(float(target), 3), 离椅面中心=(round(gap, 3) if gap is not None else None),
                 高度来源=(on[0] if on else "地面(脚着地)"))
     return fix, diag
+
+
+def seat_keep_legs(X, delta, t, conf, UP, GH, seat_h, seated, vfs=None):
+    """★ 2026-11-11 坐着、脚看得到的人(lovelynight 长凳上脱鞋、翘二郎腿): 腿是看着估的, 而且就是主要动作,
+    不能像 seat_fix 那样整段换成同一帧的腿。每帧姿势照原样, 只重定竖直位置: 屁股(seat 顶点最低处)压进椅面
+    SEAT_SINK, 代替"最低点贴地" —— 抬脚不再把整个人往下拉。模型的腿比椅面长时屁股放上去脚会扎进地里,
+    所以每帧取两个要求里高的那个(屁股不陷进椅面、脚不陷进地面)。
+    不做时间平滑: 坐着的人屁股就该每帧都在椅面上, 平滑"挪多少"反而会把 delta 里那 2 帧的下沉抹成前后几帧的起伏
+    (测试 test_seat_keep_legs: 平滑之后屁股在 0.38~0.44 之间晃)。
+    X: (T,N,3) 姿势整理完的世界系顶点; delta: tidy_track 给的整体平移(水平照用, 竖直在这里重定);
+    seated: 每帧坐没坐(sit_and_route), 没坐的帧照旧贴地, 进出按 0.1 秒渐变。conf 留着和别的整理函数同签名, 这里不用。
+    返回 (新 delta, 诊断)。"""
+    P = load_parts()
+    t, seated = np.asarray(t, float), np.asarray(seated, bool)
+    Y = X + delta[:, None, :]
+    vfs = [None] * len(X) if vfs is None else list(vfs)
+    but = (Y[:, P["seat"]] @ UP).min(1) - GH                          # 屁股最低处离地
+    foot = np.array([clearance(y, UP, GH, vf) for y, vf in zip(Y, vfs)])
+    want = np.maximum(seat_h - SEAT_SINK - but, -foot)                 # 竖直还要挪多少
+    on = _gauss_t(seated.astype(float), t, np.full(len(t), 0.1))
+    move = on * want
+    rng = lambda a: [round(float(a.min()), 3), round(float(a.max()), 3)]
+    diag = dict(方式="腿照原样, 屁股按椅面定高度(脚看得到)", 椅面离地=round(float(seat_h), 3),
+                屁股离地_前=rng(but), 屁股离地_后=rng(but + move), 脚离地_前=rng(foot), 脚离地_后=rng(foot + move),
+                脚扎地_帧数=int((foot + move < -0.02).sum()))
+    return delta + move[:, None] * UP[None, :], diag
 
 
 def _seat_report(old, new, UP, GH, fix):
@@ -697,7 +1186,7 @@ def load_chairs(scene_glb):
     out = {}
     for node in sc.graph.nodes_geometry:
         name = node.split("/")[-1]
-        if "chair" not in _re.sub(r"_\d+$", "", name):
+        if not is_seat(name):
             continue
         T, g = sc.graph[node]
         m = sc.geometry[g].copy(); m.apply_transform(T)
@@ -874,7 +1363,7 @@ def main():
         print("== 渲染回图 ==")
         for f in glob.glob(f"{a.r1}/09_people_f*.glb") + glob.glob(f"{a.r1}/09_render_4d_f*.jpg"):
             os.remove(f)                             # 上一次的: 人变了, 抽到的帧号不一样, 旧的会留在目录里冒充这一次的
-        allvf = sorted({v for fr in world.values() for v in fr})
+        allvf = sorted({v for fr in world.values() for v in fr if v in vid2key})   # 只挑场景帧(人体全帧时中间帧没有场景相机的编号)
         pick = [allvf[int(round(i * (len(allvf) - 1) / max(1, a.render_frames - 1)))]
                 for i in range(a.render_frames)]
         for vf in sorted(set(pick)):
