@@ -10,9 +10,9 @@
   * 场景名 = 文件名(小写, 字母数字以外换成 _)。素材放进 data/<室内外>/dataset/<场景名>/video.mp4(硬链接, 不占空间)。
   * 轮次名默认 r1。★ 生成的模型按"场景名前 3 个字母_轮次"存目录, 撞了会互相覆盖而且不报错 ——
     撞了就自动换 r2、r3 ...; 这一批之内互相撞的也一样。
-  * 结果目录已经有了(以前跑过)就跳过不重跑。要重跑: 删掉那个结果目录。
+  * 结果目录已经有了: 跑完了(有产出)就跳过; 没跑完(中断了 / 上次失败)就接着跑。要从头重跑: 删掉那个结果目录。
   * 跑法 = tools/run_to_end.sh(按"有人"跑, 闸口全部自动过, 不作废任何词; 要作废词传 "DROP_WORDS=wall,door frame")。
-  * 一个失败不挡下一个。
+  * 一段失败自动重跑这一段, 最多 2 次(生成物体偶尔显存不够, 重跑就过)。还不行就记失败, 不挡下一个。
 
 --jobs N: 同时跑 N 个视频, 把卡平均分成 N 份(8 张卡、--jobs 2 = 0-3 和 4-7)。默认 1。
 --classify-only: 只判室内外、出表, 不跑。
@@ -68,17 +68,26 @@ def place(kind, scene, video):
 
 
 def pick_run(kind, scene, want, taken):
-    """轮次名: 结果目录已有 -> (想要的那个, True=跳过); 否则从 want 起找一个标签不撞的。taken = 这一批已经占了的标签。"""
-    if os.path.isdir(run_ctl.r1_of(kind, scene, want)) and os.listdir(run_ctl.r1_of(kind, scene, want)):
-        return want, True
+    """轮次名: 结果目录已有 -> (想要的那个, "跳过" 跑完了 / "续跑" 没跑完); 否则从 want 起找一个标签不撞的, ""。
+    taken = 这一批已经占了的标签。"""
     m = re.match(r"^(.*?)(\d+)$", want)
     stem, n = (m.group(1), int(m.group(2))) if m else (want + "_", 1)
+    # 以前跑过的(上一批可能因为撞名用了 r2、r3): 有跑完的就跳过, 否则接着跑最后那个没跑完的
+    d = os.path.dirname(run_ctl.r1_of(kind, scene, want))
+    old = sorted((int(x.group(2)), x.group(0)) for x in
+                 (re.match(rf"^({re.escape(stem)})(\d+)$", r) for r in (os.listdir(d) if os.path.isdir(d) else []))
+                 if x and int(x.group(2)) >= n and os.listdir(f"{d}/{x.group(0)}"))
+    for _, r in old:
+        if outcome(kind, scene, r):
+            return r, "跳过"
+    if old:
+        return old[-1][1], "续跑"
     run = want
     while (os.path.exists(run_ctl.r1_of(kind, scene, run)) or run_ctl._tag_clash(kind, scene, run)
            or run_ctl.tag_of(kind, scene, run) in taken):
         n += 1
         run = f"{stem}{n}"
-    return run, False
+    return run, ""
 
 
 def outcome(kind, scene, run):
@@ -133,7 +142,7 @@ def main():
         jobs.append(dict(视频=v, 类型=k, 拿不准=kinds[v].get("拿不准"), 场景=scene, 轮次=run, 跳过=skip))
     for j in jobs:
         print(f"  {j['类型']:8s}{' (拿不准)' if j['拿不准'] else '':8s} {j['场景']}/{j['轮次']}"
-              f"{'  已有结果, 跳过' if j['跳过'] else ''}  <- {os.path.basename(j['视频'])}", flush=True)
+              f"{'  已跑完, 跳过' if j['跳过'] == '跳过' else '  上次没跑完, 接着跑' if j['跳过'] else ''}  <- {os.path.basename(j['视频'])}", flush=True)
     if a.classify_only:
         print(f"[只判不跑] 表在 {out}/kinds.json。判错的挪进 indoor/ 或 outdoor/ 子文件夹再跑")
         return
@@ -150,12 +159,13 @@ def main():
     rows = []
 
     def one(j):
-        if j["跳过"]:
-            res = outcome(j["类型"], j["场景"], j["轮次"])
-            return dict(j, 结果="已有, 跳过" + ("" if res else "(上次没跑完, 删掉结果目录才会重跑)"), 用时="", 产出=res)
+        if j["跳过"] == "跳过":
+            return dict(j, 结果="已跑完, 跳过", 用时="", 产出=outcome(j["类型"], j["场景"], j["轮次"]))
         with lock:
             p = free.pop()
         env = dict(base_env)
+        if j["跳过"] == "续跑":
+            env["RESUME"] = "1"
         if n > 1:
             env["GPU_POOL"] = p
             env.setdefault("MAX_GPUS", str(len(p.split(","))))

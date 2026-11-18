@@ -4,6 +4,8 @@
 # 第 2 道闸: 给了 REF_APPLIED(参考轮次的 05_review_applied.json)和 REF_TAG(它的标签)就照抄那一轮落地的决定
 # (作废 / 逐实例 / 共用 / 单个不生成, 见 apply_ref_decisions.py); 没给就按 DROP_WORDS 把词整词作废
 # (默认是 nfl1 r1 当时作废的那五个)。其他闸不改决定。
+# 一段失败自动重跑这一段, 最多 RETRY 次(默认 2): 生成物体在 24G 卡上偶尔显存不够, 人工跑时是点"继续"重跑就过,
+#   已经生成好的会跳过, 只补没成功的。RESUME=1: 轮次已经存在时接着跑(批量脚本续跑没跑完的用), 不重写本轮配置。
 set -eu
 SC=$1; RUN=$2; shift 2
 KIND=outdoor; IN=""
@@ -13,16 +15,29 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY=$HOME/miniforge3/envs/sam3d/bin/python
 if [ "$KIND" = indoor ]; then R1=$HOME/sam3d/data/indoorOutput/$SC/$RUN; else R1=$HOME/sam3d/data/outdoor/result/$SC/$RUN; fi
 DROP_WORDS=${DROP_WORDS-football,gloves,helmet,jersey,referee}      # 传空字符串 = 一个词都不作废
-[ -e "$R1" ] && { echo "轮次已经存在, 不覆盖: $R1"; exit 1; }
-mkdir -p "$R1/logs"
-$PY -c "import sys; sys.path.insert(0, '$HOME/sam3d/pipeline'); import _common; _common.update_run_config('$R1', '$KIND', {'PEOPLE': '1', 'RECALL': '0'}, 0)"
+if [ -e "$R1" ] && [ "${RESUME:-0}" = 1 ]; then
+  echo "接着跑已有的轮次: $R1"
+elif [ -e "$R1" ]; then
+  echo "轮次已经存在, 不覆盖: $R1(要接着跑加 RESUME=1)"; exit 1
+else
+  mkdir -p "$R1/logs"
+  $PY -c "import sys; sys.path.insert(0, '$HOME/sam3d/pipeline'); import _common; _common.update_run_config('$R1', '$KIND', {'PEOPLE': '1', 'RECALL': '0'}, 0)"
+fi
+TRIES=0
 T0=$(date +%s)
 while true; do
   LOG=$(bash "$HERE/drive_go.sh" "$SC" "$RUN" $IN | sed -n 's/^已继续: .* 日志 //p')
   [ -n "$LOG" ] || { echo "★ drive_go.sh 没开跑"; exit 1; }
   # 等这一段跑完: 看日志里的 [结束]。不靠 pgrep —— 驱动还没起来时 pgrep 查不到, 会当成已经跑完
   until [ -e "$LOG" ] && grep -q "^\[结束\]" "$LOG"; do sleep 5; done
-  grep -q "^\[结束\] .* 退出码 0$" "$LOG" || { echo "★ 失败, 看 $LOG"; tail -5 "$LOG"; exit 1; }
+  if ! grep -q "^\[结束\] .* 退出码 0$" "$LOG"; then
+    TRIES=$((TRIES + 1))
+    tail -5 "$LOG"
+    [ "$TRIES" -le "${RETRY:-2}" ] || { echo "★ 失败(已重试 ${RETRY:-2} 次), 看 $LOG"; exit 1; }
+    echo "★ 这一段失败, 第 $TRIES 次重跑这一段: $LOG"
+    continue
+  fi
+  TRIES=0
   read -r SEG STOP < <($PY -c "import json; s=json.load(open('$R1/logs/.drive_state.json')); print(s['段'], int(s['停在闸口']))")
   echo "[$(( $(date +%s) - T0 ))s] 停在第 $((SEG + 1)) 道闸"
   grep -q "全部跑完" "$LOG" && break
@@ -34,7 +49,7 @@ while true; do
   elif [ "$SEG" = 1 ]; then
     $PY - "$R1" "$DROP_WORDS" <<'EOF'
 import json, sys
-R1, words = sys.argv[1], set(sys.argv[2].split(","))
+R1, words = sys.argv[1], {w.strip() for w in sys.argv[2].split(",") if w.strip()}
 p = f"{R1}/05_review.json"; d = json.load(open(p)); seen = set()
 for c in d["候选"]:
     if c["词"] in words and c["词"] not in seen:
