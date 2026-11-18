@@ -21,8 +21,8 @@ def test_step_is_in_both_pipelines_and_the_drive_table():
     drive = _load("_d", f"{SAM3D}/.claude/skills/run-recon-pipeline/drive.py")
     for kind, steps, deps in (("outdoor", out.STEPS, out.DEPS), ("indoor", ind.STEPS_OBJ, ind.DEPS_OBJ)):
         keys = [s[0] for s in steps]
-        assert keys.index("motion") == keys.index("people_glb") + 1, keys
-        assert deps["motion"] == ["people_glb", "people"] and deps["people_glb"] == ["phys", "people"]
+        assert keys.index("motion") > keys.index("people_glb"), keys      # 中间可以有别的步(2026-11 起有 carry)
+        assert deps["motion"] == ["people_glb", "people", "carry"] and deps["people_glb"] == ["phys", "people"]
         assert "people" in deps["phys"]                                    # 物理拿人当空气墙: 摆人在它前面
         seg = [s for s in drive.SEGMENTS[kind] if s[2] == "check_scene"][0][1]
         assert seg.index("people") < seg.index("phys") < seg.index("people_glb") < seg.index("motion"), seg
