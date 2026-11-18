@@ -29,6 +29,8 @@ while true; do
   [ "$STOP" = 1 ] || { echo "★ 没停在闸口也没跑完, 看 $LOG"; exit 1; }
   if [ "$SEG" = 1 ] && [ -n "${REF_APPLIED:-}" ]; then
     $PY "$HERE/apply_ref_decisions.py" "$R1" "$REF_APPLIED" "$REF_TAG"
+  elif [ "$SEG" = 1 ] && [ ! -e "$R1/05_review.json" ]; then
+    echo "    闸 2: 没有物体候选(画面里只有人, 或词表是空的), 不用作废词"
   elif [ "$SEG" = 1 ]; then
     $PY - "$R1" "$DROP_WORDS" <<'EOF'
 import json, sys
